@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "localmem"
+dynamic = ["version"]
+description = "Local-first, zero-token memory layer for AI coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "localmem contributors" }]
+keywords = ["memory", "sqlite", "fts5", "mcp", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["click>=8.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+localmem = "localmem.cli:main"
+
+[tool.hatch.version]
+path = "localmem/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["localmem"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["ANN", "B", "D", "E", "F", "I", "N", "RUF", "S", "SIM", "UP", "W"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "S101", "S607"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["localmem"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
