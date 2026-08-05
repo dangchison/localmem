@@ -329,6 +329,82 @@ def test_import_rejects_a_missing_path(work: Path) -> None:
     assert result.exit_code != 0
 
 
+# --------------------------------------------------------------------- whole-file mode
+
+SKILL = FIXTURES_DIR / "security-review.md"
+
+
+def test_whole_file_produces_exactly_one_record() -> None:
+    records = importer.read_records(SKILL, whole_file=True)
+    assert len(records) == 1
+    # The document arrives intact — heading, every section, every bullet.
+    assert records[0].startswith("# Security review checklist")
+    assert "New runtime dependency?" in records[0]
+
+
+def test_whole_file_does_not_change_the_default_split() -> None:
+    assert len(importer.read_records(SKILL)) > 1
+    assert importer.read_records(SKILL) == importer.parse_records(SKILL.read_text(encoding="utf-8"))
+
+
+def test_whole_file_of_a_content_free_document_yields_no_record() -> None:
+    assert importer.whole_file_records("\n---\n***\n") == []
+    assert importer.whole_file_records("   \n\n") == []
+
+
+def test_whole_file_import_is_idempotent(conn: sqlite3.Connection) -> None:
+    first = importer.import_file(conn, SKILL, WORKSPACE, whole_file=True)
+    assert (first.records, first.added) == (1, 1)
+
+    second = importer.import_file(conn, SKILL, WORKSPACE, whole_file=True)
+
+    assert row_count(conn) == 1
+    assert (second.added, second.merged) == (0, 1)
+    assert seen_counts(conn) == [2]
+
+
+def test_the_two_modes_share_a_workspace_without_colliding(conn: sqlite3.Connection) -> None:
+    """A split import and a whole-file import of the same file are different records."""
+    split = importer.import_file(conn, SKILL, WORKSPACE)
+    whole = importer.import_file(conn, SKILL, WORKSPACE, whole_file=True)
+
+    assert whole.added == 1
+    assert row_count(conn) == split.records + 1
+    assert seen_counts(conn) == [1] * row_count(conn)
+
+
+def test_a_whole_file_record_is_recalled_intact(conn: sqlite3.Connection) -> None:
+    importer.import_file(conn, SKILL, "global", whole_file=True)
+    hits = store.search_memories(conn, "security review", "global", 5)
+    assert len(hits) == 1
+    assert hits[0].kind == importer.IMPORT_KIND
+    assert hits[0].source == "import:security-review.md"
+    assert "parameterized" in hits[0].content
+    assert "New runtime dependency?" in hits[0].content
+
+
+def test_cli_whole_file_import_stores_one_record(work: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli.main, ["import", str(SKILL), "-w", "global", "--whole-file"])
+    assert result.exit_code == 0
+    assert "1 records — 1 new" in result.output
+
+    # And it is reachable from a completely different workspace, because it is global.
+    found = runner.invoke(cli.main, ["search", "security review", "-w", "some-other-repo"])
+    assert found.exit_code == 0
+    assert "New runtime dependency?" in found.output
+
+
+def test_cli_whole_file_dry_run_writes_nothing(work: Path, db_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.main, ["import", str(SKILL), "-w", "global", "--whole-file", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    assert "would create 1 records" in result.output
+    assert "nothing was written" in result.output
+    assert not db_path.exists()
+
+
 def test_skip_message_is_the_plan_text_verbatim() -> None:
     """AC21: character for character, as one module constant (DD-10)."""
     assert importer.SKIP_MESSAGE == (

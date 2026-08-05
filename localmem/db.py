@@ -123,6 +123,18 @@ def _apply_initial_schema(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _add_recall_tracking(conn: sqlite3.Connection) -> None:
+    """v2 — record how often a memory is actually recalled.
+
+    Two columns on ``memories``: ``recalled_count``, which every existing row starts at
+    0, and ``last_recalled_at``, nullable because "never recalled" is not a timestamp.
+    ``schema.sql`` stays the version-1 baseline; a v1 database reaches version 2 by
+    replaying this step, exactly as the forward-only design intends.
+    """
+    conn.execute("ALTER TABLE memories ADD COLUMN recalled_count INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE memories ADD COLUMN last_recalled_at TEXT")
+
+
 def _iter_statements(script: str) -> Iterator[str]:
     """Yield complete SQL statements, keeping ``CREATE TRIGGER`` bodies intact."""
     buffer = ""
@@ -144,5 +156,12 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     )
 
 
-# Forward-only, ordered by version. A later milestone appends one tuple here.
-_MIGRATIONS: tuple[tuple[int, MigrationStep], ...] = ((1, _apply_initial_schema),)
+# Forward-only, ordered by version. A later milestone appends one tuple here; nothing is
+# ever edited in place, because a database that already ran a step will never run it again.
+_MIGRATIONS: tuple[tuple[int, MigrationStep], ...] = (
+    (1, _apply_initial_schema),
+    (2, _add_recall_tracking),
+)
+
+#: The version a freshly opened database ends up at. Derived, never typed twice.
+CURRENT_SCHEMA_VERSION = _MIGRATIONS[-1][0]

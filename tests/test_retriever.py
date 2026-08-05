@@ -142,7 +142,11 @@ def test_retrieve_returns_provenance_and_core_memory(conn: sqlite3.Connection) -
 
 
 def test_retrieve_is_workspace_scoped(conn: sqlite3.Connection) -> None:
-    """AC6."""
+    """AC6, re-read for v0.2: two *named* workspaces are still fully isolated.
+
+    The global tier is the one deliberately shared workspace; nothing else leaks, which
+    is what this fixture pins now that a fallback exists at all.
+    """
     store.add_memory(conn, "use pnpm not npm", "a")
     store.add_memory(conn, "use pnpm not npm", "b")
     scoped = retriever.retrieve(conn, "pnpm", "a", now=NOW)
@@ -209,6 +213,257 @@ def test_query_entities_collapses_duplicate_normal_forms() -> None:
     # QUOTED_STRING does not mask its interior, so 'ConfigLoader' is reported twice under
     # two classes and must fold to a single lookup key.
     assert retriever.query_entities('use "ConfigLoader" now') == ["configloader"]
+
+
+# --- the shared global tier -------------------------------------------------
+
+GLOBAL = core_memory.GLOBAL_WORKSPACE
+
+
+def test_a_named_workspace_also_recalls_the_global_tier(conn: sqlite3.Connection) -> None:
+    """The whole point of v0.2: a lesson stored once is reachable from every repo."""
+    shared = store.add_memory(conn, "reset the upload buffer before retrying", GLOBAL)
+    local = store.add_memory(conn, "this project routes upload traffic through nginx", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "upload", WORKSPACE, now=NOW)
+
+    assert {hit.id for hit in outcome.results} == {shared.id, local.id}
+    assert {hit.workspace for hit in outcome.results} == {GLOBAL, WORKSPACE}
+
+
+def test_the_global_tier_reaches_every_named_workspace_but_repos_stay_isolated(
+    conn: sqlite3.Connection,
+) -> None:
+    shared = store.add_memory(conn, "check the upload buffer size first", GLOBAL)
+    in_a = store.add_memory(conn, "upload retries are disabled in repo a", "a")
+
+    from_b = retriever.retrieve(conn, "upload", "b", now=NOW)
+
+    assert [hit.id for hit in from_b.results] == [shared.id]
+    assert in_a.id not in {hit.id for hit in from_b.results}
+
+
+def test_searching_the_global_workspace_does_not_widen_to_everything(
+    conn: sqlite3.Connection,
+) -> None:
+    shared = store.add_memory(conn, "check the upload buffer size first", GLOBAL)
+    store.add_memory(conn, "upload retries are disabled in repo a", "a")
+
+    outcome = retriever.retrieve(conn, "upload", GLOBAL, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [shared.id]
+
+
+def test_searching_every_workspace_is_unchanged(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "check the upload buffer size first", GLOBAL)
+    store.add_memory(conn, "upload retries are disabled in repo a", "a")
+    store.add_memory(conn, "upload works fine in repo b", "b")
+
+    assert len(retriever.retrieve(conn, "upload", None, now=NOW).results) == 3
+
+
+def test_a_tie_puts_the_workspace_row_above_the_global_row(conn: sqlite3.Connection) -> None:
+    """Equal fused score, and the current workspace wins. No penalty is applied.
+
+    The two texts are anagrams, so bm25 — and therefore both normalized view scores —
+    match exactly; both rows are backdated to the same instant and neither has been seen
+    twice, so nothing but the tiebreak can separate them. The workspace row is inserted
+    *first* on purpose: its lower id would otherwise sort it second, so the assertion
+    cannot pass by accident.
+    """
+    own = store.add_memory(conn, "deploy pipeline broke badly", WORKSPACE)
+    shared = store.add_memory(conn, "badly broke deploy pipeline", GLOBAL)
+    _backdate(conn, own.id, AT_NOW)
+    _backdate(conn, shared.id, AT_NOW)
+
+    outcome = retriever.retrieve(conn, "deploy pipeline", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [own.id, shared.id]
+    assert outcome.results[0].score == pytest.approx(outcome.results[1].score, abs=1e-12)
+
+
+def test_a_better_global_row_still_outranks_a_weaker_local_one(
+    conn: sqlite3.Connection,
+) -> None:
+    """The tiebreak is a tiebreak: it must not become a thumb on the scale."""
+    store.add_memory(conn, "pnpm is mentioned once here among many other words", WORKSPACE)
+    shared = store.add_memory(conn, "pnpm pnpm pnpm", GLOBAL)
+
+    outcome = retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+
+    assert outcome.results[0].id == shared.id
+    assert outcome.results[0].score > outcome.results[1].score
+
+
+def test_the_global_tier_reaches_the_pure_recency_view_too(conn: sqlite3.Connection) -> None:
+    """Consistency: "what happened recently" must not answer from a different tier set."""
+    shared = store.add_memory(conn, "a shared lesson", GLOBAL)
+    local = store.add_memory(conn, "a local note", WORKSPACE)
+    store.add_memory(conn, "someone else's note", "other")
+    _backdate(conn, shared.id, THIRTY_DAYS_BEFORE_NOW)
+    _backdate(conn, local.id, AT_NOW)
+
+    outcome = retriever.retrieve(conn, "today", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [local.id, shared.id]
+
+
+def test_entity_only_recall_reaches_the_global_tier(conn: sqlite3.Connection) -> None:
+    """The relational view carries the fallback as well, not just bm25."""
+    shared = store.add_memory(conn, "ConfigLoader retries three times on timeout", GLOBAL)
+    query = "ConfigLoader zzqqxx"
+    assert store.search_memories(conn, query, WORKSPACE) == []
+
+    outcome = retriever.retrieve(conn, query, WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [shared.id]
+    assert outcome.results[0].relational_score == 1.0
+
+
+def test_evidence_closure_keeps_each_hit_inside_its_own_tier(conn: sqlite3.Connection) -> None:
+    """A global hit gathers global neighbors; a repo hit gathers repo neighbors."""
+    store.add_memory(conn, "config_loader reads the timeout", GLOBAL)
+    global_sibling = store.add_memory(conn, "config_loader caches nothing", GLOBAL)
+    store.add_memory(conn, "config_loader is wired up in main", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "timeout", WORKSPACE, now=NOW)
+
+    assert [hit.workspace for hit in outcome.results] == [GLOBAL]
+    assert {neighbor.id for neighbor in outcome.results[0].neighbors} == {global_sibling.id}
+
+
+# --- core memory across the two tiers ---------------------------------------
+
+
+def test_core_memory_puts_the_workspace_tier_before_the_global_one(
+    conn: sqlite3.Connection,
+) -> None:
+    shared = store.add_memory(conn, "prefer pnpm everywhere", GLOBAL, "core")
+    own = store.add_memory(conn, "this project pins yarn", WORKSPACE, "core")
+    # The shared row is older, so a naive single-list build would put it first.
+    _backdate(conn, shared.id, "2026-01-01 00:00:00")
+    _backdate(conn, own.id, "2026-02-01 00:00:00")
+
+    built = core_memory.build_core_memory(conn, WORKSPACE)
+
+    assert built.text == "this project pins yarn\nprefer pnpm everywhere"
+    assert built.dropped == 0
+
+
+def test_core_memory_of_the_global_workspace_is_not_doubled(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "prefer pnpm everywhere", GLOBAL, "core")
+    assert core_memory.build_core_memory(conn, GLOBAL).text == "prefer pnpm everywhere"
+
+
+def test_core_memory_drops_the_global_tier_before_the_workspace_tier(
+    conn: sqlite3.Connection,
+) -> None:
+    """AC15 re-read: the cap costs the shared tier first, never the repo's own rows."""
+    for index, word in enumerate(("alpha", "bravo", "charlie"), start=1):
+        shared = store.add_memory(conn, f"{word} " * 100, GLOBAL, "core")
+        _backdate(conn, shared.id, f"2026-01-{index:02d} 00:00:00")
+    own = store.add_memory(conn, "delta " * 100, WORKSPACE, "core")
+    _backdate(conn, own.id, "2026-03-01 00:00:00")
+
+    built = core_memory.build_core_memory(conn, WORKSPACE)
+
+    assert built.tokens <= core_memory.CORE_MEMORY_TOKEN_CAP
+    lines = built.text.splitlines()
+    assert lines[0].split()[0] == "delta"
+    assert built.dropped == 4 - len(lines)
+    assert all(len(line.split()) == 100 for line in lines)
+
+
+def test_core_memory_reaches_a_recall_from_another_workspace(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "prefer pnpm everywhere", GLOBAL, "core")
+    store.add_memory(conn, "the migration ran on staging", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "migration", WORKSPACE, now=NOW)
+
+    assert outcome.core_memory == "prefer pnpm everywhere"
+
+
+def test_core_memory_none_scope_is_unchanged(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "only for a", "a", "core")
+    store.add_memory(conn, "shared", GLOBAL, "core")
+    assert set(core_memory.build_core_memory(conn, None).text.splitlines()) == {
+        "only for a",
+        "shared",
+    }
+
+
+def test_core_workspaces_lists_only_workspaces_holding_core_rows(
+    conn: sqlite3.Connection,
+) -> None:
+    store.add_memory(conn, "a plain note", WORKSPACE)
+    store.add_memory(conn, "a core row", "b", "core")
+    store.add_memory(conn, "another core row", "a", "core")
+    assert core_memory.core_workspaces(conn) == ["a", "b"]
+
+
+# --- recall usage tracking (schema version 2) -------------------------------
+
+
+def _tracking(conn: sqlite3.Connection, memory_id: int) -> tuple[int, str | None]:
+    row = conn.execute(
+        "SELECT recalled_count, last_recalled_at FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    return int(row["recalled_count"]), row["last_recalled_at"]
+
+
+def test_a_returned_memory_gets_its_recall_counted(conn: sqlite3.Connection) -> None:
+    added = store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    assert _tracking(conn, added.id) == (0, None)
+
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    count, stamp = _tracking(conn, added.id)
+    assert count == 1
+    assert stamp is not None
+
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert _tracking(conn, added.id)[0] == 2
+
+
+def test_a_memory_that_was_not_returned_is_not_counted(conn: sqlite3.Connection) -> None:
+    matched = store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    missed = store.add_memory(conn, "unrelated note about coffee", WORKSPACE)
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert _tracking(conn, matched.id)[0] == 1
+    assert _tracking(conn, missed.id)[0] == 0
+
+
+def test_a_neighbor_is_evidence_not_a_recall(conn: sqlite3.Connection) -> None:
+    target = store.add_memory(conn, "config_loader reads the timeout", WORKSPACE)
+    sibling = store.add_memory(conn, "config_loader caches nothing", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "timeout", WORKSPACE, now=NOW)
+
+    assert {neighbor.id for neighbor in outcome.results[0].neighbors} == {sibling.id}
+    assert _tracking(conn, target.id)[0] == 1
+    assert _tracking(conn, sibling.id)[0] == 0
+
+
+def test_tracking_never_costs_the_user_their_recall(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database error in the counter is swallowed; the results still come back."""
+    added = store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    monkeypatch.setattr(
+        retriever,
+        "_RECORD_RECALL_SQL",
+        "UPDATE no_such_table SET recalled_count = 1 WHERE id IN ({placeholders})",
+    )
+
+    outcome = retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [added.id]
+    assert _tracking(conn, added.id) == (0, None)
+
+
+def test_an_empty_result_set_records_nothing(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    retriever.retrieve(conn, "nothing matches this", WORKSPACE, now=NOW)
+    assert conn.execute("SELECT SUM(recalled_count) AS n FROM memories").fetchone()["n"] == 0
 
 
 # --- fuse -------------------------------------------------------------------

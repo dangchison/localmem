@@ -1,7 +1,8 @@
 """The ``localmem`` command line.
 
 Commands: ``init``, ``add``, ``search``, ``import``, ``agents``, ``benchmark``,
-``stats``, ``backfill``, ``dedupe``, ``gc``, ``serve``.
+``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``, ``export``, ``restore``,
+``serve``.
 
 Every command runs headless — no prompts, no TTY requirement. ``dedupe`` and ``init``
 prompt only when stdin is a terminal; with no terminal and no flags ``init`` prints what
@@ -27,6 +28,7 @@ import click
 from localmem import (
     __version__,
     agents,
+    audit,
     benchmark,
     config,
     core_memory,
@@ -36,6 +38,7 @@ from localmem import (
     indexer,
     retriever,
     store,
+    transfer,
 )
 
 _KIND_CHOICES = ("note", "trace", "core")
@@ -137,6 +140,7 @@ def stats() -> None:
     click.echo(f"memories: {summary.total}")
     click.echo(f"entities: {summary.total_entities}")
     click.echo(f"entity links: {summary.total_entity_links}")
+    click.echo(f"recalls: {summary.total_recalled} recorded across all memories")
     click.echo(f"queue depth: {summary.queue_depth} pending near-duplicate pairs")
     click.echo(f"core memory: ~{summary.core_memory_tokens} estimated tokens")
     if summary.core_memory_dropped:
@@ -146,6 +150,86 @@ def stats() -> None:
         )
     _echo_counts("by workspace", summary.per_workspace)
     _echo_counts("by kind", summary.per_kind)
+
+
+@main.command("audit")
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Restrict to one workspace (default: every workspace).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
+def audit_command(workspace: str | None, as_json: bool) -> None:
+    """Report memory hygiene: review queue, promotion candidates, distribution, dead rows.
+
+    Read-only and deterministic — no model, no network, and not one write. It is a
+    report, not a gate: it always exits 0 and never repairs what it finds.
+    """
+    with _session() as (conn, path):
+        report = audit.run(conn, path, workspace)
+    if as_json:
+        click.echo(json.dumps(_audit_payload(report), ensure_ascii=False))
+        return
+    _echo_audit(report)
+
+
+@main.command("export")
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Restrict to one workspace (default: every workspace).",
+)
+@click.option(
+    "-o",
+    "--output",
+    default=None,
+    metavar="FILE",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write to FILE instead of stdout.",
+)
+def export_command(workspace: str | None, output: Path | None) -> None:
+    """Write the raw memory rows as JSON, for backup or another machine.
+
+    Only the ``memories`` table travels: the entity graph is rebuilt by ``restore`` and
+    the near-duplicate queue is local, transient state.
+    """
+    with _session() as (conn, _path):
+        document = transfer.export_document(conn, workspace)
+    text = transfer.render(document)
+    if output is None:
+        click.echo(text)
+        return
+    try:
+        output.write_text(text + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"cannot write {output}: {exc}") from exc
+    click.echo(f"exported {len(document[transfer.MEMORIES_KEY])} memories to {output}")
+
+
+@main.command("restore")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def restore_command(path: Path) -> None:
+    """Merge the export document at PATH back into the database.
+
+    Safe to run twice and safe to run into a database that already has data: a row that
+    is already there keeps its own ``created_at``, ``kind`` and ``source``, and only its
+    ``seen_count`` rises to the larger of the two.
+    """
+    try:
+        records = transfer.read_document(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise click.ClickException(f"cannot read {path}: {exc}") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    with _session() as (conn, _path):
+        outcome = transfer.restore(conn, records)
+    click.echo(
+        f"restored {outcome.total} memories — {outcome.added} new, "
+        f"{outcome.merged} merged into existing"
+    )
+    click.echo(f"entity backfill created {outcome.links_created} links")
 
 
 @main.command()
@@ -313,16 +397,26 @@ def init(yes: bool, import_all: bool, workspace: str | None) -> None:
 @click.option("-w", "--workspace", default=None, help="Workspace name (default: auto-detected).")
 @click.option("--dry-run", is_flag=True, help="Report what would be created and write nothing.")
 @click.option("--select", "select", is_flag=True, help="Confirm each file (needs a terminal).")
+@click.option(
+    "--whole-file",
+    "whole_file",
+    is_flag=True,
+    help="Store each file as one record instead of splitting it — for skills and checklists.",
+)
 def import_command(
     paths: tuple[Path, ...],
     workspace: str | None,
     dry_run: bool,
     select: bool,
+    whole_file: bool,
 ) -> None:
     """Import markdown instruction files (CLAUDE.md, AGENTS.md, steering) into memory.
 
     Re-importing an unchanged file adds no rows: every record merges into the one it
     created last time and bumps its ``seen_count``.
+
+    ``--whole-file`` keeps a document intact — a security checklist recalled one bullet
+    at a time is not a checklist. Pair it with ``-w global`` to reach it from every repo.
     """
     if select and not _is_interactive():
         raise click.UsageError(
@@ -332,14 +426,14 @@ def import_command(
     chosen = _select_paths(paths) if select else list(paths)
     target_workspace = _resolve_workspace(workspace)
     if dry_run:
-        _echo_import_preview(chosen, target_workspace)
+        _echo_import_preview(chosen, target_workspace, whole_file=whole_file)
         return
     if not chosen:
         click.echo("no files selected, nothing imported")
         return
     with _session() as (conn, _path):
         for path in chosen:
-            _import_one(conn, path, target_workspace)
+            _import_one(conn, path, target_workspace, whole_file=whole_file)
 
 
 @main.command("agents")
@@ -630,10 +724,12 @@ def _select_paths(paths: Sequence[Path]) -> list[Path]:
     return [path for path in paths if click.confirm(f"    import {path}?", default=False)]
 
 
-def _import_one(conn: sqlite3.Connection, path: Path, workspace: str) -> None:
+def _import_one(
+    conn: sqlite3.Connection, path: Path, workspace: str, *, whole_file: bool = False
+) -> None:
     """Import one file, reporting a read failure without aborting the rest."""
     try:
-        outcome = importer.import_file(conn, path, workspace)
+        outcome = importer.import_file(conn, path, workspace, whole_file=whole_file)
     except (OSError, UnicodeDecodeError) as exc:
         click.echo(f"  cannot read {path}: {exc}")
         return
@@ -644,12 +740,14 @@ def _import_one(conn: sqlite3.Connection, path: Path, workspace: str) -> None:
     click.echo(f"  {importer.TRIM_SUGGESTION_TEMPLATE.format(path=outcome.path)}")
 
 
-def _echo_import_preview(paths: Sequence[Path], workspace: str) -> None:
+def _echo_import_preview(
+    paths: Sequence[Path], workspace: str, *, whole_file: bool = False
+) -> None:
     """Print what an import would create. Opens no database and writes nothing."""
     records: list[str] = []
     for path in paths:
         try:
-            records.extend(importer.read_records(path))
+            records.extend(importer.read_records(path, whole_file=whole_file))
         except (OSError, UnicodeDecodeError) as exc:
             raise click.ClickException(f"cannot read {path}: {exc}") from exc
     click.echo(f"would create {len(records)} records in workspace {workspace!r}")
@@ -750,6 +848,181 @@ def _benchmark_payload(report: benchmark.Benchmark, workspace: str) -> dict[str,
             "core_memory_tokens": report.core_memory_tokens,
         },
         "caveat": benchmark.CAVEAT,
+    }
+
+
+def _echo_audit(report: audit.Audit) -> None:
+    """Render the hygiene report as five numbered sections."""
+    scope = report.workspace if report.workspace is not None else "every workspace"
+    click.echo(f"localmem audit — {scope}")
+    click.echo(f"database: {report.db_path} ({_format_size(report.db_size_bytes)})")
+    _echo_audit_queue(report.queue)
+    _echo_audit_promotions(report.promotion_candidates)
+    _echo_audit_distribution(report)
+    _echo_audit_core(report.core_health)
+    _echo_audit_dead(report)
+
+
+def _echo_audit_queue(queue: audit.QueueReport) -> None:
+    click.echo("\n1. near-duplicate queue")
+    if not queue.pending:
+        click.echo("   no pending pairs — nothing waiting for review")
+        return
+    click.echo(f"   pending pairs: {queue.pending}, oldest {_age(queue.oldest_age_days)}")
+    for name, count in queue.per_workspace:
+        click.echo(f"     {name}  {count}")
+    for pair in queue.samples:
+        # Reused verbatim from `dedupe --list`, so the two commands describe a pair
+        # identically; that is also why these lines are not indented like the rest.
+        _echo_pair(pair)
+    click.echo("   resolve with:")
+    for command in audit.QUEUE_COMMANDS:
+        click.echo(f"     {command}")
+
+
+def _echo_audit_promotions(candidates: tuple[audit.PromotionCandidate, ...]) -> None:
+    click.echo("\n2. core memory promotion candidates")
+    if not candidates:
+        click.echo(f"   nothing has been seen {audit.PROMOTION_SEEN_COUNT_THRESHOLD} times yet")
+        return
+    for candidate in candidates:
+        click.echo(
+            f"   id={candidate.id} workspace={candidate.workspace} kind={candidate.kind} "
+            f"seen={candidate.seen_count} recalled={candidate.recalled_count}"
+        )
+        click.echo(f"     {_preview(candidate.content)}")
+    click.echo(f"   {audit.PROMOTION_NOTE}")
+
+
+def _echo_audit_distribution(report: audit.Audit) -> None:
+    click.echo("\n3. distribution")
+    click.echo(
+        f"   memories: {report.total_memories}   entities: {report.total_entities}   "
+        f"entity links: {report.total_entity_links}"
+    )
+    if not report.workspaces:
+        click.echo("   (no memories yet)")
+        return
+    width = max(len(summary.workspace) for summary in report.workspaces)
+    for summary in report.workspaces:
+        kinds = ", ".join(f"{kind} {count}" for kind, count in summary.per_kind)
+        click.echo(f"   {summary.workspace.ljust(width)}  {summary.total}  ({kinds})")
+        click.echo(
+            f"   {' '.ljust(width)}  oldest {summary.oldest_created_at}, "
+            f"newest {summary.newest_created_at}"
+        )
+
+
+def _echo_audit_core(core_health: tuple[audit.CoreHealth, ...]) -> None:
+    click.echo("\n4. core memory health")
+    if not core_health:
+        click.echo("   no core memories yet")
+        return
+    width = max(len(health.workspace) for health in core_health)
+    for health in core_health:
+        hidden = f"  (hidden by the cap: {health.dropped})" if health.dropped else ""
+        click.echo(
+            f"   {health.workspace.ljust(width)}  ~{health.tokens}/{health.cap} tokens{hidden}"
+        )
+
+
+def _echo_audit_dead(report: audit.Audit) -> None:
+    click.echo("\n5. dead memories")
+    if not report.dead_total:
+        click.echo(
+            f"   none — every memory older than {audit.DEAD_MEMORY_AGE_DAYS} days has "
+            "been recalled at least once"
+        )
+        return
+    click.echo(
+        f"   never recalled and older than {audit.DEAD_MEMORY_AGE_DAYS} days: "
+        f"{report.dead_total} (showing {len(report.dead)})"
+    )
+    for dead in report.dead:
+        click.echo(
+            f"   id={dead.id} workspace={dead.workspace} kind={dead.kind} "
+            f"created={dead.created_at} ({_age(dead.age_days)})"
+        )
+        click.echo(f"     {_preview(dead.content)}")
+    click.echo(f"   {audit.DEAD_MEMORY_NOTE}")
+
+
+def _age(age_days: float | None) -> str:
+    """Render an age in days, or say so when the timestamp could not be read."""
+    return "age unknown" if age_days is None else f"{age_days:g} days old"
+
+
+def _audit_payload(report: audit.Audit) -> dict[str, object]:
+    """Return the whole report as JSON-ready data — same numbers, no rendering."""
+    return {
+        "workspace": report.workspace,
+        "database": {
+            "path": str(report.db_path),
+            "size_bytes": report.db_size_bytes,
+            "memories": report.total_memories,
+            "entities": report.total_entities,
+            "entity_links": report.total_entity_links,
+        },
+        "queue": {
+            "pending": report.queue.pending,
+            "per_workspace": [
+                {"workspace": name, "pending": count} for name, count in report.queue.per_workspace
+            ],
+            "oldest_queued_at": report.queue.oldest_queued_at,
+            "oldest_age_days": report.queue.oldest_age_days,
+            "samples": [_pair_payload(pair) for pair in report.queue.samples],
+            "commands": list(audit.QUEUE_COMMANDS),
+        },
+        "promotion_candidates": {
+            "seen_count_threshold": audit.PROMOTION_SEEN_COUNT_THRESHOLD,
+            "note": audit.PROMOTION_NOTE,
+            "rows": [
+                {
+                    "id": candidate.id,
+                    "workspace": candidate.workspace,
+                    "kind": candidate.kind,
+                    "seen_count": candidate.seen_count,
+                    "recalled_count": candidate.recalled_count,
+                    "content": candidate.content,
+                }
+                for candidate in report.promotion_candidates
+            ],
+        },
+        "workspaces": [
+            {
+                "workspace": summary.workspace,
+                "total": summary.total,
+                "per_kind": [{"kind": kind, "count": count} for kind, count in summary.per_kind],
+                "oldest_created_at": summary.oldest_created_at,
+                "newest_created_at": summary.newest_created_at,
+            }
+            for summary in report.workspaces
+        ],
+        "core_memory": [
+            {
+                "workspace": health.workspace,
+                "tokens": health.tokens,
+                "cap": health.cap,
+                "dropped": health.dropped,
+            }
+            for health in report.core_health
+        ],
+        "dead_memories": {
+            "age_days": audit.DEAD_MEMORY_AGE_DAYS,
+            "total": report.dead_total,
+            "note": audit.DEAD_MEMORY_NOTE,
+            "rows": [
+                {
+                    "id": dead.id,
+                    "workspace": dead.workspace,
+                    "kind": dead.kind,
+                    "created_at": dead.created_at,
+                    "age_days": dead.age_days,
+                    "content": dead.content,
+                }
+                for dead in report.dead
+            ],
+        },
     }
 
 

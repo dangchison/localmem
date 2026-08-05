@@ -4,6 +4,8 @@ Implements ``PLAN.md`` §5. The pipeline is pure code — no model, no network, 
 
 1. query profile — the FTS5 ``MATCH`` expression, the query's entities, its recency cue;
 2. **view A**, lexical: bm25 over ``memories_fts``, workspace-filtered, top 20;
+   a *named* workspace also reads the shared ``global`` tier (§24 of the design
+   decisions); ``None`` ("every workspace") and ``"global"`` itself are unchanged;
 3. **view B**, relational: memories sharing an entity with the query, scored by Σweight;
 4. fuse — each view min-max normalized independently, then weighted;
 5. recency and ``seen_count`` boosts;
@@ -181,6 +183,22 @@ SELECT m.id AS id, m.content AS content, COUNT(*) AS shared
 
 _ENTITY_NEIGHBOR_ORDER_BY = " GROUP BY m.id ORDER BY shared DESC, m.id ASC LIMIT ?"
 
+# The two workspace predicates a view can carry. Both bind every value; neither is ever
+# built from a workspace name. Evidence closure keeps using the exact form against the
+# result row's *own* workspace, so a global hit gathers global neighbors and a repo hit
+# gathers repo neighbors — the tiers stay legible in the output.
+_WORKSPACE_EXACT = "m.workspace = ?"
+_WORKSPACE_WITH_SHARED = "m.workspace IN (?, ?)"
+
+# PLAN.md §4's `workspace` is on every result, so an agent can see which tier answered.
+# Tracking is best-effort and deliberately writes nothing else; see `_record_recall`.
+_RECORD_RECALL_SQL = """
+UPDATE memories
+   SET recalled_count = recalled_count + 1,
+       last_recalled_at = datetime('now')
+ WHERE id IN ({placeholders})
+"""
+
 
 @dataclass(frozen=True)
 class Neighbor:
@@ -278,9 +296,13 @@ def retrieve(
     Args:
         conn: an open connection.
         query: free text; FTS5 metacharacters are neutralized before matching.
-        workspace: restrict to one workspace; ``None`` spans every workspace.
+        workspace: restrict to one workspace, which also reads the shared ``global``
+            tier; ``None`` spans every workspace.
         k: number of results, from 1 to 20.
         now: the instant recency is measured against; defaults to the current UTC time.
+
+    A recall is *almost* read-only: the ids it returns get their ``recalled_count``
+    bumped by :func:`_record_recall`, best-effort and never able to fail the call.
 
     Raises:
         ValueError: if ``k`` is out of range or ``workspace`` is empty.
@@ -306,7 +328,7 @@ def retrieve(
         # entities under any of the indexer's classes, so stripping them would only risk
         # two divergent query texts flowing through the pipeline.
         relational = _relational_view(conn, query_entities(query), scope)
-        top = _fuse(lexical, relational, moment, recency_weight)[:k]
+        top = _fuse(lexical, relational, moment, recency_weight, scope)[:k]
 
     selected = {scored.row.id for scored in top}
     results = tuple(
@@ -326,6 +348,7 @@ def retrieve(
         for scored in top
     )
     core = core_memory.build_core_memory(conn, scope)
+    _record_recall(conn, [memory.id for memory in results])
     return RetrievalResult(
         results=results,
         core_memory=core.text,
@@ -430,11 +453,12 @@ def _cue_length_at(folded: list[str], position: int) -> int:
 
 def _lexical_view(conn: sqlite3.Connection, match_expression: str, workspace: str | None) -> _View:
     """View A: bm25 over the FTS5 index, best ``CANDIDATE_LIMIT`` rows."""
+    predicate, scope = _workspace_scope(workspace)
     sql = _LEXICAL_SQL
     params: list[object] = [match_expression]
-    if workspace is not None:
-        sql += " AND m.workspace = ?"
-        params.append(workspace)
+    if predicate:
+        sql += " AND " + predicate
+        params.extend(scope)
     params.append(CANDIDATE_LIMIT)
     return _read_view(conn, sql + _LEXICAL_ORDER_BY, params)
 
@@ -447,12 +471,13 @@ def _relational_view(
         # `IN ()` is a syntax error in SQLite, and a query with no entities has no
         # relational view to build anyway.
         return _View({}, {})
+    predicate, scope = _workspace_scope(workspace)
     placeholders = ", ".join("?" for _ in entity_names)
     sql = _RELATIONAL_SQL.format(placeholders=placeholders)
     params: list[object] = list(entity_names)
-    if workspace is not None:
-        sql += " AND m.workspace = ?"
-        params.append(workspace)
+    if predicate:
+        sql += " AND " + predicate
+        params.extend(scope)
     params.append(CANDIDATE_LIMIT)
     return _read_view(conn, sql + _RELATIONAL_ORDER_BY, params)
 
@@ -465,11 +490,12 @@ def _recent_view(
     Reached only when the query consisted entirely of recency cues, so there is no
     lexical or relational signal to fuse — both view scores are reported as ``None``.
     """
+    predicate, scope = _workspace_scope(workspace)
     sql = _RECENT_SQL
     params: list[object] = []
-    if workspace is not None:
-        sql += " WHERE m.workspace = ?"
-        params.append(workspace)
+    if predicate:
+        sql += " WHERE " + predicate
+        params.extend(scope)
     params.append(k)
     return [
         _Scored(
@@ -480,6 +506,46 @@ def _recent_view(
         )
         for row in _read_rows(conn, sql + _RECENT_ORDER_BY, params)
     ]
+
+
+def _workspace_scope(workspace: str | None) -> tuple[str, list[object]]:
+    """Return a view's workspace predicate and the values it binds.
+
+    Three cases, and only the middle one is new:
+
+    * ``None`` — "every workspace"; no predicate at all.
+    * a named workspace — that workspace **and** the shared
+      :data:`localmem.core_memory.GLOBAL_WORKSPACE` tier. Two named workspaces stay
+      fully isolated from each other; ``global`` is the one deliberately shared tier.
+    * ``"global"`` itself — exactly itself, so the shared tier never widens to
+      everything.
+    """
+    if workspace is None:
+        return "", []
+    if workspace == core_memory.GLOBAL_WORKSPACE:
+        return _WORKSPACE_EXACT, [workspace]
+    return _WORKSPACE_WITH_SHARED, [workspace, core_memory.GLOBAL_WORKSPACE]
+
+
+def _record_recall(conn: sqlite3.Connection, memory_ids: list[int]) -> None:
+    """Bump ``recalled_count`` and ``last_recalled_at`` for the rows just returned.
+
+    Best-effort by design: usage tracking is a convenience for ``audit``, and a recall
+    must never fail because of it. Only :class:`sqlite3.Error` is swallowed — a bug in
+    this function still propagates. Neighbors are deliberately not counted: they were
+    attached as evidence, not asked for.
+
+    One statement, outside any transaction the caller owns, over the ids of the final
+    top-k. The ``memories`` FTS triggers fire on ``UPDATE OF content`` only, so this
+    write costs no index maintenance.
+    """
+    if not memory_ids:
+        return
+    placeholders = ", ".join("?" for _ in memory_ids)
+    try:
+        conn.execute(_RECORD_RECALL_SQL.format(placeholders=placeholders), memory_ids)
+    except sqlite3.Error:
+        return
 
 
 def _read_view(conn: sqlite3.Connection, sql: str, params: list[object]) -> _View:
@@ -506,8 +572,19 @@ def _to_row(row: sqlite3.Row) -> _Row:
     )
 
 
-def _fuse(lexical: _View, relational: _View, now: datetime, recency_weight: float) -> list[_Scored]:
-    """Combine both views into one ranking, best first."""
+def _fuse(
+    lexical: _View,
+    relational: _View,
+    now: datetime,
+    recency_weight: float,
+    workspace: str | None = None,
+) -> list[_Scored]:
+    """Combine both views into one ranking, best first.
+
+    ``workspace`` only breaks ties: at an equal fused score the row that belongs to the
+    workspace being searched outranks one from the shared ``global`` tier. There is no
+    score penalty for being global — a genuinely better global row still wins.
+    """
     normalized_lexical = _min_max(lexical.scores)
     normalized_relational = _min_max(relational.scores)
     if relational.scores:
@@ -526,7 +603,14 @@ def _fuse(lexical: _View, relational: _View, now: datetime, recency_weight: floa
         fused += seen_count_boost(row.seen_count)
         scored.append(_Scored(row, fused, lexical_score, relational_score))
     return sorted(
-        scored, key=lambda item: (item.score, item.row.created_at, item.row.id), reverse=True
+        scored,
+        key=lambda item: (
+            item.score,
+            item.row.workspace == workspace,
+            item.row.created_at,
+            item.row.id,
+        ),
+        reverse=True,
     )
 
 

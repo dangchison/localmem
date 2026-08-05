@@ -90,6 +90,7 @@ class Stats:
     per_kind: tuple[tuple[str, int], ...]
     total_entities: int
     total_entity_links: int
+    total_recalled: int
     queue_depth: int
     core_memory_tokens: int
     core_memory_dropped: int
@@ -217,9 +218,16 @@ def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
 
     ``core_memory_tokens`` sums each workspace's core memory *after* its own cap, because
     that is the cost a recall actually pays; ``core_memory_dropped`` reports how many
-    rows that cap is currently hiding.
+    rows that cap is currently hiding. Since a named workspace also loads the shared
+    ``global`` tier, that tier is charged once per workspace that would load it.
+
+    ``total_recalled`` counts recalls, not memories: one row returned five times
+    contributes five.
     """
     total_row = conn.execute("SELECT COUNT(*) AS total FROM memories").fetchone()
+    recalled_row = conn.execute(
+        "SELECT COALESCE(SUM(recalled_count), 0) AS n FROM memories"
+    ).fetchone()
     entity_row = conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
     link_row = conn.execute("SELECT COUNT(*) AS n FROM memory_entities").fetchone()
     queue_row = conn.execute(
@@ -241,6 +249,7 @@ def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
         per_kind=tuple((row["kind"], int(row["n"])) for row in per_kind),
         total_entities=int(entity_row["n"]),
         total_entity_links=int(link_row["n"]),
+        total_recalled=int(recalled_row["n"]),
         queue_depth=int(queue_row["n"]),
         core_memory_tokens=core_tokens,
         core_memory_dropped=core_dropped,

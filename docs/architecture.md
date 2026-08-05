@@ -2,7 +2,7 @@
 
 How a memory gets in, how it comes back out, and what the database looks like in between.
 
-This document describes **what v0.1.0 does**. `design_decisions.md` is the companion record of
+This document describes **what v0.2.0 does**. `design_decisions.md` is the companion record of
 **why** — every deviation from `PLAN.md` and every accepted limitation, with its measurement.
 Where the two touch, this file links rather than repeats.
 
@@ -16,13 +16,15 @@ localmem/
 ├── store.py        add_memory(), the FTS5 MATCH sanitizer, stats aggregation
 ├── dedup.py        tier-1 hashing, tier-2 candidate + Jaccard gate, queue review, gc
 ├── indexer.py      regex entity extraction, entities/memory_entities maintenance, backfill
-├── core_memory.py  the always-load tier: kind='core' rows, token-capped
-├── retriever.py    dual-view retrieval, fusion, boosts, evidence closure
+├── core_memory.py  the always-load tier: kind='core' rows, token-capped, two-tier merge
+├── retriever.py    dual-view retrieval, fusion, boosts, evidence closure, recall tracking
 ├── tokens.py       character-based token estimation (imports nothing from localmem)
-├── importer.py     markdown → records
+├── importer.py     markdown → records (split, or one record per file)
 ├── benchmark.py    push cost vs. fixed pull cost
+├── audit.py        the read-only hygiene report; every statement is a SELECT
+├── transfer.py     export/restore of the raw memories table
 ├── mcp_server.py   the two frozen tools, stdio
-├── cli.py          eleven commands; the only module that calls Path.home()
+├── cli.py          fourteen commands; the only module that calls Path.home()
 └── agents/         one config writer per supported agent
 ```
 
@@ -87,6 +89,9 @@ query
   │      • query_entities(): the same extractor the indexer uses, run over the *full*
   │        original query.
   │      • workspace: the parameter, or detected from cwd; None means every workspace.
+  │        A *named* workspace resolves to `workspace IN (?, 'global')` — it reads its own
+  │        rows and the shared tier. `'global'` itself and None are unchanged, and two
+  │        named workspaces never see each other. See design_decisions.md §24.
   │
   ├─ 2. view A — lexical: bm25 over memories_fts, workspace-filtered, top 20.
   │
@@ -95,6 +100,7 @@ query
   │
   ├─ 4. fuse: each view min-max normalized into [0, 1] independently, then
   │      0.6·lexical + 0.4·relational — flipped to 0.4/0.6 when view B found anything.
+  │      Ties break towards the current workspace; there is no penalty for being global.
   │
   ├─ 5. boosts: + weight·2^(-age_days/30) recency decay, + 0.02·ln(seen_count).
   │      The recency weight is 0.05 normally and 0.25 when the query carried a cue; the
@@ -104,9 +110,19 @@ query
   │      in the results. Session-adjacent rows first, then top co-occurring entity
   │      siblings. See "session_id" below — in practice this is the entity path.
   │
-  └─ 7. core memory: kind='core' rows for the workspace, oldest first, joined by newline,
-         capped at ~400 estimated tokens by dropping whole rows from the front.
+  ├─ 7. core memory: kind='core' rows for the workspace, oldest first, joined by newline,
+  │      capped at ~400 estimated tokens by dropping whole rows from the front. For a named
+  │      workspace its own rows are fitted first and the shared 'global' rows fill the
+  │      remainder, so the cap costs the shared tier before it costs the repo's own.
+  │
+  └─ 8. recall tracking: one best-effort UPDATE bumping recalled_count and last_recalled_at
+         for the returned ids — not for neighbours. Wrapped in `except sqlite3.Error`, so a
+         recall can never fail because of it, and it adds no field to the §4 payload.
 ```
+
+Evidence closure keeps each hit inside its **own** workspace: a global hit gathers global
+neighbours, a repo hit gathers repo neighbours. The fallback widens which rows can be *found*,
+not which rows count as evidence for one another.
 
 A query consisting of nothing but recency cues (`today`, `hôm qua`) skips both views and
 returns the workspace ordered `created_at DESC`, scored by the recency term alone. That is a
@@ -143,13 +159,17 @@ when a transport that fields genuinely concurrent clients lands.
 
 ## Schema
 
-Version 1, `localmem/schema.sql`. Migrations are forward-only: `db.migrate()` reads
-`meta.schema_version` and applies numbered steps, idempotently.
+Version **2**. `localmem/schema.sql` is the version-1 baseline and is never edited; migrations
+are forward-only, and `db.migrate()` reads `meta.schema_version` and applies the numbered steps
+after it, idempotently. Version 2 is `db._add_recall_tracking`, two `ALTER TABLE ... ADD COLUMN`
+statements — the first real use of the mechanism built in M1. A v0.1.0 database upgrades in
+place on the next open, with its data untouched and `recalled_count` starting at 0.
 
 ```sql
 memories(
     id, content, content_hash, workspace, kind, source, session_id,
     seen_count, superseded_by, created_at, updated_at,
+    recalled_count, last_recalled_at,          -- schema version 2
     UNIQUE (workspace, content_hash)
 )
 memories_fts        -- external-content FTS5 over memories.content,
@@ -171,8 +191,9 @@ collide and leak one project's memory into another's recall. Deduplication is pe
 design; workspaces are the privacy and relevance boundary of the product.
 
 **`kind`** is one of `note` (default), `trace`, `imported`, `core`. The MCP `memory_add` tool
-accepts only the first three — `imported` belongs to the importer, and an agent has no business
-writing one.
+accepts only `note` and `trace`: `imported` belongs to the importer, and `core` is the
+always-load tier and therefore human-curated — an agent acting on injected instructions must
+not be able to write one. `localmem add --kind core` still does. See `design_decisions.md` §23.
 
 **`session_id`** is populated only by `localmem add --session-id`. The frozen `memory_add` tool
 schema has no such parameter, so **every memory written through MCP stores `NULL`**. The
@@ -180,9 +201,14 @@ retriever's session-adjacency neighbour query is guarded by `row.session_id is n
 means it never fires for MCP-written memories; those results get entity-sibling neighbours
 instead. The column is reserved for CLI provenance and for a future `SessionEnd` hook.
 
-**`superseded_by`** is a reserved column with **no logic behind it**. Nothing in v0.1.0 reads
-or writes it. Tier-3 temporal supersede is a v0.2 item; the column exists so that landing it
-needs no migration.
+**`superseded_by`** is a reserved column with **no logic behind it**. Nothing in v0.2.0 reads
+or writes it, and `transfer.restore` deliberately does not carry it: it holds a row id, and row
+ids are local to a database. Tier-3 temporal supersede is still open.
+
+**`recalled_count` / `last_recalled_at`** arrive with schema version 2 and are written by one
+best-effort statement at the end of `retriever.retrieve()`. They exist for `audit` and `stats`;
+nothing in retrieval reads them, and no MCP payload carries them. Rows that predate the upgrade
+start at 0, which `audit` states on every run rather than letting it read as history.
 
 **`dedup_queue.status`** is `pending`, `merged` or `kept_both`. Both `memory_id` and
 `candidate_id` declare `ON DELETE CASCADE`, so resolving a pair with `--merge` — which deletes

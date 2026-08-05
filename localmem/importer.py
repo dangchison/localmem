@@ -79,28 +79,60 @@ def parse_records(text: str) -> list[str]:
     return _Splitter().run(text)
 
 
-def read_records(path: Path) -> list[str]:
+def whole_file_records(text: str) -> list[str]:
+    """Return ``text`` as exactly one record, or none at all if it has no content.
+
+    The counterpart to :func:`parse_records` for documents that only make sense whole —
+    a security checklist, a coding-standard skill — where a recall has to return the
+    entire thing rather than the one bullet that matched. No heading prefix is applied:
+    the document already carries its own headings.
+    """
+    body = text.strip()
+    return [body] if _has_content(body) else []
+
+
+def read_records(path: Path, *, whole_file: bool = False) -> list[str]:
     """Return the records ``path`` splits into.
+
+    Args:
+        path: the markdown file to read.
+        whole_file: keep the file as a single record instead of splitting it.
 
     Raises:
         OSError: if the file cannot be read.
         UnicodeDecodeError: if it is not valid UTF-8.
     """
-    return parse_records(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    return whole_file_records(text) if whole_file else parse_records(text)
 
 
-def import_file(conn: sqlite3.Connection, path: Path, workspace: str) -> ImportOutcome:
+def import_file(
+    conn: sqlite3.Connection,
+    path: Path,
+    workspace: str,
+    *,
+    whole_file: bool = False,
+) -> ImportOutcome:
     """Store every record of ``path`` in ``workspace``, running dedup tiers 1 and 2.
 
     Re-importing an unchanged file adds no rows: each record hashes to the value it
-    hashed to last time, so tier 1 merges it and bumps ``seen_count``.
+    hashed to last time, so tier 1 merges it and bumps ``seen_count``. That holds for
+    ``whole_file`` too — the single record hashes the same way any other one does.
+
+    Args:
+        conn: an open connection.
+        path: the markdown file to read.
+        workspace: where the records are stored.
+        whole_file: store the file as one record instead of splitting it. ``kind`` and
+            ``source`` are unchanged either way, so the two modes share a workspace
+            without colliding: their records hash differently and never merge.
 
     Raises:
         OSError: if the file cannot be read.
         UnicodeDecodeError: if it is not valid UTF-8.
         ValueError: if ``workspace`` is empty.
     """
-    records = read_records(path)
+    records = read_records(path, whole_file=whole_file)
     source = source_for(path)
     added = 0
     merged = 0
@@ -172,10 +204,17 @@ class _Splitter:
         if not lines:
             return
         body = "\n".join(lines).strip("\n")
-        # A horizontal rule or a row of punctuation is markup, not a memory.
-        if not any(character.isalnum() for character in body):
+        if not _has_content(body):
             return
         self._records.append(f"[{self._heading}] {body}" if self._heading else body)
+
+
+def _has_content(body: str) -> bool:
+    """Return whether ``body`` is a memory rather than markup.
+
+    A horizontal rule or a row of punctuation carries nothing to remember.
+    """
+    return any(character.isalnum() for character in body)
 
 
 def _closes_fence(line: str, opener: str) -> bool:

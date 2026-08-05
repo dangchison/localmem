@@ -113,15 +113,78 @@ def test_schema_creates_reserved_tables(conn: sqlite3.Connection) -> None:
 
 def test_migration_is_idempotent(conn: sqlite3.Connection, db_path: Path) -> None:
     store.add_memory(conn, "keep me", "ws")
-    assert db.schema_version(conn) == 1
+    assert db.schema_version(conn) == db.CURRENT_SCHEMA_VERSION
     conn.close()
 
     reopened = db.open_database(db_path)
     try:
-        assert db.schema_version(reopened) == 1
+        assert db.schema_version(reopened) == db.CURRENT_SCHEMA_VERSION
         assert reopened.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
     finally:
         reopened.close()
+
+
+def _columns(connection: sqlite3.Connection) -> set[str]:
+    return {row["name"] for row in connection.execute("PRAGMA table_info(memories)").fetchall()}
+
+
+def _open_at_version_1(path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """Open ``path`` with only the v1 migration registered — a v0.1.0 database."""
+    monkeypatch.setattr(db, "_MIGRATIONS", db._MIGRATIONS[:1])
+    return db.open_database(path)
+
+
+def test_a_version_1_database_upgrades_with_its_data_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The forward-only mechanism built in M1, used for real for the first time."""
+    path = tmp_path / "v1.db"
+    old = _open_at_version_1(path, monkeypatch)
+    try:
+        store.add_memory(old, "use pnpm not npm", "ws")
+        store.add_memory(old, "prefer small commits", "ws", "core")
+        assert db.schema_version(old) == 1
+        assert "recalled_count" not in _columns(old)
+    finally:
+        old.close()
+    monkeypatch.undo()
+
+    upgraded = db.open_database(path)
+    try:
+        assert db.schema_version(upgraded) == 2
+        assert {"recalled_count", "last_recalled_at"} <= _columns(upgraded)
+        rows = upgraded.execute(
+            "SELECT content, recalled_count, last_recalled_at FROM memories ORDER BY id"
+        ).fetchall()
+        assert [row["content"] for row in rows] == ["use pnpm not npm", "prefer small commits"]
+        # Every pre-existing row starts the counter at zero, not at NULL.
+        assert [row["recalled_count"] for row in rows] == [0, 0]
+        assert [row["last_recalled_at"] for row in rows] == [None, None]
+        hits = store.search_memories(upgraded, "pnpm", "ws")
+        assert [hit.content for hit in hits] == ["use pnpm not npm"]
+    finally:
+        upgraded.close()
+
+
+def test_upgrading_a_version_1_database_twice_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "v1.db"
+    old = _open_at_version_1(path, monkeypatch)
+    try:
+        store.add_memory(old, "use pnpm not npm", "ws")
+    finally:
+        old.close()
+    monkeypatch.undo()
+
+    first = db.open_database(path)
+    first.close()
+    second = db.open_database(path)
+    try:
+        assert db.migrate(second) == db.CURRENT_SCHEMA_VERSION
+        assert second.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    finally:
+        second.close()
 
 
 def test_open_database_creates_parent_directories(tmp_path: Path) -> None:
@@ -345,6 +408,29 @@ def test_stats_counts_workspaces_and_kinds(conn: sqlite3.Connection, db_path: Pa
     assert dict(summary.per_kind) == {"note": 2, "core": 1}
 
 
+def test_stats_totals_the_recorded_recalls(conn: sqlite3.Connection, db_path: Path) -> None:
+    from localmem import retriever
+
+    store.add_memory(conn, "use pnpm not npm", "a")
+    store.add_memory(conn, "never looked at", "a")
+    assert store.collect_stats(conn, db_path).total_recalled == 0
+
+    retriever.retrieve(conn, "pnpm", "a")
+    retriever.retrieve(conn, "pnpm", "a")
+
+    # Recalls, not memories: one row returned twice counts twice.
+    assert store.collect_stats(conn, db_path).total_recalled == 2
+
+
+def test_cli_stats_reports_recalls(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "use pnpm not npm", "-w", "a"])
+    runner.invoke(main, ["search", "pnpm", "-w", "a"])
+    result = runner.invoke(main, ["stats"])
+    assert result.exit_code == 0
+    assert "recalls: 1 recorded across all memories" in result.output
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -356,12 +442,15 @@ def test_cli_exposes_exactly_the_expected_commands() -> None:
     assert set(main.commands) == {
         "add",
         "agents",
+        "audit",
         "backfill",
         "benchmark",
         "dedupe",
+        "export",
         "gc",
         "import",
         "init",
+        "restore",
         "search",
         "serve",
         "stats",

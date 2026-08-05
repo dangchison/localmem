@@ -29,7 +29,7 @@ from typing import Any, Literal
 
 from mcp.server import MCPServer
 
-from localmem import __version__, config, db, retriever, store
+from localmem import __version__, config, core_memory, db, retriever, store
 
 SERVER_NAME = "localmem"
 
@@ -52,9 +52,18 @@ ADD_DESCRIPTION = (
 # workspace name, which is why memory_add rejects it.
 ALL_WORKSPACES = "all"
 
-# §4 offers three kinds to agents. `imported` is a valid database kind but belongs to the
-# importer, not to the tool surface — an agent has no business writing one.
-ADD_KINDS = ("note", "trace", "core")
+# The kinds an agent may write. `imported` belongs to the importer and `core` to the human
+# (see :data:`CORE_KIND_REJECTION`); neither is on the tool surface. This is input
+# validation, not a change to §4's payload shape — see docs/design_decisions.md §23.
+ADD_KINDS = ("note", "trace")
+
+# Core memory is a *push* tier: every recall loads it, in every session. An agent acting on
+# injected instructions must therefore not be able to write one, and with the global tier
+# (§24) a single poisoned core row would reach every workspace. The CLI still writes them.
+CORE_KIND_REJECTION = (
+    "kind 'core' is human-curated — core memory is loaded into every recall, so it is "
+    "written by a person, not by an agent. Use `localmem add --kind core` from the CLI."
+)
 
 # Every failure payload carries this prefix so a caller can tell a localmem problem from
 # a legitimately empty result.
@@ -138,7 +147,8 @@ def memory_add(
         content: the text to remember; must not be blank.
         workspace: a workspace name, or ``None`` to detect one from the current
             directory. ``"all"`` is rejected — it is a recall filter, not a place.
-        kind: one of :data:`ADD_KINDS`.
+        kind: one of :data:`ADD_KINDS`. ``"core"`` is rejected with
+            :data:`CORE_KIND_REJECTION`, which names the CLI command that writes one.
         source: the calling agent's name, if it knows it.
 
     Returns:
@@ -176,6 +186,8 @@ def _add(content: str, workspace: str | None, kind: str, source: str | None) -> 
         # Checked before the workspace is resolved so an empty write never pays for the
         # `git rev-parse` that detection runs.
         raise ValueError("content is empty; pass the text you want to remember")
+    if kind == core_memory.CORE_KIND:
+        raise ValueError(CORE_KIND_REJECTION)
     if kind not in ADD_KINDS:
         raise ValueError(f"kind must be one of {', '.join(ADD_KINDS)}; got {kind!r}")
     target = _add_workspace(workspace)
