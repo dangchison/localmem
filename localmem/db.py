@@ -28,11 +28,20 @@ def connect(path: Path) -> sqlite3.Connection:
 
     Transactions are managed explicitly (see :func:`transaction`), so the
     connection runs in autocommit mode.
+
+    ``sqlite3.connect`` succeeds against any file; a corrupt one only fails on the
+    first statement, which is ``PRAGMA journal_mode=WAL``. The setup is therefore
+    guarded so the half-built connection is closed rather than dropped unreferenced.
+    The original exception propagates untouched — callers match on ``sqlite3.Error``.
     """
     conn = sqlite3.connect(path, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    for pragma in _CONNECTION_PRAGMAS:
-        conn.execute(pragma)
+    try:
+        conn.row_factory = sqlite3.Row
+        for pragma in _CONNECTION_PRAGMAS:
+            conn.execute(pragma)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

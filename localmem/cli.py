@@ -1,4 +1,4 @@
-"""Command line interface: ``add``, ``search``, ``stats``, ``backfill``, ``dedupe``, ``gc``.
+"""Commands: ``add``, ``search``, ``stats``, ``backfill``, ``dedupe``, ``gc``, ``serve``.
 
 Every command runs headless — no prompts, no TTY requirement. ``dedupe`` prompts only
 when stdin is a terminal; with no terminal and no flags it prints the pending queue and
@@ -224,6 +224,19 @@ def gc(dry_run: bool, days: int) -> None:
     click.echo(f"pruned {pruned} resolved queue rows older than {days} days")
     click.echo(f"size:    {_format_size(size_before)} -> {_format_size(size_after)}")
     click.echo(f"queue depth: {len(remaining)} pending near-duplicate pairs")
+
+
+@main.command()
+def serve() -> None:
+    """Run the MCP server on stdio; this is what agent configs invoke.
+
+    Emits nothing on stdout — that channel carries JSON-RPC framing.
+    """
+    # Imported here, not at module scope: the MCP SDK pulls in starlette, uvicorn and
+    # httpx, and no other command needs any of them.
+    from localmem import mcp_server
+
+    mcp_server.serve()
 
 
 @contextmanager

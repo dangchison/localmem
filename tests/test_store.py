@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,51 @@ def test_open_database_creates_parent_directories(tmp_path: Path) -> None:
     connection = db.open_database(nested)
     connection.close()
     assert nested.exists()
+
+
+def test_opening_a_corrupt_database_does_not_leak_its_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4 fix round 1: the half-built connection is closed, so no ResourceWarning.
+
+    ``sqlite3.connect`` succeeds against any file; the first statement is what fails,
+    and that statement is ``PRAGMA journal_mode=WAL``. ``connect`` used to drop the
+    connection it had just opened, unreferenced and unclosed. The MCP server opens a
+    connection per tool call, so against a corrupt database that was one leaked handle
+    per call.
+
+    Both halves are asserted, because either alone would pass vacuously: the connection
+    object is closed (the mechanism), and nothing reaches ``sys.unraisablehook`` once
+    the last reference is dropped (the symptom pytest reports as a ResourceWarning).
+    The exception callers see is unchanged — ``cli._session`` and the MCP tool boundary
+    both match on ``sqlite3.Error``.
+    """
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"this is not a SQLite database" * 64)
+
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    unraisable: list[str] = []
+    monkeypatch.setattr(sqlite3, "connect", recording_connect)
+    monkeypatch.setattr(sys, "unraisablehook", lambda hook: unraisable.append(str(hook.exc_value)))
+
+    with pytest.raises(sqlite3.Error):
+        db.open_database(corrupt)
+
+    assert opened, "open_database never reached sqlite3.connect"
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
+
+    opened.clear()
+    gc.collect()
+    assert unraisable == []
 
 
 def test_schema_version_rejects_corrupt_value(conn: sqlite3.Connection) -> None:
@@ -304,8 +351,17 @@ def test_stats_counts_workspaces_and_kinds(conn: sqlite3.Connection, db_path: Pa
 def test_cli_exposes_exactly_the_expected_commands() -> None:
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
-    # M3 added dedupe and gc; the assertion stays exact so a stray command is noticed.
-    assert set(main.commands) == {"add", "search", "stats", "backfill", "dedupe", "gc"}
+    # M3 added dedupe and gc, M4 added serve; the assertion stays exact so a stray
+    # command is noticed.
+    assert set(main.commands) == {
+        "add",
+        "search",
+        "stats",
+        "backfill",
+        "dedupe",
+        "gc",
+        "serve",
+    }
 
 
 def test_cli_add_round_trip() -> None:

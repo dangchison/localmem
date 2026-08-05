@@ -415,3 +415,172 @@ Two consequences follow, both deliberate:
   cue handling; when no cue is found the original string is what continues down the pipeline.
 - Verified end to end: `search "recent pnpm"` now returns the same two rows as `search "pnpm"`,
   scored 0.85/0.25 instead of 0.65/0.05 — same rows, heavier recency term.
+
+## 14. The `PLAN.md` §4 payloads are frozen, and the internal dataclasses carry more than they emit
+
+**Milestone:** M4
+
+`retriever.RetrievalResult` and `retriever.RetrievedMemory` were shaped in M3 to satisfy §4
+without rework, and they carry a little more than §4 lists. `mcp_server.py` emits the §4 subset
+and nothing else. The API freezes at this milestone, so the difference is recorded rather than
+left to be rediscovered.
+
+**`memory_recall`** emits exactly three top-level keys — `results`, `core_memory`, `message` —
+and each result object exactly eight:
+
+```jsonc
+{ "id": int, "content": str, "workspace": str, "kind": str,
+  "source": str|null, "created_at": "YYYY-MM-DDTHH:MM:SSZ", "score": float,
+  "neighbors": [ { "id": int, "content": str } ] }
+```
+
+Withheld on purpose:
+
+| carried internally | why it is not on the wire |
+|---|---|
+| `RetrievalResult.core_memory_tokens` | a cost estimate; §4 has no field for it and `localmem stats` already reports it |
+| `RetrievalResult.core_memory_dropped` | same — a `stats` concern, not a recall answer |
+| `RetrievedMemory.seen_count` | §4's result object does not list it; `memory_add` returns it because §4 *does* list it there |
+| `RetrievedMemory.lexical_score` / `relational_score` | fusion diagnostics; the fused `score` is the answer |
+| `session_id` | provenance the agent did not supply and cannot use |
+
+**`memory_add`** emits exactly `{"status", "id", "seen_count"}`. `store.add_memory` accepts a
+`session_id`, but §4's input schema has no such parameter, so the MCP layer always passes `None`.
+Adding it later is additive; removing a shipped field is not.
+
+**Failure payloads keep the success shape** and add the reason, so a client never has to branch
+on the transport to read an answer:
+
+```jsonc
+{"results": [], "core_memory": "", "message": "localmem error: …"}
+{"status": "error", "id": 0, "seen_count": 0, "message": "localmem error: …"}
+```
+
+`memory_add`'s failure payload is the one place a key appears that success does not have. That is
+deliberate: `message` present *means* the call failed, and a successful add has nothing to say.
+
+**Timestamps are converted in the MCP layer only.** SQLite writes `datetime('now')` as
+`YYYY-MM-DD HH:MM:SS` in UTC with no offset; §4's wire format is RFC 3339 (`…T…Z`).
+`mcp_server._to_wire_timestamp` bridges the two. `retriever.py` is untouched — it owns no wire
+format, and the CLI legitimately prints the stored spelling. A value the database could not have
+written is passed through unchanged rather than raising, matching how `retriever.recency_boost`
+treats the same column.
+
+**`score` is passed through, rounded to 4 places.** §4's `0.87` is illustrative, not a bound.
+Fused scores land in that neighbourhood because each view is min-max normalized into `[0, 1]`
+*before* fusion (§8 above explains why the raw bm25 values, ~1e-6, cannot be used directly).
+
+## 15. `except Exception` is authorized at the MCP tool boundary, and nowhere else in the codebase
+
+**Milestone:** M4
+
+`PLAN.md` §4 says a recall on an empty database is "**Never an error**". That promise cannot be
+kept by an unguarded handler: a corrupt database, an unreadable file, a `ValueError` from
+workspace validation would all become an MCP protocol error, and a traceback rendered into the
+protocol stream is worse than a degraded payload — it costs the agent the answer *and* the
+session.
+
+**Decision:** `mcp_server.memory_recall` and `mcp_server.memory_add` each wrap their whole body
+in `except Exception`. These two functions are the only place in `localmem` where that is
+allowed. Everywhere else, exceptions are caught by type.
+
+Three properties make this a boundary guard rather than a swallow:
+
+- **It is not a bare `except:`.** `BaseException` — `KeyboardInterrupt`, `SystemExit`, and
+  anyio's cancellation exceptions — still propagates, so shutdown and cancellation are
+  unaffected. A test asserts this.
+- **Nothing is lost.** The full exception is logged to stderr with `Logger.exception`, and the
+  message reaches the caller in the payload behind the `localmem error: ` prefix.
+- **It is one function deep.** Each tool delegates immediately to a private `_recall` / `_add`
+  that raises normally, so the guarded region is a single call and no logic hides inside it.
+
+Input validation uses the same path on purpose: `k` out of range, `kind='imported'`, blank
+content and `workspace='all'` on a write all raise `ValueError` and surface as the same error
+payload. One shape for every failure means the client has one thing to check.
+
+## 16. One SQLite connection per MCP tool call, not one per server process
+
+**Milestone:** M4
+
+The obvious design — open the database when the server starts, reuse it — is wrong twice over.
+
+1. **Concurrency.** `store.add_memory` runs a `BEGIN IMMEDIATE` read-then-write sequence. A
+   `sqlite3.Connection` has one transaction state; two calls interleaving on one connection can
+   commit each other's work or fail on a nested `BEGIN`. Separate connections serialize through
+   SQLite's own locking, which is what `busy_timeout=5000` is there for.
+2. **WAL growth.** SQLite auto-checkpoints when the *last* connection to a database closes. A
+   connection held open for the life of a long-running agent session suppresses that, and the
+   `-wal` sidecar grows without bound.
+
+**Decision:** `mcp_server._connection()` opens the database at handler entry and closes it in a
+`finally`. Measured on a local file this is well under a millisecond — far below the cost of the
+FTS5 query it wraps.
+
+**Consequences**
+
+- After a session of ten tool calls the database directory holds `memory.db` alone: no `-wal`,
+  no `-shm`. This is asserted by a test that drives a real `localmem serve` subprocess.
+- The database path is resolved per call, so `$LOCALMEM_DB` is read at call time, not pinned at
+  startup. So is workspace detection: one server process outlives any single directory an agent
+  asks about.
+- **A leak found while testing this, fixed in M4 fix round 1:** `db.connect` applies its PRAGMAs
+  *after* `sqlite3.connect` returns, and `db.open_database`'s `try/except BaseException: close()`
+  guard wrapped only `migrate()`. Against a corrupt database file `PRAGMA journal_mode=WAL`
+  raises and the connection object was dropped unclosed — one `ResourceWarning` per tool call
+  for a server whose database is corrupt. `db.connect` now guards its own setup with
+  `try/except BaseException: conn.close(); raise`, so the exception callers see is unchanged
+  (`cli._session` and the MCP tool boundary both match on `sqlite3.Error`) while the half-built
+  connection is closed. The regression test asserts both halves — that the connection object is
+  closed, and that nothing reaches `sys.unraisablehook` — because either alone passes vacuously:
+  a `ResourceWarning` raised during finalization goes through the unraisable hook, not the
+  `warnings` filter, so `warnings.simplefilter("error", ResourceWarning)` does **not** catch it.
+
+## 17. `sqlite3` blocks the MCP server's event loop — accepted for v1
+
+**Milestone:** M4
+
+The tool handlers are ordinary synchronous functions. Every database call inside them — connect,
+FTS5 query, insert, close — blocks the thread the MCP server's event loop runs on, so a single
+slow query stalls every other in-flight request on that connection.
+
+**Decision:** accepted for v1, deliberately, because the alternative buys nothing here. Queries
+run against a local file, are sub-millisecond at personal corpus sizes, and the realistic load is
+one agent issuing one tool call at a time. Wrapping each handler in `anyio.to_thread.run_sync`
+would add a thread hop and a concurrency model to reason about in exchange for latency that is
+not currently observable.
+
+**Revisit when** either becomes true: the corpus grows to where a recall is measurable in tens of
+milliseconds, or the streamable-HTTP transport (§12 of `PLAN.md`, v2) lands and one server starts
+fielding genuinely concurrent clients. The change is contained — the handlers already delegate to
+`_recall` / `_add`, so making them `async def` and moving those two calls onto a worker thread
+touches nothing else.
+
+## 18. mcp 2.x is snake_case in Python and camelCase on the wire — do not "fix" either side
+
+**Milestone:** M4
+
+`mcp` 2.0.0 renamed the Python model fields to snake_case. The JSON-RPC payload did **not**
+change: it is still camelCase, because that is what the MCP protocol specifies and what every
+other client and server implementation emits.
+
+| concept | Python attribute (mcp 2.x) | JSON on the wire |
+|---|---|---|
+| tool input schema | `Tool.input_schema` | `inputSchema` |
+| tool output schema | `Tool.output_schema` | `outputSchema` |
+| call failed | `CallToolResult.is_error` | `isError` |
+| structured result body | `CallToolResult.structured_content` | `structuredContent` |
+| pagination cursor | `ListToolsResult.next_cursor` | `nextCursor` |
+| negotiated version | `InitializeResult.protocol_version` | `protocolVersion` |
+| server identity | `InitializeResult.server_info` | `serverInfo` |
+
+Verified by capturing the raw stdout of `localmem serve` driven over a plain pipe: the
+`initialize` response carries `protocolVersion`, `serverInfo` and `listChanged`, and a
+`tools/call` response carries `isError`.
+
+**This is a warning, not a curiosity.** Both spellings are correct in their own layer. A reader
+who sees `is_error` in `mcp_server.py` next to `"isError"` in a captured frame will be tempted to
+make them agree; doing so breaks whichever side they change. Pydantic's alias generator handles
+the translation, and neither side is ours to normalize.
+
+Applies to test code too: assert on `result.is_error` when holding a parsed `CallToolResult`, and
+on `msg["result"]["isError"]` when parsing raw JSON off the pipe.
