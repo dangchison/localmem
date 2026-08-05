@@ -1,0 +1,25 @@
+# Codex CLI configuration
+# Hand-edited. Comments below must survive any localmem write.
+
+model = "gpt-5-codex"
+approval_policy = "on-request"
+
+[desktop]
+notifications = true   # trailing comment
+
+[features]
+web_search_request = true
+
+[mcp_servers.codegraph]
+command = "codegraph-mcp"
+args = ["serve", "--stdio"]
+
+[mcp_servers.codegraph.env]
+CODEGRAPH_LOG = "warn"
+
+[mcp_servers.node_repl]
+command = "node-repl-mcp"
+args = []
+
+[shell_environment_policy.set]
+LANG = "en_US.UTF-8"

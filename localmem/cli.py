@@ -1,8 +1,16 @@
-"""Commands: ``add``, ``search``, ``stats``, ``backfill``, ``dedupe``, ``gc``, ``serve``.
+"""The ``localmem`` command line.
 
-Every command runs headless — no prompts, no TTY requirement. ``dedupe`` prompts only
-when stdin is a terminal; with no terminal and no flags it prints the pending queue and
-exits cleanly instead of waiting for input that will never arrive.
+Commands: ``init``, ``add``, ``search``, ``import``, ``agents``, ``benchmark``,
+``stats``, ``backfill``, ``dedupe``, ``gc``, ``serve``.
+
+Every command runs headless — no prompts, no TTY requirement. ``dedupe`` and ``init``
+prompt only when stdin is a terminal; with no terminal and no flags ``init`` prints what
+it *would* do and writes no agent config, and ``import --select`` fails with a clear
+message rather than hanging or silently importing everything.
+
+This module is the only place that resolves the user's home directory. ``Path.home()``
+is read here and passed down as a parameter, so nothing under :mod:`localmem.agents` can
+reach a real config file on its own.
 """
 
 from __future__ import annotations
@@ -10,17 +18,34 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 import click
 
-from localmem import __version__, config, core_memory, db, dedup, indexer, retriever, store
+from localmem import (
+    __version__,
+    agents,
+    benchmark,
+    config,
+    core_memory,
+    db,
+    dedup,
+    importer,
+    indexer,
+    retriever,
+    store,
+)
 
 _KIND_CHOICES = ("note", "trace", "core")
 _SIZE_UNITS = ("B", "KB", "MB", "GB")
 _NEIGHBOR_PREVIEW_CHARS = 100
+
+# The query `init` step 5 runs to prove recall works end to end.
+_SELF_CHECK_QUERY = "localmem"
+
+_NEXT_STEPS = ('localmem search "your question"', "localmem stats", "localmem benchmark")
 
 # Memory text and search queries routinely start with a markdown bullet ("- use pnpm"),
 # which click would otherwise reject as an unknown option.
@@ -239,6 +264,134 @@ def serve() -> None:
     mcp_server.serve()
 
 
+@main.command()
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Answer yes to every agent registration question (step 2 only).",
+)
+@click.option(
+    "--import-all",
+    "import_all",
+    is_flag=True,
+    help="Import every instruction file found. Asked separately from --yes, never bundled.",
+)
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Workspace for imported records (default: auto-detected).",
+)
+def init(yes: bool, import_all: bool, workspace: str | None) -> None:
+    """Set up the database, agent configs, and optionally import instruction files.
+
+    Safe to re-run: every step is idempotent, and a step that fails leaves the steps
+    before it intact. Nothing outside the database is written without a yes — with no
+    terminal and no flags this prints what it would do and writes no agent config.
+    """
+    home = Path.home()
+    cwd = Path.cwd()
+    interactive = _is_interactive()
+    with _session() as (conn, path):
+        _init_database(path)
+        _init_agents(home, cwd, yes=yes, interactive=interactive)
+        target_workspace = _resolve_workspace(workspace)
+        _init_import(
+            conn, home, cwd, target_workspace, import_all=import_all, interactive=interactive
+        )
+        _init_snippet(home, cwd)
+        _init_self_check(conn, target_workspace)
+
+
+@main.command("import")
+@click.argument(
+    "paths",
+    nargs=-1,
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("-w", "--workspace", default=None, help="Workspace name (default: auto-detected).")
+@click.option("--dry-run", is_flag=True, help="Report what would be created and write nothing.")
+@click.option("--select", "select", is_flag=True, help="Confirm each file (needs a terminal).")
+def import_command(
+    paths: tuple[Path, ...],
+    workspace: str | None,
+    dry_run: bool,
+    select: bool,
+) -> None:
+    """Import markdown instruction files (CLAUDE.md, AGENTS.md, steering) into memory.
+
+    Re-importing an unchanged file adds no rows: every record merges into the one it
+    created last time and bumps its ``seen_count``.
+    """
+    if select and not _is_interactive():
+        raise click.UsageError(
+            "--select needs a terminal to ask on. Re-run without it to import every "
+            "PATH given, or pass only the paths you want."
+        )
+    chosen = _select_paths(paths) if select else list(paths)
+    target_workspace = _resolve_workspace(workspace)
+    if dry_run:
+        _echo_import_preview(chosen, target_workspace)
+        return
+    if not chosen:
+        click.echo("no files selected, nothing imported")
+        return
+    with _session() as (conn, _path):
+        for path in chosen:
+            _import_one(conn, path, target_workspace)
+
+
+@main.command("agents")
+@click.option(
+    "--install",
+    "install_slug",
+    default=None,
+    metavar="NAME",
+    help="Register localmem for one agent by slug; naming it here is the consent.",
+)
+def agents_command(install_slug: str | None) -> None:
+    """Detect supported agents and print where their config lives.
+
+    With ``--install NAME`` it registers localmem for that one agent, under the same
+    merge, backup and refuse-on-malformed rules ``init`` uses.
+    """
+    home = Path.home()
+    cwd = Path.cwd()
+    if install_slug is None:
+        _echo_agent_table(home, cwd)
+        return
+    writer = agents.writer_for(install_slug)
+    if writer is None:
+        raise click.UsageError(
+            f"unknown agent {install_slug!r}; known agents: {', '.join(agents.slugs())}"
+        )
+    _echo_apply_result(writer, writer.apply(home, cwd), home, cwd)
+
+
+@main.command("benchmark")
+@click.argument("paths", nargs=-1, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-w", "--workspace", default=None, help="Workspace name (default: auto-detected).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def benchmark_command(paths: tuple[Path, ...], workspace: str | None, as_json: bool) -> None:
+    """Estimate what instruction files cost per session against localmem's fixed cost.
+
+    The "after" figure is one fixed overhead per session — pointer snippet, the two MCP
+    tool descriptions and core memory — not a charge per file.
+    """
+    home = Path.home()
+    cwd = Path.cwd()
+    targets = _unique_paths([*agents.find_instruction_files(home, cwd), *paths])
+    with _session() as (conn, _path):
+        target_workspace = _resolve_workspace(workspace)
+        core = core_memory.build_core_memory(conn, target_workspace)
+    report = benchmark.measure(targets, core.text)
+    if as_json:
+        click.echo(json.dumps(_benchmark_payload(report, target_workspace), ensure_ascii=False))
+        return
+    _echo_benchmark(report, target_workspace)
+
+
 @contextmanager
 def _session() -> Iterator[tuple[sqlite3.Connection, Path]]:
     """Open the database and translate failures into clean CLI errors."""
@@ -370,6 +523,234 @@ def _review_pairs(conn: sqlite3.Connection, pairs: list[dedup.DuplicatePair]) ->
             _echo_resolution(dedup.resolve_keep_both(conn, pair.queue_id), False)
         else:
             click.echo(f"pair {pair.queue_id}: skipped, still pending")
+
+
+def _init_database(path: Path) -> None:
+    """Step 1 — the database is already created and migrated by :func:`_session`."""
+    click.echo("Step 1 — database")
+    click.echo(f"  ready at {path}")
+
+
+def _init_agents(home: Path, cwd: Path, *, yes: bool, interactive: bool) -> None:
+    """Step 2 — ask about each detected agent individually and write only on a yes."""
+    click.echo("\nStep 2 — agent configuration")
+    detected = agents.detect_agents(home, cwd)
+    if not detected:
+        click.echo("  no supported agent detected; nothing to register")
+        return
+    for writer in detected:
+        _register_agent(writer, home, cwd, yes=yes, interactive=interactive)
+
+
+def _register_agent(
+    writer: agents.AgentWriter,
+    home: Path,
+    cwd: Path,
+    *,
+    yes: bool,
+    interactive: bool,
+) -> None:
+    if yes or (interactive and _confirm_agent(writer)):
+        _echo_apply_result(writer, writer.apply(home, cwd), home, cwd)
+        return
+    if interactive:
+        click.echo(f"  {writer.name}: skipped")
+        return
+    # No terminal to ask on and no flag: report the intent, write nothing.
+    _echo_apply_result(writer, writer.apply(home, cwd, dry_run=True), home, cwd)
+    click.echo("    (no terminal to ask on; nothing written — re-run with --yes to apply)")
+
+
+def _confirm_agent(writer: agents.AgentWriter) -> bool:
+    return click.confirm(f"  Register localmem as an MCP server for {writer.name}?", default=False)
+
+
+def _echo_apply_result(
+    writer: agents.AgentWriter,
+    result: agents.ApplyResult,
+    home: Path,
+    cwd: Path,
+) -> None:
+    """Report one writer's outcome, including what to do by hand when it refused."""
+    click.echo(f"  {result.agent}: {result.detail}")
+    if result.printed_command is not None:
+        click.echo(f"    run: {result.printed_command}")
+    if result.action != "refused":
+        return
+    click.echo("    add this by hand instead:")
+    for line in writer.render_config(home, cwd).splitlines():
+        click.echo(f"      {line}")
+
+
+def _init_import(
+    conn: sqlite3.Connection,
+    home: Path,
+    cwd: Path,
+    workspace: str,
+    *,
+    import_all: bool,
+    interactive: bool,
+) -> None:
+    """Step 3 — a question of its own, never bundled with step 2."""
+    click.echo("\nStep 3 — import existing instruction files")
+    found = agents.find_instruction_files(home, cwd)
+    if not found:
+        click.echo("  no CLAUDE.md, AGENTS.md or Kiro steering file found; nothing to import")
+        return
+    for path in found:
+        click.echo(f"  found {path}")
+    chosen = _choose_import_files(found, import_all=import_all, interactive=interactive)
+    if not chosen:
+        # PLAN.md §8 step 3, verbatim and unindented so the line is exactly the message.
+        click.echo(importer.SKIP_MESSAGE)
+        return
+    for path in chosen:
+        _import_one(conn, path, workspace)
+
+
+def _choose_import_files(
+    found: Sequence[Path], *, import_all: bool, interactive: bool
+) -> list[Path]:
+    if import_all:
+        return list(found)
+    if not interactive:
+        return []
+    choice = click.prompt(
+        "  [a] import all / [s] select files / [n] skip", default="n", show_default=True
+    )
+    answer = choice.strip().lower()[:1]
+    if answer == "a":
+        return list(found)
+    if answer == "s":
+        return _select_paths(found)
+    return []
+
+
+def _select_paths(paths: Sequence[Path]) -> list[Path]:
+    return [path for path in paths if click.confirm(f"    import {path}?", default=False)]
+
+
+def _import_one(conn: sqlite3.Connection, path: Path, workspace: str) -> None:
+    """Import one file, reporting a read failure without aborting the rest."""
+    try:
+        outcome = importer.import_file(conn, path, workspace)
+    except (OSError, UnicodeDecodeError) as exc:
+        click.echo(f"  cannot read {path}: {exc}")
+        return
+    click.echo(
+        f"  {outcome.path}: {outcome.records} records — "
+        f"{outcome.added} new, {outcome.merged} merged into existing"
+    )
+    click.echo(f"  {importer.TRIM_SUGGESTION_TEMPLATE.format(path=outcome.path)}")
+
+
+def _echo_import_preview(paths: Sequence[Path], workspace: str) -> None:
+    """Print what an import would create. Opens no database and writes nothing."""
+    records: list[str] = []
+    for path in paths:
+        try:
+            records.extend(importer.read_records(path))
+        except (OSError, UnicodeDecodeError) as exc:
+            raise click.ClickException(f"cannot read {path}: {exc}") from exc
+    click.echo(f"would create {len(records)} records in workspace {workspace!r}")
+    for content in records[: importer.DRY_RUN_PREVIEW]:
+        click.echo("  ---")
+        for line in content.splitlines():
+            click.echo(f"  {line}")
+    click.echo("nothing was written")
+
+
+def _init_snippet(home: Path, cwd: Path) -> None:
+    """Step 4 — print the pointer snippet; never edit an instruction file."""
+    click.echo("\nStep 4 — pointer snippet")
+    detected = agents.detect_agents(home, cwd)
+    if detected:
+        click.echo(f"  for: {', '.join(writer.name for writer in detected)}")
+    click.echo("  Paste this into the instruction file your agent already loads.")
+    click.echo("  localmem never edits those files for you.\n")
+    for line in agents.POINTER_SNIPPET.splitlines():
+        click.echo(line)
+
+
+def _init_self_check(conn: sqlite3.Connection, workspace: str) -> None:
+    """Step 5 — run one real recall, then print where to go next."""
+    click.echo("\nStep 5 — self-check")
+    outcome = retriever.retrieve(conn, _SELF_CHECK_QUERY, workspace, 1)
+    if outcome.results:
+        hit = outcome.results[0]
+        click.echo(f"  recall works — id={hit.id}: {_preview(hit.content)}")
+    else:
+        click.echo(f"  recall works — {outcome.message or 'nothing matched yet'}")
+    click.echo("  next steps:")
+    for command in _NEXT_STEPS:
+        click.echo(f"    {command}")
+
+
+def _echo_agent_table(home: Path, cwd: Path) -> None:
+    slug_width = max(len(writer.slug) for writer in agents.WRITERS)
+    name_width = max(len(writer.name) for writer in agents.WRITERS)
+    for writer in agents.WRITERS:
+        state = "detected " if writer.is_detected(home, cwd) else "not found"
+        target = writer.target_path(home, cwd)
+        location = str(target) if target is not None else "(no project config — prints a command)"
+        click.echo(
+            f"{writer.slug.ljust(slug_width)}  {writer.name.ljust(name_width)}  {state}  {location}"
+        )
+    click.echo("\nregister one with: localmem agents --install NAME")
+
+
+def _unique_paths(paths: Sequence[Path]) -> list[Path]:
+    """Return ``paths`` with duplicates removed, first occurrence winning."""
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        key = path if not path.exists() else path.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _echo_benchmark(report: benchmark.Benchmark, workspace: str) -> None:
+    click.echo(f"workspace: {workspace}")
+    if not report.files:
+        click.echo("no instruction files found; pass paths explicitly to measure them")
+    else:
+        width = max(len(str(cost.path)) for cost in report.files)
+        for cost in report.files:
+            measured = (
+                f"unreadable: {cost.error}" if cost.error else f"~{cost.tokens} estimated tokens"
+            )
+            click.echo(f"  {str(cost.path).ljust(width)}  {measured}")
+    click.echo(f"\nbefore (pushed every session): ~{report.before_tokens} estimated tokens")
+    click.echo(f"after  (pulled on demand):     ~{report.after_tokens} estimated tokens")
+    click.echo(f"    pointer snippet:   ~{report.pointer_tokens}")
+    click.echo(f"    tool descriptions: ~{report.tool_description_tokens}")
+    click.echo(f"    core memory:       ~{report.core_memory_tokens}")
+    click.echo(f"saved: ~{report.saved_tokens} estimated tokens ({report.saved_pct}%)\n")
+    # PLAN.md §10 step 4, verbatim and unindented.
+    click.echo(benchmark.CAVEAT)
+
+
+def _benchmark_payload(report: benchmark.Benchmark, workspace: str) -> dict[str, object]:
+    return {
+        "workspace": workspace,
+        "files": [
+            {"path": str(cost.path), "before_tokens": cost.tokens, "error": cost.error}
+            for cost in report.files
+        ],
+        "before_tokens": report.before_tokens,
+        "after_tokens": report.after_tokens,
+        "saved_tokens": report.saved_tokens,
+        "saved_pct": report.saved_pct,
+        "after_breakdown": {
+            "pointer_snippet_tokens": report.pointer_tokens,
+            "tool_description_tokens": report.tool_description_tokens,
+            "core_memory_tokens": report.core_memory_tokens,
+        },
+        "caveat": benchmark.CAVEAT,
+    }
 
 
 def _echo_counts(title: str, counts: tuple[tuple[str, int], ...]) -> None:

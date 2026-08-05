@@ -351,17 +351,21 @@ def test_stats_on_an_empty_database(conn: sqlite3.Connection, db_path: Path) -> 
 
 
 def test_cli_command_set() -> None:
-    """AC15, widened in M3 by dedupe and gc, and in M4 by serve."""
+    """AC15, widened in M3 by dedupe and gc, in M4 by serve, in M5 by four more."""
     result = CliRunner().invoke(cli.main, ["--help"])
     assert result.exit_code == 0
     assert set(cli.main.commands) == {
         "add",
-        "search",
-        "stats",
+        "agents",
         "backfill",
+        "benchmark",
         "dedupe",
         "gc",
+        "import",
+        "init",
+        "search",
         "serve",
+        "stats",
     }
     assert "backfill" in result.output
 

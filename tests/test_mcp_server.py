@@ -47,7 +47,19 @@ RESULT_KEYS = {
 }
 RECALL_KEYS = {"results", "core_memory", "message"}
 ADD_KEYS = {"status", "id", "seen_count"}
-CLI_COMMANDS = {"add", "search", "stats", "backfill", "dedupe", "gc", "serve"}
+CLI_COMMANDS = {
+    "add",
+    "agents",
+    "backfill",
+    "benchmark",
+    "dedupe",
+    "gc",
+    "import",
+    "init",
+    "search",
+    "serve",
+    "stats",
+}
 
 EMPTY_MESSAGE = "no memories yet — memories will accumulate as you work"
 RFC3339_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")

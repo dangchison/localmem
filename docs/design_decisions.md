@@ -584,3 +584,229 @@ the translation, and neither side is ours to normalize.
 
 Applies to test code too: assert on `result.is_error` when holding a parsed `CallToolResult`, and
 on `msg["result"]["isError"]` when parsing raw JSON off the pipe.
+
+## 19. Codex config: parse to decide, append to write — and why there is a TOML dependency
+
+**Milestone:** M5 (rewritten in fix round 3, after three blockers)
+
+`PLAN.md` §8 step 2 says to "append `[mcp_servers.localmem]` block to `~/.codex/config.toml`". Doing
+that safely needs one decision: *is localmem already registered?*
+
+**Decision, current:** parse the file and look up the key.
+
+```python
+document = tomllib.loads(text)
+servers = document.get("mcp_servers")
+present = isinstance(servers, dict) and "localmem" in servers
+```
+
+Writing stays **append-only** — the file is never rewritten from the parsed data, because that
+would destroy the comments, table order and formatting that append-only exists to preserve. **Parse
+to decide, append to write.**
+
+### Why there is a `tomli` dependency, and why removing it will break things
+
+`dependencies` carries `tomli>=2.0; python_version < '3.11'`, and `codex.py` does:
+
+```python
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+```
+
+`tomllib` is stdlib from 3.11, `requires-python` is `>=3.10`, and `tomli` is the backport. `tomli`
+2.4.1 has **zero** transitive dependencies. `requires-python` stays `>=3.10`.
+
+This dependency was originally forbidden, on the reasoning that parsing buys only "is the block
+present?" and an anchored regex answers that exactly. **That reasoning was wrong, and it cost three
+blockers.** The user reversed the constraint once that became clear. Anyone tempted to "simplify
+away" the dependency later should read the next section first.
+
+### What went wrong three times
+
+Each attempt detected the table with a regex over `[…]` headers. Each time an existing, working
+declaration went undetected, `apply()` appended a *second* declaration, and TOML forbids that:
+
+```
+TOMLDecodeError: Cannot declare ('mcp_servers', 'localmem') twice
+```
+
+Codex then fails to load the whole file, taking **every** MCP server in it down — and every one of
+these runs reported `action="merged"`, a success.
+
+| # | trigger | why the regex missed it |
+|---|---|---|
+| 1 | `[mcp_servers.localmem]  # hand added earlier` | TOML allows a comment after a table header; the pattern was anchored to `]` |
+| 2 | a CRLF-terminated header | `re.MULTILINE`'s `$` matches before `\n`, **not** before the `\r` of a CRLF line |
+| 3 | `["mcp_servers".localmem]` | the pattern allowed a quoted child key but not a quoted parent |
+
+Blocker 2 also exposed the deeper problem: the post-write safety net re-scanned with the *same*
+blind pattern, saw only the newly appended header, and let the write stand. **A guard that shares a
+scan with the decision can never catch that scan's blind spot.**
+
+### The measurement that ended the argument
+
+TOML has many spellings that all bind `mcp_servers.localmem`. Measured against the last regex-based
+implementation:
+
+| spelling | binds the key | regex saw it |
+|---|---|---|
+| `[mcp_servers.localmem]` | yes | yes |
+| `["mcp_servers".localmem]` | yes | yes (only after blocker 3) |
+| `[mcp_servers."localmem"]` | yes | **no** |
+| `[[mcp_servers.localmem]]` (array of tables) | yes | **no** |
+| `mcp_servers = { localmem = { … } }` (inline table) | yes | **no** |
+| `mcp_servers.localmem.command = "…"` (dotted key) | yes | **no** |
+| `[mcp_servers]` + `localmem.command = "…"` | yes | **no** |
+
+The last four have **no `[…]` header naming localmem at all**, so no regex over table headers can
+ever see them — this was not a pattern that needed one more fix. All four were confirmed to produce
+an unparseable config through the real `apply()`. The parser detects all of them, verified end to
+end.
+
+### What the parser also fixed for free
+
+- **Malformed TOML is now refused.** `tomllib.loads` raising means `action="refused"`, nothing
+  written, no `.bak`, and the block printed for manual addition — the same DD-6 rule the JSON
+  writers always followed, and something append-only could never do because it never parsed.
+- **The post-write invariant is now real.** `_verify` re-reads and re-parses the written file: it
+  must parse **and** bind `mcp_servers.localmem`. A binding the decision missed shows up here as
+  `Cannot declare … twice`, which is exactly the failure the old net could not see. On failure the
+  append path restores the original with `os.replace(backup, target)` — atomic, and it consumes the
+  `.bak` in the same step — while the create path removes the file it just made.
+- **Three guards were deleted, not left dormant.** The multi-line-string blanking, the odd-quote
+  refusal and the scan-time line-ending normalisation are all gone, along with `TABLE_HEADER_RE`,
+  `MCP_SERVERS_HEADER_RE` and `escaped_server_header`. Keeping them would mean two sources of truth.
+  The odd-quote guard also produced false refusals on legal TOML like `x = '"""'`; that now
+  registers normally.
+- **The residual hole of rounds 1 and 2 is closed.** Two `"""` sequences in separate comments used
+  to make the scan blank a stretch of real TOML between them. A parser reads comments as comments.
+
+**The appended block still adopts the file's own line endings.** `dominant_newline()` picks
+whichever of `\n`, `\r\n`, `\r` the file mostly uses (ties go to LF; a new file gets LF), and the
+block is re-terminated to match, so a CRLF config does not come back with two conventions mixed
+into it. `render_config()` still returns the canonical LF block: it is what the CLI prints for a
+user to paste, and it is pure by contract.
+
+**Consequences**
+
+- The file is byte-identical except for the appended block. Comments, table order, alignment and
+  every unrelated table survive, because nothing rewrites them. Asserted against a fixture carrying
+  `[desktop]`, `[features]`, `[mcp_servers.codegraph.env]` and comments.
+- Reading and writing both disable newline translation (`newline=""`), so appending to a CRLF config
+  does not rewrite every line ending in the file.
+- **A lone-CR file is now refused, and that is the honest answer.** TOML 1.0 defines a newline as LF
+  or CRLF only, so `[mcp_servers.localmem]\r` is not valid TOML and Codex cannot read it either.
+  Fix round 2 taught the regex to "detect" headers in such a file; that was solving a non-problem.
+- **`[mcp_servers.localmem.env]` alone now counts as registered.** TOML creates the intermediate
+  table implicitly, so the key path genuinely is bound. This is a deliberate behaviour change — the
+  regex rejected that line and would have appended. Reporting `already_present` is the fail-safe
+  reading: it writes nothing. A config with env vars for a server that is not defined is already
+  incomplete, and the user is told localmem is registered rather than having their file edited.
+- **If `mcp_servers.localmem` exists but its value is wrong, localmem leaves it alone** and reports
+  `already_present`. Correcting it would require rewriting the file from parsed data, which is the
+  thing append-only exists to avoid. The user edits it, or removes it and re-runs.
+- `[mcp_servers.LocalMem]` is correctly ignored — TOML keys are case-sensitive, so it is a different
+  table that legitimately coexists.
+
+## 20. A malformed agent config is refused — no write, no backup
+
+**Milestone:** M5
+
+The analyst proposed that when an existing JSON config cannot be parsed, localmem should back it up
+and then write "a fresh config containing only the localmem entry".
+
+**Rejected.** That silently drops every other MCP server from the *live* file. A user whose
+`~/.gemini/config/mcp_config.json` had a stray trailing comma would find their other servers gone,
+and would most likely not notice until something broke — at which point the `.bak` is a file they
+have no reason to look for. A backup does not make it acceptable: the user consented to *adding
+localmem*, not to *having their config replaced*.
+
+**Decision:** on a config that cannot be parsed, `apply()` returns `action="refused"`, **writes
+nothing and backs up nothing**, and the message names the parse error. The CLI then prints the exact
+block for the user to add by hand. `init` still exits 0 — a refusal is a normal outcome, not a crash
+— but the refusal is visible in the step-2 summary.
+
+Four inputs take this path, all with the same reasoning: invalid JSON, an empty file, a top level
+that is not an object, and an `mcpServers` value that is not an object.
+
+**Consequences**
+
+- An empty (zero-byte) config file is refused rather than treated as a blank document. It is
+  unparseable, and one rule with no exceptions is easier to trust than two. The user deletes the
+  empty file and re-runs, or pastes the printed block.
+- **Codex follows this rule too, as of M5 fix round 3.** It could not before: append-only
+  never parsed, so a broken TOML config was appended to regardless. Now `tomllib.loads`
+  raising produces the same refusal, with the same postcondition (§19).
+- The same refusal shape carries genuine I/O failures — an unreadable file, an undecodable file, a
+  directory that cannot be created, a backup that cannot be written. In every case the postcondition
+  is identical and checkable: **the original file is byte-for-byte what it was**.
+- Writes go through a temp file in the same directory followed by `os.replace`, so a config is never
+  observed half-written, and a failed write removes its own temp file.
+- **A backup taken for a write that then fails is removed.** `replace_atomically` backs up, writes,
+  and unlinks the backup if the write raises. Without that, an out-of-disk failure left a `.bak`
+  beside an unmodified config — a file that looks like evidence of a change that never happened.
+  The postcondition is uniform: a refusal leaves the directory exactly as it found it.
+- **A config localmem creates takes the umask default, not `0600`.** `tempfile.mkstemp` creates its
+  temp file at `0600`, and `os.replace` carries that mode to the destination, so every config
+  localmem created was owner-only — unlike one the user would have created by hand. `write_atomic`
+  now copies the mode of an *existing* target and applies `0o666 & ~umask` to a *new* one. Reading
+  the umask requires setting it and putting it back; localmem's writers run in a single-threaded CLI
+  process, so nothing else can create a file in that window.
+
+## 21. `~/.claude.json` is never written
+
+**Milestone:** M5
+
+`PLAN.md` §8 step 2 says of Claude Code: "prefer printing the exact command over editing global
+files". Measured on this machine, `~/.claude.json` is **~60 KB across 64 top-level keys** — project
+history, session state, onboarding flags — of which `mcpServers` is one.
+
+**Decision:** localmem never opens that file for writing. Inside a git repository it merges into the
+project `./.mcp.json` under the §20 rules. Outside a repository it writes nothing at all and prints
+`claude mcp add localmem -- localmem serve`, returning `action="printed"`.
+
+Repository membership is decided by walking `cwd` and its parents for a `.git` entry, not by
+shelling out to `git`: a subprocess would inherit the real environment, and this answer only selects
+which path to write.
+
+**Consequences**
+
+- A test asserts the sha256 of a fake 60 KB `~/.claude.json` is unchanged after a full `init --yes`,
+  and that no `.claude.json.bak` appears. This is the single highest-consequence assertion in M5.
+- Registering localmem for Claude Code outside a repository is a manual step. Accepted: one printed
+  command is cheaper than one rewritten state file.
+
+## 22. No function under `localmem/agents/` resolves the home directory
+
+**Milestone:** M5
+
+M5 is the first milestone whose code writes outside the repository, into the user's own agent
+configs. The failure mode that matters is a *test* reaching a *real* config file.
+
+Monkeypatching `$HOME` is the usual mitigation and it is not enough on its own: it protects only the
+paths that happen to route through the environment, and a single missed `Path.home()` in a module
+nobody re-read defeats it silently.
+
+**Decision:** `home` and `cwd` are **parameters** of every function and every writer method in
+`localmem/agents/`. No module in that package contains `Path.home()`, `expanduser`, `os.environ` or
+`getenv` — asserted by a test that scans the source of all six modules, so the rule is enforced
+against future edits rather than remembered. `cli.py` is the only place that calls `Path.home()`,
+and it passes the result down.
+
+This makes touching the real `~/.codex/config.toml` from a test *structurally impossible* rather
+than merely unlikely: there is nothing to intercept.
+
+`tests/conftest.py` additionally redirects `$HOME` to a temporary directory for every test, autouse.
+That is the second layer, not the first.
+
+**Consequences**
+
+- `render_config(home, cwd)` takes both parameters and uses neither in three of the four writers.
+  That is deliberate: one signature for every writer keeps the `Protocol` structural and keeps the
+  registry loop free of special cases.
+- `render_config` is additionally **pure** — no filesystem access at all — which a test enforces by
+  making `Path.open`, `Path.exists`, `Path.glob` and `builtins.open` raise for the duration.
+- The whole package is testable with `tmp_path` alone. No fixture has to remember to sandbox
+  anything.
