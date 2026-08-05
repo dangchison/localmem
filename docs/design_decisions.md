@@ -186,3 +186,232 @@ above that is 1, not 2.
 - The display `name` stored is the first-seen raw match, so a quoted span keeps its quote
   characters (`"ConfigLoader"`). Accepted: preserving the raw match verbatim is the rule that
   needs no exceptions, and `name` is never joined on.
+
+## 8. Tier-2 gates on Jaccard alone — the bm25 half of §6 is unusable at this scale
+
+**Milestone:** M3
+
+`PLAN.md` §6 specifies tier-2 as "any existing row with bm25 score above threshold **and**
+normalized Jaccard token overlap ≥ 0.7". The conjunction cannot be implemented as written,
+because there is no bm25 threshold that means anything on a personal-sized corpus.
+
+**Measured.** `memories_fts` is a small index with near-zero IDF, so `-bm25()` values collapse
+towards zero. Real numbers from this repository:
+
+| corpus | query | max `-bm25()` |
+|---|---|---|
+| 31 rows of near-identical content | the shared top terms | **5.0e-06** |
+| 2 rows, `use pnpm not npm` / `use pnpm, not npm!` | `"pnpm"` | **1.0e-06** |
+| 2 rows, `alpha beta gamma` / `gamma beta alpha` | `"alpha" "beta"` | **2.0e-06** |
+
+The analyst's proposed constant was `TIER2_BM25_THRESHOLD = 0.5`. That is five to six orders of
+magnitude above anything the index produces. A gate at 0.5 can never open, so tier 2 would have
+been silent dead code — and, worse, code that passes its own tests by never running.
+
+Scaling the threshold down is not a fix either: bm25 magnitude is a function of corpus size and
+term rarity, so any absolute constant that fires on a 30-row database will fire on everything
+once the database has 30 000 rows, and vice versa. There is no scale-invariant bm25 cut-off.
+
+**Decision:** FTS5 is used for **candidate generation only**. The MATCH expression is built from
+the new content's top 5 non-stopword tokens by frequency and returns at most
+`TIER2_MAX_CANDIDATES = 10` rows in the same workspace, excluding the new row itself. The
+decision gate is then `jaccard(new, candidate) >= TIER2_JACCARD_THRESHOLD` (0.7) — the one hard
+number §6 actually specifies, and the only signal here that does not move with corpus size.
+
+Jaccard operates on the token sets of `dedup.normalize(text)` (this is the "normalized" in
+"normalized Jaccard"), split on `\W+`, with **no** stopword filtering: dropping filler words
+inflates the overlap of short texts, which is exactly the length at which a false pair is most
+likely.
+
+**Consequences**
+
+- `use pnpm not npm` vs `use pnpm, not npm!` scores 1.0 and queues. That is precisely the gap
+  tier 1 leaves open: the two hash differently because punctuation is meaningful text.
+- Unrelated content scores 0.0 and never queues; `alpha bravo charlie delta` vs
+  `alpha bravo charlie echo foxtrot` scores 0.5 and does not queue either.
+- FTS5's conjunctive MATCH over the top 5 terms is the real recall bound. Two texts that are
+  Jaccard-similar but share fewer than those 5 terms are never even considered. Accepted: tier 2
+  is a cheap inline assist, not an exhaustive similarity search.
+- The stopword list is English-only. Vietnamese filler words are not filtered, so a Vietnamese
+  memory's top terms may include them. This costs recall, never correctness — the Jaccard gate
+  is unaffected.
+- Tier 2 is capped at 10 candidates per insert, so the cost of a write stays bounded regardless
+  of corpus size.
+
+## 9. `estimate_tokens` switches regime at 15% non-ASCII characters
+
+**Milestone:** M3
+
+`PLAN.md` §1 fixes two divisors — `ceil(chars/4)` for English, `ceil(chars/2.5)` for
+"CJK/Vietnamese-heavy" text — but never says where one ends and the other begins.
+
+**Decision:** `tokens.NON_ASCII_RATIO_CUTOFF = 0.15`. Above that fraction of non-ASCII
+characters, the dense divisor applies.
+
+The value is chosen from the two failure modes. A mostly English sentence carrying a couple of
+accented loanwords (`the naïve café rule…`, 2 non-ASCII of 43 = 0.047) must stay on the English
+estimate, or every European name inflates the number. A genuinely Vietnamese sentence crosses
+0.15 after only a handful of diacritics (`Dùng pnpm thay vì npm` = 0.19), which is the intent.
+
+**Consequences**
+
+- Every number this produces is an approximation (±15%) and is labelled `~estimated` wherever it
+  is printed, per §1 and §10.
+- A short mixed string can land on either side of the cutoff; nothing in the product makes a
+  correctness decision on the result — it drives the core-memory cap and, later, the benchmark
+  table.
+- The estimator lives in `localmem/tokens.py`, which imports nothing from `localmem`, so
+  `core_memory.py` (M3) and `benchmark.py` (M5) share one implementation.
+
+## 10. Core memory drops whole rows, oldest first, and never splits one
+
+**Milestone:** M3
+
+`PLAN.md` §5 step 7 caps core memory at 400 estimated tokens and says to "truncate oldest-first".
+Truncation could mean cutting the character stream, which would leave a half-sentence at the top
+of every recall.
+
+**Decision:** rows are ordered `created_at ASC, id ASC`, joined with newlines, and while the
+result exceeds `CORE_MEMORY_TOKEN_CAP = 400` estimated tokens **whole rows are removed from the
+front**. A row is never split. `build_core_memory` returns the text, its token estimate and the
+number of rows dropped; `stats` surfaces the drop count as a warning.
+
+The `id ASC` tiebreak is required, not cosmetic: `datetime('now')` has one-second resolution, so
+several core rows written in the same second would otherwise have no defined order and "oldest
+first" would be arbitrary.
+
+**Consequences**
+
+- A single core row larger than 400 tokens is dropped entirely, leaving an empty core memory.
+  That is the same rule applied consistently — the alternative is emitting a fragment of a
+  preference, which is worse than emitting none.
+- `stats` sums each workspace's core memory *after* its own cap, because that is the cost a
+  recall actually pays. A global concatenation would report a number nobody is charged.
+- `build_core_memory` never raises. A database error is reported as an empty core memory:
+  losing the always-load tier must not fail an otherwise good recall.
+
+## 11. `dedupe --merge` deletes the older memory, and the queue row goes with it
+
+**Milestone:** M3
+
+`PLAN.md` §12 forbids "automatic deletion of near-duplicates". `--merge` is not that: it acts on
+one pair, on an explicit user instruction, after the pair has been shown side by side. It keeps
+the **newer** row, adds the older row's `seen_count` to it, and deletes the older row.
+
+Deleting the older row is what makes the merge honest. `memory_entities` has
+`ON DELETE CASCADE`, so leaving the row in place while stripping its links would produce a
+memory that is searchable lexically but invisible to the relational view — a silently degraded
+record. Either the row is a duplicate and goes, or it is not and stays.
+
+**The queue row goes too, and this is unavoidable.** `dedup_queue.candidate_id` also declares
+`ON DELETE CASCADE`, so deleting the older memory removes every queue row that referenced it —
+including the one just marked `merged`. Verified on a live database: after
+`UPDATE dedup_queue SET status='merged'` followed by `DELETE FROM memories WHERE id=<older>`,
+`SELECT * FROM dedup_queue` returns no rows.
+
+**Decision:** the status is set to `merged` before the delete, and the row's subsequent removal
+by the cascade is accepted. The observable postcondition of a merge is therefore *"no pending
+pair remains for these two memories"*, not *"a row with status `merged` exists"*.
+
+**Consequences**
+
+- Re-running `--merge` on the same id reports `no pending near-duplicate pair with id N` and
+  exits non-zero without changing anything. It is a clean error, not a crash, and not a
+  double-merge.
+- Any *other* pending pair that referenced the deleted memory is cascaded away as well. That is
+  correct: those pairs are no longer decidable.
+- `gc` consequently only ever prunes `kept_both` rows, since `merged` rows do not survive to be
+  aged out. Pending rows are never pruned — an unreviewed near-duplicate is not garbage.
+- Keeping the queue row alive would require re-pointing `candidate_id` at the surviving memory,
+  which would record a pair of a row with itself. Rejected: a false provenance record is worse
+  than an absent one.
+
+**Stated plainly, because it will surprise someone reading the schema:** `dedup_queue` rows for
+merged pairs **are removed**, not retained with `status='merged'`. `gc` therefore only ever
+prunes `kept_both` rows. Retaining a merged pair's audit trail would require changing
+`dedup_queue.candidate_id`'s foreign key from `ON DELETE CASCADE` to `ON DELETE SET NULL` (plus
+making the column nullable), which is a schema change and a migration. Both are **deferred past
+v1** — the schema is frozen at version 1 for this release.
+
+## 12. The recency cue reweights the recency term; it does not change the decay curve
+
+**Milestone:** M3 (fix round 1)
+
+`PLAN.md` §5 step 1 puts a "recency cue" in the query profile — a regex for `recent`,
+`last week`, `hôm qua`, `tuần trước` — that "adds an `ORDER BY created_at` boost". It names no
+magnitude, and §5 step 5 already fixes the recency contribution at `0.05 · decay`. A literal
+second `ORDER BY` term would have competed with that formula.
+
+**Decision:** a cue changes *how much* of the decay curve is added, and nothing else.
+`RECENCY_WEIGHT = 0.05` applies normally, `RECENCY_CUE_WEIGHT = 0.25` when the query carries a
+cue. The decay function stays `2 ** (-age_days / 30.0)` in both cases, and no other term in the
+fuse is affected. At five times the normal weight the cue can reorder results that the fused
+view scores close together, without ever overturning a genuinely better lexical or relational
+match.
+
+Cues are detected in the **query only**, case-insensitively, on whole-word boundaries, against
+a fixed list: `recent`, `recently`, `latest`, `newest`, `last week`, `last month`, `yesterday`,
+`today`, `hôm qua`, `hôm nay`, `tuần trước`, `tháng trước`, `gần đây`, `mới nhất`.
+
+**Diacritics are folded for cue detection only.** Both the cue list and the query are NFD
+normalized with `Mn`-category combining marks dropped before comparison, so `tuan truoc` matches
+`tuần trước`. This mirrors what `unicode61 remove_diacritics 2` already does for the lexical
+view, keeping the two consistent. The folding is applied nowhere else in the pipeline —
+`dedup.normalize`, entity `norm_name` and `content_hash` are all untouched by it.
+
+**Consequences**
+
+- `đ` has no canonical decomposition, so folding leaves it in place. `gần đây` typed as
+  `gan day` is **not** recognized; `gan đay` is. This is exactly the §2 limitation, reproduced
+  deliberately rather than papered over in one place and not the other.
+- The cue list is fixed, not a regex over inflections. `last fortnight` and `vài hôm trước` are
+  not cues. Adding one is a one-line change to `RECENCY_CUES`.
+## 13. Cue words are stripped from the lexical query, and a cue-only query ranks by recency
+
+**Milestone:** M3 (fix round 2)
+
+Detecting a cue is not enough on its own. `store.build_match_expression` builds a *conjunctive*
+FTS5 query over every token of the query, so a cue word left in place demands that every matching
+memory literally contain it. Measured on a two-row database holding
+`we switched the deploy pipeline to pnpm` and `the pnpm lockfile was regenerated`, before this
+change:
+
+| query | MATCH expression | cue detected | results |
+|---|---|---|---|
+| `pnpm` | `"pnpm"` | no | 2 |
+| `recent pnpm` | `"recent" "pnpm"` | yes | **0** |
+
+The cue was detected correctly and then had nothing left to reorder. In the phrasing a user is
+most likely to type, adding the feature made recall strictly worse than not having it.
+
+**Decision:** cue spans are removed from the query before the view-A MATCH expression is built.
+Only spans that actually matched are dropped, multi-word cues drop whole
+(`notes from last week` → `notes from`), and everything else keeps its original spelling. A query
+with no cue is returned byte-for-byte unchanged, so the common path cannot regress.
+
+Two consequences follow, both deliberate:
+
+1. **Literal matching on cue words is given up.** `search "today"` no longer finds rows because
+   they contain the word "today". This is the intended trade: in a memory system that query
+   almost certainly means *"what did I record today"*, not *"grep for the string today"*, and
+   that is what `PLAN.md` §5 step 1 is reaching for when it says a cue "adds `ORDER BY
+   created_at` boost". A user who genuinely wants the literal word can still reach it through
+   any other term in the same query — only the cue span is removed, never the rest.
+2. **A query that is nothing but cues enters pure recency mode.** `today`, `tuần trước`,
+   `hôm qua` return the workspace ordered by `created_at DESC`, limited to `k`, scored by
+   `RECENCY_CUE_WEIGHT · decay` alone. Both view scores are reported as `None`, because neither
+   view was asked anything. Evidence closure and core memory behave exactly as on the normal
+   path. This is a legitimate query, not an error.
+
+**Consequences**
+
+- Entity extraction still runs on the **full original query**. Cue words cannot form entities
+  under any of the M2 classes, so stripping would change nothing except to put two divergent
+  query texts into the pipeline. View B is untouched by any of this.
+- A query that is empty *and* carries no cue — pure punctuation, `"!!!"` — keeps the old
+  behavior: empty results and the friendly message. Recency mode is entered only on a cue.
+- The query is NFC-normalized before cue tokenization, because a decomposed `hôm` would
+  otherwise split into `ho` and `m` on `\W+` and never match. This normalization is confined to
+  cue handling; when no cue is found the original string is what continues down the pipeline.
+- Verified end to end: `search "recent pnpm"` now returns the same two rows as `search "pnpm"`,
+  scored 0.85/0.25 instead of 0.65/0.05 — same rows, heavier recency term.

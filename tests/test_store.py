@@ -304,7 +304,8 @@ def test_stats_counts_workspaces_and_kinds(conn: sqlite3.Connection, db_path: Pa
 def test_cli_exposes_exactly_the_expected_commands() -> None:
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert set(main.commands) == {"add", "search", "stats", "backfill"}
+    # M3 added dedupe and gc; the assertion stays exact so a stray command is noticed.
+    assert set(main.commands) == {"add", "search", "stats", "backfill", "dedupe", "gc"}
 
 
 def test_cli_add_round_trip() -> None:

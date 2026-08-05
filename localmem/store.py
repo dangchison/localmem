@@ -13,9 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from localmem import db, indexer
+from localmem import core_memory, db, dedup, indexer
 from localmem.config import validate_workspace
-from localmem.dedup import content_hash
 
 DEFAULT_KIND = "note"
 DEFAULT_LIMIT = 5
@@ -91,6 +90,9 @@ class Stats:
     per_kind: tuple[tuple[str, int], ...]
     total_entities: int
     total_entity_links: int
+    queue_depth: int
+    core_memory_tokens: int
+    core_memory_dropped: int
 
 
 def add_memory(
@@ -111,6 +113,9 @@ def add_memory(
     transaction. A merge does not re-index: the stored content is unchanged, so the
     links already attached to that row stay correct.
 
+    Tier-2 near-duplicate detection then runs over the new row and silently queues any
+    pair it finds. It never blocks, never deletes and never changes the returned result.
+
     Returns:
         ``("added", id, 1)`` for a new row, ``("duplicate_merged", id, n)`` when an
         existing row in the same workspace was bumped.
@@ -121,7 +126,7 @@ def add_memory(
     if not content.strip():
         raise ValueError("content is empty; pass the text you want to remember")
     target_workspace = validate_workspace(workspace)
-    digest = content_hash(content)
+    digest = dedup.content_hash(content)
 
     with db.transaction(conn):
         existing = conn.execute(_SELECT_BY_HASH_SQL, (target_workspace, digest)).fetchone()
@@ -143,6 +148,9 @@ def add_memory(
         if row_id is None:
             raise RuntimeError("SQLite did not report a row id for the inserted memory")
         indexer.index_memory(conn, row_id, content)
+        dedup.enqueue_near_duplicates(
+            conn, row_id, content, target_workspace, build_match_expression
+        )
         return AddResult(STATUS_ADDED, row_id, 1)
 
 
@@ -205,10 +213,19 @@ def build_match_expression(query: str) -> str:
 
 
 def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
-    """Return row counts per workspace, per kind and for the entity graph."""
+    """Return row counts per workspace and kind, the entity graph, queue and core sizes.
+
+    ``core_memory_tokens`` sums each workspace's core memory *after* its own cap, because
+    that is the cost a recall actually pays; ``core_memory_dropped`` reports how many
+    rows that cap is currently hiding.
+    """
     total_row = conn.execute("SELECT COUNT(*) AS total FROM memories").fetchone()
     entity_row = conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
     link_row = conn.execute("SELECT COUNT(*) AS n FROM memory_entities").fetchone()
+    queue_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM dedup_queue WHERE status = ?", (dedup.QUEUE_STATUS_PENDING,)
+    ).fetchone()
+    core_tokens, core_dropped = core_memory.core_memory_totals(conn)
     per_workspace = conn.execute(
         "SELECT workspace, COUNT(*) AS n FROM memories "
         "GROUP BY workspace ORDER BY n DESC, workspace"
@@ -224,6 +241,9 @@ def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
         per_kind=tuple((row["kind"], int(row["n"])) for row in per_kind),
         total_entities=int(entity_row["n"]),
         total_entity_links=int(link_row["n"]),
+        queue_depth=int(queue_row["n"]),
+        core_memory_tokens=core_tokens,
+        core_memory_dropped=core_dropped,
     )
 
 
