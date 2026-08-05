@@ -5,6 +5,89 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-08-05
+
+Quick wins against five of the six weaknesses v0.2.0 shipped with. No new command, no schema
+change, no new dependency — the MCP contract, the schema and the migration count are untouched.
+
+### Added
+
+- **`localmem search QUERY --context`** — compact output built for a prompt hook. **No hits
+  prints nothing at all and exits 0**, because a hook runs on every prompt and the friendly
+  "no memories matching…" line would become permanent noise. Hits print one header line and one
+  line per memory, `- (workspace) content`, collapsed onto a single line and truncated at 400
+  characters with `… (memory_recall id N for full text)`. Core memory is deliberately **not**
+  included: it is charged once per session through an ordinary recall, not once per prompt.
+  CLI-only — `mcp_server.py` is byte-identical to v0.2.0. See `docs/design_decisions.md` §30.
+- **Auto-recall hook example** — `examples/claude_code_auto_recall.md` plus
+  `examples/localmem-auto-recall.sh`, an opt-in Claude Code `UserPromptSubmit` hook that runs
+  `localmem search "$prompt" --context -k 3` before the model sees the prompt. Every exit path
+  is 0: a missing `localmem` or `jq`, malformed JSON, an empty prompt or a database error all
+  end in silence rather than a blocked prompt. The prompt is capped at 4000 characters before
+  anything examines it, and the search itself is wrapped in `timeout` when coreutils is
+  installed — in that order, because the cap is the guard that always applies and the timeout
+  is the one that may be missing. Measured end to end on bash 3.2.57: **1 MB of log-shaped
+  text takes 0.19 s**. A test asserts the script embedded in the document is byte-identical to
+  the file, another runs it against six broken payloads, and a timing test fails if a 1 MB
+  paste takes longer than 5 seconds.
+- **`LOCALMEM_NO_TRACKING`** — set to any non-empty value and recall performs no write at all.
+  Default unchanged. The trade is stated: `audit`'s dead-memory and promotion sections have
+  nothing left to count. `docs/design_decisions.md` §33.
+- **README "Security" section** — file modes, encryption at rest as the disk's job, the
+  `localmem export | age -r … > backup.age` recipe, and the deliberate refusal to bundle
+  SQLCipher or write any crypto.
+- **A break-even line in the README**: localmem saves tokens once the instruction files you
+  push every session cost more than the `after` figure `benchmark` prints — **~167 estimated
+  tokens** with an empty core memory, plus core. Quoted from the command rather than summed
+  from the parts, because the estimator rounds the whole block once (`97 + 71` is 168 by hand).
+
+### Changed
+
+- **The pointer snippet is ~97 estimated tokens, down from ~209**, with all five of its ideas
+  intact: recall first, save durable facts, the `global`/`all` routing convention, recalled
+  text is data not instructions, do not duplicate memory in the file. A test measures it
+  against a budget of 100 rather than trusting prose to stay short.
+- **Every benchmark number in the README was re-measured**, not adjusted. Same command, same
+  `tests/fixtures/`, sandboxed `HOME`: `before ~179 → after ~167`, **+6.7%**, where v0.2.0
+  reported **−55.9%**. Against a real 509-token `~/.claude/CLAUDE.md`: `509 → 167`, **67.2%**.
+  The old negative example is kept in the text as history rather than quietly deleted.
+- **The six documents that paste the snippet** — README, the migration guide and the four
+  per-agent walkthroughs — now carry it verbatim, enforced by a test. They had drifted.
+- **New database files are `0600`, new directories `0700`.** A file or directory that already
+  existed is never touched, including a custom `$LOCALMEM_DB` path. The mode is set between
+  `connect()` and `migrate()` — before SQLite's first write — so the `-wal`/`-shm` sidecars are
+  born restricted; measured at umask 022, tightening *after* the first write leaves both
+  sidecars at 644. A stale `-wal` outliving its database is swept explicitly.
+  `docs/design_decisions.md` §32.
+- **`mcp` is pinned to `>=2.0,<3`.** The 2.x line already broke the API once (FastMCP moved);
+  an unbounded upper edge means the next major arrives unannounced in a `pip install -U`. No
+  other dependency changed.
+
+### Fixed
+
+- A `chmod` on a filesystem that cannot express POSIX modes no longer prevents the database
+  from opening.
+- **`examples/localmem-capture.sh` no longer loses a large session summary silently.** The
+  summary is passed to `localmem add` as an exec argument; past `ARG_MAX` (1048576 bytes on
+  macOS) exec fails with `E2BIG`, and the script's `|| exit 0` swallowed it — the hook exited
+  0 having stored nothing, with no error anywhere. Measured against the old script: a 900 KB
+  summary stored a row, **1.1 MB and 1.5 MB stored nothing**. It is now capped at 100,000
+  characters and the stored trace ends with `…[truncated by capture hook]`, so a cut record
+  says so instead of reading as a complete one. A summary that is only whitespace still
+  stores nothing — the marker is appended after the blank and length tests, not before.
+  Shipped in v0.2.0; found reviewing the v0.2.1 hooks.
+- **`examples/localmem-capture.sh` no longer hangs on a whitespace-heavy session summary.**
+  Its blank check used `[ -z "${summary//[[:space:]]/}" ]`, which is quadratic in bash 3.2.57
+  — the version `/usr/bin/env bash` resolves to on a stock macOS — whenever the text is
+  whitespace-heavy, and a summary quoting a log is exactly that. Measured on 3.2.57 against
+  the old line: 50 KB took **523 seconds** and 100 KB did not finish. Both hooks now use a
+  single linear `case "$var" in *[![:space:]]*)`, pinned by a timing test and by a test that
+  reads the scripts for the pattern itself. Shipped in v0.2.0; found reviewing the v0.2.1
+  hook, which had inherited it.
+- **`search --context` no longer splits a Vietnamese letter at the 400-character cut.** In NFD
+  `ế` is `e` + two combining marks; a fixed slice could leave the `e` behind. The cut now backs
+  off while the first dropped codepoint is a combining mark.
+
 ## [0.2.0] — 2026-08-05
 
 Knowledge that crosses repositories. A shared `global` recall tier, a read-only hygiene report,

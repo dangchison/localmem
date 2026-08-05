@@ -194,6 +194,106 @@ def test_open_database_creates_parent_directories(tmp_path: Path) -> None:
     assert nested.exists()
 
 
+# --- file permissions -------------------------------------------------------
+
+
+def mode_of(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+def test_a_new_database_file_is_owner_only(tmp_path: Path) -> None:
+    """v0.2.1 item 5: another account on the machine must not be able to read memories."""
+    target = tmp_path / "fresh" / "memory.db"
+    connection = db.open_database(target)
+    try:
+        store.add_memory(connection, "a memory worth protecting", "proj")
+    finally:
+        connection.close()
+    assert mode_of(target) == db.DB_FILE_MODE
+
+
+def test_a_new_database_directory_is_owner_only(tmp_path: Path) -> None:
+    target = tmp_path / "fresh" / "memory.db"
+    db.open_database(target).close()
+    assert mode_of(target.parent) == config.DB_DIRECTORY_MODE
+
+
+def test_the_wal_sidecars_are_owner_only_too(tmp_path: Path) -> None:
+    """SQLite copies the database file's mode onto ``-wal``/``-shm`` at first write.
+
+    Measured on this machine at umask 022: with no chmod all three files land at 644,
+    and tightening the database file *after* the first write leaves the sidecars at 644.
+    ``open_database`` therefore tightens before :func:`db.migrate` — which is the first
+    write there is — so this asserts the ordering, not just the final mode.
+    """
+    target = tmp_path / "fresh" / "memory.db"
+    connection = db.open_database(target)
+    try:
+        store.add_memory(connection, "a memory worth protecting", "proj")
+        sidecars = [target.with_name(target.name + suffix) for suffix in ("-wal", "-shm")]
+        assert [side.exists() for side in sidecars] == [True, True]
+        assert [mode_of(side) for side in sidecars] == [db.DB_FILE_MODE, db.DB_FILE_MODE]
+    finally:
+        connection.close()
+
+
+def test_a_stale_sidecar_left_by_a_crash_is_tightened(tmp_path: Path) -> None:
+    """The one case ordering cannot cover: a ``-wal`` outliving its database file.
+
+    SQLite adopts the file that is already there rather than recreating it, so its mode
+    survives both the connect and the first write; the sweep is what closes it. The
+    assertion runs while the connection is open, because a clean close deletes the file.
+    """
+    target = tmp_path / "memory.db"
+    stale = target.with_name(target.name + "-wal")
+    stale.write_bytes(b"")
+    stale.chmod(0o644)
+
+    connection = db.open_database(target)
+    try:
+        store.add_memory(connection, "written after the crash", "proj")
+        assert mode_of(stale) == db.DB_FILE_MODE
+    finally:
+        connection.close()
+
+
+def test_an_existing_database_file_keeps_its_permissions(tmp_path: Path) -> None:
+    """A custom ``$LOCALMEM_DB`` the user chmodded deliberately is not "repaired"."""
+    target = tmp_path / "memory.db"
+    db.open_database(target).close()
+    target.chmod(0o644)
+
+    db.open_database(target).close()
+
+    assert mode_of(target) == 0o644
+
+
+def test_an_existing_directory_keeps_its_permissions(tmp_path: Path) -> None:
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+
+    db.open_database(parent / "memory.db").close()
+
+    assert mode_of(parent) == 0o755
+
+
+def test_a_filesystem_without_modes_does_not_break_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permissions are hardening; a chmod that cannot work must not fail the open."""
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("chmod is not supported here")
+
+    monkeypatch.setattr(Path, "chmod", refuse)
+    connection = db.open_database(tmp_path / "fresh" / "memory.db")
+    try:
+        assert db.schema_version(connection) == db.CURRENT_SCHEMA_VERSION
+    finally:
+        connection.close()
+
+
 def test_opening_a_corrupt_database_does_not_leak_its_connection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

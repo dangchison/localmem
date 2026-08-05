@@ -19,7 +19,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = ["click>=8.1", "mcp>=2.0", "tomli>=2.0; python_version < '3.11'"]
+# `mcp` is pinned below 3: 2.x already broke the API once (FastMCP moved), and an
+# unbounded upper edge means the next major lands in a `pip install -U` unannounced.
+dependencies = ["click>=8.1", "mcp>=2.0,<3", "tomli>=2.0; python_version < '3.11'"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "mypy>=1.11"]

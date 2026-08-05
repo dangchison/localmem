@@ -6,15 +6,17 @@ so nothing here depends on the machine's date.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from localmem import core_memory, retriever, store, tokens
+from localmem import cli, core_memory, retriever, store, tokens
 from localmem.cli import main
 
 WORKSPACE = "proj"
@@ -891,3 +893,204 @@ def test_cli_search_still_reports_no_matches(db_path: Path) -> None:
     result = CliRunner().invoke(main, ["search", "nothing here", "-w", WORKSPACE])
     assert result.exit_code == 0
     assert "no memories matching" in result.output
+
+
+# --- search --context -------------------------------------------------------
+
+
+def test_context_prints_absolutely_nothing_without_hits(db_path: Path) -> None:
+    """The whole point of the mode: a prompt hook runs this on every single prompt."""
+    result = CliRunner().invoke(main, ["search", "nothing here", "--context", "-w", WORKSPACE])
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_context_prints_nothing_against_an_empty_database(db_path: Path) -> None:
+    result = CliRunner().invoke(main, ["search", "anything", "--context", "--all"])
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_context_prints_a_header_and_one_line_per_hit(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", WORKSPACE])
+    runner.invoke(main, ["add", "config_loader caches nothing", "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines[0] == "Relevant memories (localmem):"
+    assert len(lines) == 3
+    assert all(line.startswith(f"- ({WORKSPACE}) ") for line in lines[1:])
+
+
+def test_context_collapses_a_multiline_memory_onto_one_line(db_path: Path) -> None:
+    runner = CliRunner()
+    multiline = "config_loader:\n  reads the timeout\n  caches nothing"
+    runner.invoke(main, ["add", multiline, "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    assert result.output.splitlines()[1:] == [
+        f"- ({WORKSPACE}) config_loader: reads the timeout caches nothing"
+    ]
+
+
+def test_context_truncates_a_long_memory_and_names_the_id(db_path: Path) -> None:
+    """A whole-file skill must not paste itself into every prompt."""
+    runner = CliRunner()
+    long_memory = "config_loader " + "detail " * 200
+    added = json.loads(runner.invoke(main, ["add", long_memory, "-w", WORKSPACE]).output)
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    line = result.output.splitlines()[1]
+    body = line[len(f"- ({WORKSPACE}) ") :]
+    head, marker, tail = body.partition("…")
+    assert len(head) == cli.CONTEXT_SNIPPET_CHARS
+    assert marker == "…"
+    assert tail == f" (memory_recall id {added['id']} for full text)"
+
+
+def test_context_never_splits_a_vietnamese_letter_in_half(db_path: Path) -> None:
+    """NFD `ế` is three codepoints; cutting between them turns it into `e`.
+
+    The memory is built so the 400th codepoint lands *inside* a cluster, which is the
+    only case that can go wrong and the one a fixed slice gets wrong silently.
+    """
+    runner = CliRunner()
+    letter = unicodedata.normalize("NFD", "ế")
+    assert len(letter) == 3, "the fixture only tests anything if NFD really decomposes"
+
+    # Place the cluster so that BOTH the cut index and the codepoint before it are combining
+    # marks: the base lands at 398, its two marks at 399 and 400. Anything less exercises the
+    # fast path and passes against a plain slice.
+    prefix = "config_loader "
+    limit = cli.CONTEXT_SNIPPET_CHARS
+    content = f"{prefix}{'x' * (limit - 2 - len(prefix))}{letter * 40}"
+    assert unicodedata.combining(content[limit]) != 0
+    assert unicodedata.combining(content[limit - 1]) != 0
+    runner.invoke(main, ["add", content, "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    head = result.output.splitlines()[1].split("…")[0]
+    assert unicodedata.combining(head[-1]) == 0, "the snippet ends on a combining mark"
+    # The whole cluster is given up, base included — never the base without its marks.
+    assert head[-1] == "x"
+    # And the cut still lands as late as it can: at most one cluster is surrendered.
+    assert len(head) >= limit - len(letter)
+
+
+def test_cut_point_is_the_limit_when_nothing_is_split() -> None:
+    assert cli._cut_point("a" * 500, cli.CONTEXT_SNIPPET_CHARS) == cli.CONTEXT_SNIPPET_CHARS
+
+
+def test_context_leaves_a_short_memory_whole(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", WORKSPACE])
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+    assert result.output.splitlines()[1] == f"- ({WORKSPACE}) config_loader reads the timeout"
+    assert "…" not in result.output
+
+
+def test_context_never_injects_core_memory(db_path: Path) -> None:
+    """DD-30: core is charged once per recall, never once per prompt."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "prefer pnpm everywhere", "-w", WORKSPACE, "--kind", "core"])
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    assert "core memory" not in result.output
+    assert "prefer pnpm everywhere" not in result.output
+    # The same query without the flag still gets it.
+    plain = runner.invoke(main, ["search", "config_loader", "-w", WORKSPACE])
+    assert "prefer pnpm everywhere" in plain.output
+
+
+def test_context_shows_the_workspace_that_answered(db_path: Path) -> None:
+    """The shared tier is legible in the injected block, exactly as in plain output."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", "global"])
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+    assert result.output.splitlines()[1].startswith("- (global) ")
+
+
+def test_context_honours_k(db_path: Path) -> None:
+    runner = CliRunner()
+    for index in range(5):
+        runner.invoke(main, ["add", f"config_loader detail number {index}", "-w", WORKSPACE])
+    result = runner.invoke(
+        main, ["search", "config_loader", "--context", "-k", "2", "-w", WORKSPACE]
+    )
+    assert len(result.output.splitlines()) == 3
+
+
+def test_context_prints_no_neighbors_or_scores(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", WORKSPACE])
+    runner.invoke(main, ["add", "config_loader caches nothing", "-w", WORKSPACE])
+    result = runner.invoke(main, ["search", "timeout", "--context", "-w", WORKSPACE])
+    assert "related id=" not in result.output
+    assert "score" not in result.output
+
+
+# --- LOCALMEM_NO_TRACKING ---------------------------------------------------
+
+
+def recalled_counts(conn: sqlite3.Connection) -> list[int]:
+    rows = conn.execute("SELECT recalled_count FROM memories ORDER BY id").fetchall()
+    return [int(row["recalled_count"]) for row in rows]
+
+
+def test_tracking_is_on_by_default(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert recalled_counts(conn) == [1]
+
+
+def test_no_tracking_env_makes_recall_read_only(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v0.2.1 item 3: the opt-out, proven in both directions on one database."""
+    store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+
+    monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, "1")
+    outcome = retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert len(outcome.results) == 1
+    assert recalled_counts(conn) == [0]
+
+    monkeypatch.delenv(retriever.NO_TRACKING_ENV_VAR)
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert recalled_counts(conn) == [1]
+
+
+def test_no_tracking_accepts_any_non_empty_value(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Set at all means off — including ``0``, which nobody sets to mean "on"."""
+    store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    for value in ("1", "0", "no", "true"):
+        monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, value)
+        retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert recalled_counts(conn) == [0]
+
+
+def test_an_empty_no_tracking_value_leaves_tracking_on(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.add_memory(conn, "use pnpm not npm", WORKSPACE)
+    monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, "")
+    retriever.retrieve(conn, "pnpm", WORKSPACE, now=NOW)
+    assert recalled_counts(conn) == [1]
+
+
+def test_cli_search_respects_no_tracking(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "use pnpm not npm", "-w", WORKSPACE])
+    monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, "1")
+    runner.invoke(main, ["search", "pnpm", "--context", "-w", WORKSPACE])
+    result = runner.invoke(main, ["stats"])
+    assert "recalls: 0 recorded across all memories" in result.output

@@ -19,6 +19,7 @@ passing a value rather than by patching the standard library.
 from __future__ import annotations
 
 import math
+import os
 import re
 import sqlite3
 import unicodedata
@@ -27,6 +28,11 @@ from datetime import datetime, timezone
 
 from localmem import core_memory, indexer, store
 from localmem.config import validate_workspace
+
+#: Set this to any non-empty value and a recall performs no write at all. The check is
+#: on emptiness, not on truthiness — ``LOCALMEM_NO_TRACKING=0`` also disables tracking,
+#: because an env var that has been set at all is a user who wants it off.
+NO_TRACKING_ENV_VAR = "LOCALMEM_NO_TRACKING"
 
 CANDIDATE_LIMIT = 20
 MAX_NEIGHBORS = 2
@@ -303,6 +309,7 @@ def retrieve(
 
     A recall is *almost* read-only: the ids it returns get their ``recalled_count``
     bumped by :func:`_record_recall`, best-effort and never able to fail the call.
+    Setting :data:`NO_TRACKING_ENV_VAR` removes that write and makes it read-only.
 
     Raises:
         ValueError: if ``k`` is out of range or ``workspace`` is empty.
@@ -356,6 +363,15 @@ def retrieve(
         core_memory_dropped=core.dropped,
         message=None if results else EMPTY_MESSAGE,
     )
+
+
+def tracking_disabled() -> bool:
+    """Return whether :data:`NO_TRACKING_ENV_VAR` is set to a non-empty value.
+
+    Read on every recall rather than cached at import: a long-lived MCP server and a
+    test suite both change the environment after this module is imported.
+    """
+    return bool(os.environ.get(NO_TRACKING_ENV_VAR, ""))
 
 
 def query_entities(query: str) -> list[str]:
@@ -538,8 +554,12 @@ def _record_recall(conn: sqlite3.Connection, memory_ids: list[int]) -> None:
     One statement, outside any transaction the caller owns, over the ids of the final
     top-k. The ``memories`` FTS triggers fire on ``UPDATE OF content`` only, so this
     write costs no index maintenance.
+
+    :data:`NO_TRACKING_ENV_VAR` turns the statement off, which makes recall strictly
+    read-only — at the cost of ``audit``'s dead-memory and promotion sections, which
+    have nothing left to count.
     """
-    if not memory_ids:
+    if not memory_ids or tracking_disabled():
         return
     placeholders = ", ".join("?" for _ in memory_ids)
     try:

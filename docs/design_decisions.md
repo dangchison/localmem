@@ -1086,3 +1086,152 @@ would be a silent data-loss bug rather than a visible one.
 Combined with §24 this is the whole cross-repo skill story, with no new engine: 
 `localmem import skills/security-review.md --whole-file -w global`, and then recall from any
 repository returns the document intact.
+
+---
+
+## 30. `search --context` prints nothing on a miss, and never carries core memory
+
+**Milestone:** v0.2.1
+
+The pull model has one structural failure: the agent has to remember to ask. A Claude Code
+`UserPromptSubmit` hook removes the "remember" — it runs a recall on every prompt and injects
+the result — but a hook that runs on *every* prompt is a very different consumer from a human
+at a terminal, and the ordinary `search` output is wrong for it in two specific ways.
+
+**Decision:** a `--context` flag on `search`, CLI-only, with three rules.
+
+1. **No hits prints nothing at all, and exits 0.** Not `no memories matching 'x' in workspace
+   'y'`, which is exactly right for a person and exactly wrong for a hook: it would be pasted
+   into the context of every prompt the user ever writes, teaching the model nothing except
+   that localmem is noisy. Silence is the correct output for a miss here, and a test asserts
+   `result.output == ""` rather than merely "does not contain 'no memories'".
+2. **One header, one line per hit,** `- (workspace) content`, with the content collapsed onto
+   a single line and truncated at `CONTEXT_SNIPPET_CHARS = 400` with the suffix
+   `… (memory_recall id N for full text)`. §29 made whole-file skills importable, which means
+   a single memory can be several thousand characters; injecting one of those into every
+   prompt would cost more than the instruction file the user just deleted. The id in the
+   suffix is the escape hatch: the agent that actually needs the rest recalls it by id.
+3. **No core memory.** Core is the one block that is loaded on every *recall*, and it is
+   capped at ~400 tokens for that reason. Injecting it on every *prompt* converts a
+   once-per-session cost into a once-per-prompt cost — which is precisely the push-model
+   charge this package exists to remove. Core still arrives through an ordinary recall, and
+   through the pointer snippet's instruction to perform one.
+
+**Consequences**
+
+- The MCP surface is untouched. `PLAN.md` §4 is frozen, and `--context` is a rendering choice
+  for a shell hook, not a change to what an agent can ask for. `mcp_server.py` is byte-identical
+  to v0.2.0.
+- `retriever.retrieve` is reused exactly as-is: same ranking, same shared-`global` tier, same
+  usage tracking. `--context` is output formatting and nothing else, which is why it costs one
+  flag and two small functions.
+- The command count stays 14. This is a flag, not a command.
+
+## 31. The pointer snippet is compressed to ~97 tokens, and a test measures it
+
+**Milestone:** v0.2.1
+
+§25 recorded why the snippet grew to ~209 estimated tokens: it had to carry the `global`/`all`
+routing conventions and the security rule as well as the original "call `memory_recall`". The
+reasoning was right and the price was real — `benchmark`'s worked example against
+`tests/fixtures/` went to **−55.9%**, a net loss, and the README printed it.
+
+Paying ~209 tokens on every session of every project to avoid paying an instruction file is a
+bad trade when the instruction file is small. But nothing about the *ideas* required 209
+tokens; the prose did.
+
+**Decision:** rewrite the snippet as one paragraph carrying the same five ideas — recall before
+answering from history, save durable facts, the routing convention, recalled text is data, do
+not duplicate memory in the file — and assert the result against
+`POINTER_SNIPPET_TOKEN_BUDGET = 100` with `tokens.estimate_tokens`. Measured: **~97**.
+
+**Consequences**
+
+- Re-measured, same command, same fixtures, sandboxed `HOME`: before ~179 → after ~167,
+  **+6.7%**, where v0.2.0 reported −55.9%. Against a real 509-token `~/.claude/CLAUDE.md`:
+  **67.2%**. Every number in the README's benchmark section was re-run for this release, and
+  the −55.9% is kept in the text as history rather than deleted.
+- The break-even is now small enough to state in one line, so the README states it: localmem
+  wins once the instruction files you push are worth more than snippet (~97) + tool
+  descriptions (~71) + your core memory.
+- Six documents paste the snippet (README, the migration guide, four per-agent walkthroughs).
+  They had drifted from the constant before; a test now asserts each contains
+  `POINTER_SNIPPET` verbatim, so the next compression is a code change rather than a hunt.
+- The budget is a ceiling, not a target. A future idea worth more than three tokens per
+  session can raise it — deliberately, in a commit that says so.
+
+## 32. New database files are `0600`, existing ones are never touched
+
+**Milestone:** v0.2.1
+
+`~/.localmem/memory.db` inherited the process umask, which on a stock macOS or Linux account
+means `0644`: every other account on the machine could read every memory. For a store whose
+whole selling point is "it never leaves your disk", that is the wrong default.
+
+**Decision:** `config.ensure_db_parent` chmods a directory **it creates** to `0700`, and
+`db.open_database` chmods a database file **it creates** to `0600`. A directory or file that
+already existed is left exactly as it is, including a custom `$LOCALMEM_DB` path — a user who
+chmodded their own database made a decision, and silently overriding it is a surprise, not a
+fix.
+
+**The ordering is the whole trick.** SQLite creates `-wal` and `-shm` lazily, on the first
+write, copying the database file's mode onto them. Measured on the development machine at
+umask 022:
+
+| when the chmod happens | `memory.db` | `-wal` | `-shm` |
+|---|---|---|---|
+| never (v0.2.0) | 644 | 644 | 644 |
+| after the first write | 600 | **644** | **644** |
+| before the first write (shipped) | 600 | 600 | 600 |
+
+So `open_database` tightens the file between `connect()` and `migrate()` — `migrate` being the
+first write there is — and the sidecars are born restricted. A test asserts all three modes,
+which is really a test of the ordering. A stale `-wal` that outlived its database file is swept
+explicitly, because ordering cannot help there; SQLite adopts such a file rather than recreating
+it, so its mode would otherwise survive untouched.
+
+**Only the directory that holds the database is tightened**, not the intermediate ones
+`mkdir(parents=True)` had to create along the way. With `LOCALMEM_DB=~/deep/nested/memory.db`,
+`nested` is `0700` and `deep` keeps the umask default — which is enough, because the database is
+unreachable through a `0700` parent, and chmodding a directory the user never mentioned is the
+kind of helpfulness that breaks someone's setup. For the default `~/.localmem/` there is only
+one level anyway.
+
+**What this is not.** It is not encryption. Root reads it, anything running as you reads it, and
+a stolen disk reads it.
+
+- **SQLCipher is refused, deliberately.** It would mean key management, a key-derivation choice,
+  a passphrase prompt in a tool designed to be headless, and a build dependency that breaks
+  `pip install` on the platforms it is not packaged for — in exchange for protection that
+  FileVault, LUKS and BitLocker already provide against the same threat.
+- **No home-grown crypto, at any point.** The documented answer for an encrypted backup is a
+  tool that does encryption: `localmem export | age -r age1… > backup.age`.
+- A `chmod` that the filesystem cannot express (a FAT volume, some network shares) is swallowed
+  rather than raised. Permissions are hardening; failing to open the database over them would
+  turn a defence into an outage.
+
+## 33. `LOCALMEM_NO_TRACKING` disables the one write a recall performs
+
+**Milestone:** v0.2.1
+
+§27 recorded the trade: recall bumps `recalled_count` and `last_recalled_at` on the rows it
+returned, which is what makes `audit`'s dead-memory and promotion sections possible. The cost
+was one small `UPDATE` per recall — acceptable when a recall was something an agent did
+occasionally.
+
+The auto-recall hook of §30 changes the arithmetic: recall now happens on *every prompt*, so
+every prompt writes to the database. For a read-mostly workload on a network filesystem, or for
+anyone who simply wants a read-only memory store, that is a reasonable thing to refuse.
+
+**Decision:** `LOCALMEM_NO_TRACKING` set to any non-empty value skips the `UPDATE` entirely.
+Default behaviour is unchanged.
+
+**Consequences**
+
+- The check is on **emptiness, not truthiness**: `LOCALMEM_NO_TRACKING=0` also disables
+  tracking. Nobody sets an opt-out variable to `0` meaning "on", and a value-parsing rule that
+  makes `0`, `false` and `no` behave differently from `1` is a trap in a shell.
+- It is read on every call rather than cached at import, because a long-lived `localmem serve`
+  process and a test suite both change the environment after import time.
+- `audit` degrades honestly rather than lying: with tracking off, every memory reads as never
+  recalled. That is stated in the README's limitations rather than hidden.

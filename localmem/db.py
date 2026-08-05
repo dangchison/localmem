@@ -12,6 +12,15 @@ from localmem import config
 
 SCHEMA_VERSION_KEY = "schema_version"
 
+#: Mode for a database file this process creates: owner only. An existing file is never
+#: touched, including a custom ``$LOCALMEM_DB`` path (``docs/design_decisions.md`` §32).
+DB_FILE_MODE = 0o600
+
+#: The files SQLite puts next to the database in WAL mode. It creates them with the
+#: database file's own mode, on the *first write* rather than at connect time — which is
+#: why the mode is tightened before :func:`migrate` runs.
+_SIDECAR_SUFFIXES = ("-wal", "-shm")
+
 # WAL is a persistent database property; busy_timeout and foreign_keys are
 # per-connection and therefore re-applied on every connect.
 _CONNECTION_PRAGMAS = (
@@ -48,18 +57,43 @@ def connect(path: Path) -> sqlite3.Connection:
 def open_database(path: Path | None = None) -> sqlite3.Connection:
     """Resolve, create, migrate and return a ready-to-use connection.
 
+    A database file this call brings into existence is restricted to
+    :data:`DB_FILE_MODE`; one that was already there is left exactly as the user set it.
+
     Args:
         path: explicit database file; defaults to :func:`config.resolve_db_path`.
     """
     target = path if path is not None else config.resolve_db_path()
     config.ensure_db_parent(target)
+    created = not target.exists()
     conn = connect(target)
     try:
+        if created:
+            _restrict_new_database(target)
         migrate(conn)
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+def _restrict_new_database(target: Path) -> None:
+    """Tighten a just-created database file, before anything writes to it.
+
+    Order is load-bearing. SQLite creates ``-wal`` and ``-shm`` on the first write and
+    copies the database file's mode onto them, so tightening the file first means the
+    sidecars are born restricted; tightening it afterwards leaves them world-readable.
+    Measured on this machine at umask 022: no chmod → ``644 644 644``; chmod before the
+    first write → ``600 600 600``; chmod after it → ``600 644 644``.
+
+    Sidecars are swept as well, for the one case that ordering cannot cover: a stale
+    ``-wal`` left behind by a crash whose database file was then deleted.
+    """
+    config.restrict_mode(target, DB_FILE_MODE)
+    for suffix in _SIDECAR_SUFFIXES:
+        sidecar = target.with_name(target.name + suffix)
+        if sidecar.exists():
+            config.restrict_mode(sidecar, DB_FILE_MODE)
 
 
 @contextmanager

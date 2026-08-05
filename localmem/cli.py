@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import unicodedata
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,6 +45,12 @@ from localmem import (
 _KIND_CHOICES = ("note", "trace", "core")
 _SIZE_UNITS = ("B", "KB", "MB", "GB")
 _NEIGHBOR_PREVIEW_CHARS = 100
+
+#: ``search --context`` truncates each memory here. A hook pays this per prompt, so a
+#: whole-file skill or checklist must not inject itself in full every time; the agent is
+#: told the id and can recall the row properly when it actually needs the rest.
+CONTEXT_SNIPPET_CHARS = 400
+_CONTEXT_HEADER = "Relevant memories (localmem):"
 
 # The query `init` step 5 runs to prove recall works end to end.
 _SELF_CHECK_QUERY = "localmem"
@@ -104,11 +111,26 @@ def add(
     help="Number of results.",
 )
 @click.option("--all", "search_all", is_flag=True, help="Search every workspace.")
-def search(query: str, workspace: str | None, limit: int, search_all: bool) -> None:
+@click.option(
+    "--context",
+    "as_context",
+    is_flag=True,
+    help="Compact output for a prompt hook; prints nothing when nothing matches.",
+)
+def search(
+    query: str,
+    workspace: str | None,
+    limit: int,
+    search_all: bool,
+    as_context: bool,
+) -> None:
     """Recall memories matching QUERY, best match first."""
     with _session() as (conn, _path):
         target_workspace = None if search_all else _resolve_workspace(workspace)
         outcome = retriever.retrieve(conn, query, target_workspace, limit)
+    if as_context:
+        _echo_context(outcome)
+        return
     _echo_core_memory(outcome)
     if not outcome.results:
         scope = "any workspace" if search_all else f"workspace {target_workspace!r}"
@@ -521,6 +543,48 @@ def _preview(text: str) -> str:
     if len(collapsed) <= _NEIGHBOR_PREVIEW_CHARS:
         return collapsed
     return collapsed[: _NEIGHBOR_PREVIEW_CHARS - 1] + "…"
+
+
+def _echo_context(outcome: retriever.RetrievalResult) -> None:
+    """Print the compact block a prompt hook injects, or nothing at all.
+
+    Two rules, both about a hook that runs on *every* prompt:
+
+    * no hits prints **nothing** — not the friendly empty-database message, which would
+      otherwise be pasted into the context of every prompt the user ever writes;
+    * core memory is left out. It is loaded on demand by an ordinary recall; injecting
+      it per prompt would turn a capped 400-token block into a fixed per-prompt cost,
+      which is the charge localmem exists to avoid (``docs/design_decisions.md`` §30).
+    """
+    if not outcome.results:
+        return
+    click.echo(_CONTEXT_HEADER)
+    for hit in outcome.results:
+        click.echo(f"- ({hit.workspace}) {_context_snippet(hit)}")
+
+
+def _context_snippet(hit: retriever.RetrievedMemory) -> str:
+    """Collapse a memory onto one line, truncated with the way to read the rest."""
+    collapsed = " ".join(hit.content.split())
+    if len(collapsed) <= CONTEXT_SNIPPET_CHARS:
+        return collapsed
+    head = collapsed[: _cut_point(collapsed, CONTEXT_SNIPPET_CHARS)]
+    return f"{head}… (memory_recall id {hit.id} for full text)"
+
+
+def _cut_point(text: str, limit: int) -> int:
+    """Return the largest cut at or below ``limit`` that keeps clusters whole.
+
+    Vietnamese in NFD is `e` + U+0302 + U+0301, three codepoints for one letter. Slicing
+    between them is valid UTF-8 and visibly wrong — `ế` becomes `e` — so the cut backs off
+    while the first *dropped* codepoint is a combining mark. ``unicodedata`` is enough for
+    this: the cases that need a real grapheme library (emoji ZWJ sequences, regional
+    indicators) render as one glyph either side of the cut and cost nothing when split.
+    """
+    cut = limit
+    while cut > 0 and unicodedata.combining(text[cut]) != 0:
+        cut -= 1
+    return cut
 
 
 def _echo_core_memory(outcome: retriever.RetrievalResult) -> None:

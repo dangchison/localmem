@@ -14,6 +14,11 @@ DB_PATH_ENV_VAR = "LOCALMEM_DB"
 DEFAULT_DB_RELATIVE_PATH = Path(".localmem") / "memory.db"
 FALLBACK_WORKSPACE = "global"
 
+#: Mode for a database directory this process creates: owner only. A directory that
+#: already exists is never touched — its permissions are the user's decision, not ours
+#: (``docs/design_decisions.md`` §32).
+DB_DIRECTORY_MODE = 0o700
+
 _GIT_TIMEOUT_SECONDS = 5
 
 
@@ -39,14 +44,36 @@ def resolve_db_path() -> Path:
 def ensure_db_parent(path: Path) -> None:
     """Create the directory that holds the database file.
 
+    A directory this call creates is restricted to :data:`DB_DIRECTORY_MODE`, so a
+    default ``~/.localmem/`` is not readable by other accounts on a shared machine. A
+    directory that was already there keeps whatever mode it had: the user may have
+    chosen it deliberately, and silently tightening someone else's directory is a
+    surprise, not a fix.
+
     Raises:
         OSError: if the directory cannot be created, with the offending path named.
     """
     parent = path.parent
+    existed = parent.is_dir()
     try:
         parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise OSError(f"cannot create database directory {parent}: {exc}") from exc
+    if not existed:
+        restrict_mode(parent, DB_DIRECTORY_MODE)
+
+
+def restrict_mode(path: Path, mode: int) -> None:
+    """Set ``path`` to ``mode``, ignoring a filesystem that cannot express it.
+
+    Permissions are a hardening measure, not a correctness requirement: a database on a
+    filesystem with no POSIX modes (a mounted FAT volume, some network shares) must
+    still open. The failure is swallowed for that reason and for no other.
+    """
+    try:
+        path.chmod(mode)
+    except OSError:
+        return
 
 
 def detect_workspace(cwd: Path | str | None = None) -> str:

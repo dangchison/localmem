@@ -5,7 +5,8 @@
 #   fresh venv -> pip install -e . -> localmem init (sandboxed HOME, decline agents and
 #   import) -> add x3 (one duplicate) -> search shows ranked results and the merge ->
 #   import a fixture twice with the row count stable -> drive `localmem serve` with a
-#   scripted MCP client over stdio -> benchmark --json parsed for saved_pct.
+#   scripted MCP client over stdio -> benchmark --json parsed for saved_pct -> the
+#   `--context` hook surface, its fail-safes, and the file modes of a new database.
 #
 # Both HOME and LOCALMEM_DB are redirected into a throwaway directory before any localmem
 # process starts, so this script cannot reach the real ~/.localmem/ or any real agent
@@ -399,9 +400,149 @@ if "±15%" not in report["caveat"]:
 print(f"saved_pct = {report['saved_pct']}")
 PY
 
-# ------------------------------------------------------------------ 8. nothing touched
+# ------------------------------------------------------------------ 8. search --context
 
-step "8. The real HOME is untouched"
+step "8. localmem search --context and the auto-recall hook"
+
+# A miss must print absolutely nothing: the hook runs this on every prompt.
+"${LM}" search "zzqqxx nothing is stored about this" --context \
+    >"${SANDBOX}/context-miss.out" 2>&1 ||
+    fail "search --context exited non-zero on a miss"
+[ ! -s "${SANDBOX}/context-miss.out" ] ||
+    fail "search --context printed something on a miss: $(cat "${SANDBOX}/context-miss.out")"
+info "a miss printed nothing and exited 0"
+
+"${LM}" search "pnpm" --context -k 3 >"${SANDBOX}/context-hit.out" 2>&1 ||
+    fail "search --context exited non-zero on a hit"
+cat "${SANDBOX}/context-hit.out"
+grep -q '^Relevant memories (localmem):$' "${SANDBOX}/context-hit.out" ||
+    fail "search --context printed no header line"
+grep -q '^- (' "${SANDBOX}/context-hit.out" ||
+    fail "search --context printed no '- (workspace) content' line"
+if grep -q 'core memory' "${SANDBOX}/context-hit.out"; then
+    fail "search --context injected core memory"
+fi
+
+# A memory longer than the 400-character cap is cut, with the id to recall for the rest.
+long_memory="config_loader $(printf 'detail %.0s' $(seq 1 200))"
+"${LM}" add "${long_memory}" >/dev/null 2>&1 || fail "could not add the long memory"
+"${LM}" search "config_loader" --context -k 1 >"${SANDBOX}/context-long.out" 2>&1 ||
+    fail "search --context exited non-zero on the long memory"
+grep -q 'for full text)$' "${SANDBOX}/context-long.out" ||
+    fail "a 1400-character memory was not truncated with the recall hint"
+info "a long memory was truncated with '… (memory_recall id N for full text)'"
+
+HOOK="${REPO_ROOT}/examples/localmem-auto-recall.sh"
+bash -n "${HOOK}" || fail "the auto-recall hook is not valid bash"
+
+# A PATH with jq but deliberately without localmem — the commonest hook failure there is.
+NO_LOCALMEM_PATH="${SANDBOX}/no-localmem"
+mkdir -p "${NO_LOCALMEM_PATH}"
+JQ_BIN="$(command -v jq || true)"
+if [ -n "${JQ_BIN}" ]; then
+    ln -s "${JQ_BIN}" "${NO_LOCALMEM_PATH}/jq"
+fi
+
+# The interpreter is named absolutely, so the stripped PATH governs only what the hook
+# itself looks up.
+BASH_BIN="$(command -v bash)"
+
+hook_status=0
+printf '%s' '{"prompt": "pnpm"}' |
+    PATH="${NO_LOCALMEM_PATH}" "${BASH_BIN}" "${HOOK}" >"${SANDBOX}/hook-nolm.out" 2>&1 ||
+    hook_status=$?
+[ "${hook_status}" = "0" ] ||
+    fail "the auto-recall hook exited ${hook_status} without localmem on PATH"
+[ ! -s "${SANDBOX}/hook-nolm.out" ] ||
+    fail "the hook printed something without localmem on PATH"
+info "no localmem on PATH: exit 0, no output"
+
+for payload in '' '   ' 'not json at all' '{}' '{"prompt": ""}'; do
+    hook_status=0
+    printf '%s' "${payload}" | PATH="${VENV}/bin:${PATH}" bash "${HOOK}" \
+        >"${SANDBOX}/hook-bad.out" 2>&1 || hook_status=$?
+    [ "${hook_status}" = "0" ] || fail "the hook exited ${hook_status} on payload: ${payload}"
+    [ ! -s "${SANDBOX}/hook-bad.out" ] || fail "the hook printed output on payload: ${payload}"
+done
+info "five malformed payloads: exit 0, no output, every time"
+
+# A 1 MB pasted log. The blank check used to be `[ -z "${prompt//[[:space:]]/}" ]`, which is
+# quadratic on bash 3.2.57 (stock macOS): 50 KB of this text spent 523 seconds in that one
+# expansion, upstream of the timeout guard. Wall clock is the assertion.
+"${VENV}/bin/python" - "${SANDBOX}/huge.json" <<'PY'
+import json
+import sys
+
+chunk = "  INFO   handler   started \n\t  retry  \n"
+prompt = (chunk * (1_000_000 // len(chunk) + 1))[:1_000_000]
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"prompt": prompt, "cwd": "."}, handle)
+PY
+
+hook_status=0
+SECONDS=0
+PATH="${VENV}/bin:${PATH}" bash "${HOOK}" <"${SANDBOX}/huge.json" \
+    >"${SANDBOX}/hook-huge.out" 2>&1 || hook_status=$?
+huge_elapsed=${SECONDS}
+[ "${hook_status}" = "0" ] || fail "the hook exited ${hook_status} on a 1 MB prompt"
+[ "${huge_elapsed}" -lt 5 ] ||
+    fail "the hook took ${huge_elapsed}s on a 1 MB prompt; the quadratic check is back"
+info "1 MB whitespace-heavy prompt handled in ${huge_elapsed}s"
+
+# The hook as Claude Code actually runs it: JSON on stdin, localmem on PATH. `jq` is the
+# script's dependency, not localmem's, so a machine without it skips this one assertion.
+if [ -z "${JQ_BIN}" ]; then
+    info "jq is not installed — skipping the injecting-a-real-hit assertion"
+else
+    hook_status=0
+    printf '%s' '{"prompt": "pnpm"}' |
+        PATH="${VENV}/bin:${PATH}" bash "${HOOK}" >"${SANDBOX}/hook-hit.out" 2>&1 ||
+        hook_status=$?
+    [ "${hook_status}" = "0" ] ||
+        fail "the auto-recall hook exited ${hook_status} on a real prompt"
+    cat "${SANDBOX}/hook-hit.out"
+    grep -q '^Relevant memories (localmem):$' "${SANDBOX}/hook-hit.out" ||
+        fail "the auto-recall hook injected nothing for a prompt that matches"
+    info "a real prompt was answered with an injected context block"
+fi
+
+# ------------------------------------------------------------------ 9. file permissions
+
+step "9. A new database is owner-only, an existing one is left alone"
+
+mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+
+db_mode="$(mode_of "${LOCALMEM_DB}")"
+[ "${db_mode}" = "600" ] || fail "the database is mode ${db_mode}, expected 600"
+for suffix in -wal -shm; do
+    sidecar="${LOCALMEM_DB}${suffix}"
+    [ -e "${sidecar}" ] || continue
+    side_mode="$(mode_of "${sidecar}")"
+    [ "${side_mode}" = "600" ] || fail "${sidecar} is mode ${side_mode}, expected 600"
+done
+info "memory.db and any live sidecar are 600"
+
+# A directory localmem creates itself is 0700.
+fresh_dir="${SANDBOX}/fresh"
+LOCALMEM_DB="${fresh_dir}/memory.db" "${LM}" stats >/dev/null 2>&1 ||
+    fail "could not open a database under a directory localmem had to create"
+dir_mode="$(mode_of "${fresh_dir}")"
+[ "${dir_mode}" = "700" ] || fail "a directory localmem created is mode ${dir_mode}, expected 700"
+fresh_mode="$(mode_of "${fresh_dir}/memory.db")"
+[ "${fresh_mode}" = "600" ] || fail "a database localmem created is ${fresh_mode}, expected 600"
+info "a directory localmem creates is 700"
+
+# A database the user chmodded deliberately is not "repaired".
+chmod 644 "${fresh_dir}/memory.db"
+LOCALMEM_DB="${fresh_dir}/memory.db" "${LM}" stats >/dev/null 2>&1 ||
+    fail "could not reopen the existing database"
+kept_mode="$(mode_of "${fresh_dir}/memory.db")"
+[ "${kept_mode}" = "644" ] || fail "an existing 644 database was changed to ${kept_mode}"
+info "an existing 644 database stayed 644"
+
+# ------------------------------------------------------------------ 10. nothing touched
+
+step "10. The real HOME is untouched"
 
 [ ! -e "${REAL_HOME}/.localmem" ] || [ "${BEFORE_LOCALMEM}" != "absent" ] ||
     fail "the run created ${REAL_HOME}/.localmem — the sandbox leaked"
