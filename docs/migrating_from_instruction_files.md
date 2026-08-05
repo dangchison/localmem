@@ -1,0 +1,183 @@
+# Migrating from instruction files
+
+Moving accumulated knowledge out of `CLAUDE.md` / `AGENTS.md` / Kiro steering files and into
+localmem, without breaking anything.
+
+> **localmem never edits your instruction files.** Not during `import`, not during `init`, not
+> ever. Every step below that changes a file is one you perform by hand. localmem's job is to
+> read those files, store what is in them, and print a suggestion.
+
+## Why bother
+
+Instruction files are **push-based**: the whole file enters context at the start of every
+session, relevant or not. They grow, they duplicate across projects, and no agent shares them
+with another. localmem is **pull-based**: a memory enters context when a query asks for it.
+
+The trade is not free. You give up guaranteed presence — an instruction file is *always* there,
+a recalled memory is there only when the agent asks and the query matches. Which is exactly why
+the migration is a split, not a move.
+
+## What to move, what to keep
+
+**Keep in the instruction file** anything the model must obey unconditionally, whether or not
+it thought to ask:
+
+- build and test commands (`pnpm -r build`, `pytest -q` must be green before you push)
+- hard style rules and prohibitions
+- the project's shape in two or three lines
+- the localmem pointer snippet itself
+
+**Move to localmem** anything that is knowledge rather than instruction — true, occasionally
+relevant, and accumulating:
+
+- decisions and their reasons ("we moved off X because Y")
+- incident notes and lessons learned
+- per-person and per-team preferences
+- API quirks, gotchas, workarounds you keep rediscovering
+- anything you added "so I don't forget", which is most of what makes these files grow
+
+Rule of thumb: if removing the line would make the agent do the *wrong thing* on its very next
+action, keep it. If removing it would only make the agent *not know* something it might need
+later, move it.
+
+## Step 1 — Look before you import
+
+```bash
+localmem import ./CLAUDE.md --dry-run
+```
+
+`--dry-run` prints `would create N records`, shows the first five rendered records, and writes
+nothing at all — it does not even open the database.
+
+Records are split at these boundaries:
+
+- each top-level bullet, with its nested children and continuations, as **one** record;
+- each paragraph;
+- each fenced code block, kept whole and never re-interpreted (a `#` or `-` inside a fence is
+  ordinary text, not a heading or bullet);
+- each heading's intro paragraph.
+
+The nearest enclosing heading is prepended as context, so a bullet under `## Build commands`
+is stored as `[Build commands] use pnpm, not npm` and stays findable by either half.
+
+Horizontal rules and rows of punctuation are dropped — they are markup, not memories.
+
+## Step 2 — Import
+
+```bash
+localmem import ./CLAUDE.md
+```
+
+Each record is stored with `kind='imported'` and `source='import:CLAUDE.md'`, in the
+auto-detected workspace (override with `-w NAME`), and runs through both dedup tiers.
+
+Pass several paths at once, or use `--select` to confirm each file individually — `--select`
+needs a terminal and fails with a clear message rather than hanging when there isn't one.
+
+**Re-importing is a no-op beyond `seen_count`.** The splitter is deterministic, so every record
+hashes to what it hashed to last time and tier-1 merges it. Import the same file twice and the
+row count does not move. This means you can safely re-import after editing a file: the
+unchanged records merge, only the new ones are added.
+
+After a real import localmem prints a *suggestion* — it is not an action:
+
+```
+Consider trimming the imported sections from CLAUDE.md and replacing them with the pointer
+snippet (`localmem init` prints it, or see docs/migrating_from_instruction_files.md).
+```
+
+## Step 3 — Check the memories are reachable
+
+Before you delete anything from the file, verify you can get it back:
+
+```bash
+localmem search "pnpm"
+localmem search "something you know is in that file"
+localmem stats
+```
+
+`stats` shows the row count per workspace and per kind, so you can confirm the `imported` rows
+landed where you expected.
+
+This step matters because retrieval is lexical plus an entity graph, not semantic. A memory
+phrased entirely differently from how you will later ask for it may not come back. If something
+important does not surface, that is the signal to leave it in the instruction file — or to
+re-add it as a `core` memory (below) rather than trusting recall to find it.
+
+## Step 4 — Trim by hand, and leave the pointer
+
+Now open `CLAUDE.md` yourself, delete the sections you imported and verified, and put this in
+their place (`localmem init` prints it too):
+
+```markdown
+## Memory
+
+Before answering questions about project history, prior decisions, or user preferences, call the `memory_recall` tool. When you learn a durable fact or decision, save it with `memory_add`. Do not duplicate long-term memory in this file.
+```
+
+That snippet is exactly what `localmem benchmark` charges as part of the "after" cost, so the
+number it quotes you is the number you actually pay.
+
+Do the trimming in a commit of its own. The DB is now the source of truth for what you removed,
+but the git history is a cheaper way to get it back if you cut too deep.
+
+## Step 5 — Promote the few things that must always be present
+
+Some facts are too important to depend on a query matching. Store those as **core memory**:
+
+```bash
+localmem add "deploys to staging always need a manual approval step" --kind core
+```
+
+`kind='core'` rows are attached to **every** recall for that workspace, before any ranking.
+They are the always-load tier — the small part of the old instruction file that genuinely had
+to be pushed.
+
+Two limits to respect:
+
+- Core memory is capped at **~400 estimated tokens per workspace**. Over the cap, whole rows
+  are dropped **oldest first** — never split. `localmem stats` prints a warning naming how many
+  rows the cap is currently hiding.
+- A single core memory longer than 400 tokens is dropped **entirely**, so keep them to one or
+  two sentences each.
+
+Think of core memory as a budget of roughly a dozen short lines. If you find yourself needing
+more, that content probably belongs back in the instruction file.
+
+## Step 6 — Measure
+
+```bash
+localmem benchmark
+```
+
+It compares the estimated per-session cost of the instruction files it finds against localmem's
+fixed cost (pointer snippet + the two MCP tool descriptions + this workspace's core memory).
+Run it before you trim and again after, and read the caveat it prints — every number is a
+character-based approximation, ±15%. For real numbers, use `/context` in Claude Code on either
+side of the change.
+
+## Housekeeping afterwards
+
+```bash
+localmem dedupe --list      # near-duplicate pairs the import queued for review
+localmem dedupe --review    # walk them one at a time (needs a terminal)
+localmem backfill           # entity-index anything stored before indexing existed
+localmem gc                 # prune resolved queue rows, reclaim disk space
+```
+
+Importing a file that overlaps with memories you already had will queue near-duplicate pairs.
+Nothing is merged automatically. `--merge ID` keeps the **newer** memory, folds the older row's
+`seen_count` into it, and **deletes the older row permanently** — it is the only path in
+localmem that deletes a memory. `--keep-both ID` marks the pair reviewed and changes nothing.
+
+## Rolling back
+
+There is nothing to undo. Your instruction files were never touched by localmem, so a rollback
+is `git checkout` on whatever you trimmed by hand. The database can be deleted outright:
+
+```bash
+rm -rf ~/.localmem
+```
+
+Removing the pointer snippet and unregistering the MCP server (delete the `localmem` entry from
+your agent's config) returns you to exactly where you started.
