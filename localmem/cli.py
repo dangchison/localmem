@@ -1,4 +1,4 @@
-"""Command line interface: ``add``, ``search`` and ``stats``.
+"""Command line interface: ``add``, ``search``, ``stats`` and ``backfill``.
 
 Every command runs headless — no prompts, no TTY requirement.
 """
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import click
 
-from localmem import __version__, config, db, store
+from localmem import __version__, config, db, indexer, store
 
 _KIND_CHOICES = ("note", "trace", "core")
 _SIZE_UNITS = ("B", "KB", "MB", "GB")
@@ -103,8 +103,27 @@ def stats() -> None:
     click.echo(f"database: {summary.db_path}")
     click.echo(f"size:     {_format_size(summary.db_size_bytes)}")
     click.echo(f"memories: {summary.total}")
+    click.echo(f"entities: {summary.total_entities}")
+    click.echo(f"entity links: {summary.total_entity_links}")
     _echo_counts("by workspace", summary.per_workspace)
     _echo_counts("by kind", summary.per_kind)
+
+
+@main.command()
+@click.option(
+    "-w",
+    "--workspace",
+    default=None,
+    help="Restrict to one workspace (default: every workspace).",
+)
+def backfill(workspace: str | None) -> None:
+    """Extract entities for memories stored before they were indexed.
+
+    Safe to re-run: memories that already have entity links are skipped.
+    """
+    with _session() as (conn, _path):
+        processed, links_created = indexer.backfill_all(conn, workspace)
+    click.echo(f"processed {processed} memories, created {links_created} links")
 
 
 @contextmanager

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from localmem import db
+from localmem import db, indexer
 from localmem.config import validate_workspace
 from localmem.dedup import content_hash
 
@@ -89,6 +89,8 @@ class Stats:
     total: int
     per_workspace: tuple[tuple[str, int], ...]
     per_kind: tuple[tuple[str, int], ...]
+    total_entities: int
+    total_entity_links: int
 
 
 def add_memory(
@@ -104,6 +106,10 @@ def add_memory(
     The raw ``content`` is stored verbatim; only its normalized form is hashed.
     Lookup and insert share one ``BEGIN IMMEDIATE`` transaction so concurrent
     writers cannot both insert the same fact.
+
+    A new row is indexed by :func:`localmem.indexer.index_memory` in the same
+    transaction. A merge does not re-index: the stored content is unchanged, so the
+    links already attached to that row stay correct.
 
     Returns:
         ``("added", id, 1)`` for a new row, ``("duplicate_merged", id, n)`` when an
@@ -136,6 +142,7 @@ def add_memory(
         row_id = cursor.lastrowid
         if row_id is None:
             raise RuntimeError("SQLite did not report a row id for the inserted memory")
+        indexer.index_memory(conn, row_id, content)
         return AddResult(STATUS_ADDED, row_id, 1)
 
 
@@ -198,8 +205,10 @@ def build_match_expression(query: str) -> str:
 
 
 def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
-    """Return row counts per workspace and per kind, plus the database footprint."""
+    """Return row counts per workspace, per kind and for the entity graph."""
     total_row = conn.execute("SELECT COUNT(*) AS total FROM memories").fetchone()
+    entity_row = conn.execute("SELECT COUNT(*) AS n FROM entities").fetchone()
+    link_row = conn.execute("SELECT COUNT(*) AS n FROM memory_entities").fetchone()
     per_workspace = conn.execute(
         "SELECT workspace, COUNT(*) AS n FROM memories "
         "GROUP BY workspace ORDER BY n DESC, workspace"
@@ -213,6 +222,8 @@ def collect_stats(conn: sqlite3.Connection, db_path: Path) -> Stats:
         total=int(total_row["total"]),
         per_workspace=tuple((row["workspace"], int(row["n"])) for row in per_workspace),
         per_kind=tuple((row["kind"], int(row["n"])) for row in per_kind),
+        total_entities=int(entity_row["n"]),
+        total_entity_links=int(link_row["n"]),
     )
 
 
