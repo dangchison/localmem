@@ -60,6 +60,11 @@ _NEIGHBOR_PREVIEW_CHARS = 100
 CONTEXT_SNIPPET_CHARS = 400
 _CONTEXT_HEADER = "Relevant memories (localmem):"
 
+#: Width of the longest bar in `audit`'s trace-similarity histogram. The shape is what
+#: carries the message, so the bars are scaled to the fullest bucket rather than to an
+#: absolute count.
+_HISTOGRAM_BAR_CHARS = 40
+
 #: Appended to a result the disjunctive fallback found. Nothing else matched the query,
 #: so the row shares *some* word with it rather than all of them — worth showing, worth
 #: labelling. ``--context`` drops these entirely; see :func:`_echo_context`.
@@ -116,6 +121,16 @@ def main() -> None:
         "this one as its first neighbour. An unknown id is an error and stores nothing."
     ),
 )
+@click.option(
+    "--if-novel",
+    "if_novel",
+    is_flag=True,
+    help=(
+        "Store only if no existing memory in this workspace already says the same thing. "
+        "Reports `skipped_redundant` and writes nothing when one does. Built for the "
+        "auto-capture hook; nothing is ever deleted or edited by this flag."
+    ),
+)
 def add(
     content: str,
     workspace: str | None,
@@ -124,12 +139,31 @@ def add(
     session_id: str | None,
     keywords: tuple[str, ...],
     supersedes: tuple[int, ...],
+    if_novel: bool,
 ) -> None:
     """Store CONTENT, merging it into an existing row if identical."""
+    if if_novel and supersedes:
+        # Refused rather than resolved either way round. Applying the correction after
+        # declining the write would retract a memory in favour of one that was never
+        # stored; skipping it silently would drop a retraction the caller believes it
+        # made. Both are worse than saying so.
+        raise click.UsageError(
+            "--if-novel cannot be combined with --supersedes: a skipped write has nothing "
+            "to supersede with, and dropping the correction silently would be worse. "
+            "Store the correction unconditionally, or drop --supersedes."
+        )
     with _session() as (conn, _path):
         target_workspace = _resolve_workspace(workspace)
         result = store.add_memory(
-            conn, content, target_workspace, kind, source, session_id, keywords, supersedes
+            conn,
+            content,
+            target_workspace,
+            kind,
+            source,
+            session_id,
+            keywords,
+            supersedes,
+            if_novel,
         )
     click.echo(
         json.dumps(
@@ -423,15 +457,41 @@ def dedupe(
     show_default=True,
     help="Prune resolved queue rows older than this many days.",
 )
-def gc(dry_run: bool, days: int) -> None:
-    """Prune resolved queue rows, reclaim disk space and print the result."""
+@click.option(
+    "--prune-traces",
+    "prune_traces_days",
+    type=click.IntRange(min=0),
+    default=None,
+    metavar="N",
+    help=(
+        "ALSO delete auto-captured traces older than N days that have never been "
+        "recalled. Off unless given: plain `gc` deletes no memory. Preview with "
+        "--dry-run first."
+    ),
+)
+def gc(dry_run: bool, days: int, prune_traces_days: int | None) -> None:
+    """Prune resolved queue rows, reclaim disk space and print the result.
+
+    Deletes **no memory** unless you pass `--prune-traces N`. Without it this command
+    only ever touches the near-duplicate queue, exactly as it always has.
+    """
     with _session() as (conn, path):
         prunable = dedup.count_prunable(conn, days)
+        traces = (
+            None
+            if prune_traces_days is None
+            else store.count_prunable_traces(conn, prune_traces_days)
+        )
         size_before = store.database_size_bytes(path)
         if dry_run:
             click.echo(f"would prune {prunable} resolved queue rows older than {days} days")
+            if traces is not None:
+                _echo_trace_prune_preview(traces)
             click.echo(f"size:    {_format_size(size_before)} (unchanged, nothing written)")
             return
+        pruned_traces = (
+            0 if prune_traces_days is None else store.prune_traces(conn, prune_traces_days)
+        )
         pruned = dedup.prune_resolved(conn, days)
         # VACUUM cannot run inside a transaction, so it happens after prune_resolved
         # has committed rather than within it.
@@ -442,6 +502,15 @@ def gc(dry_run: bool, days: int) -> None:
         size_after = store.database_size_bytes(path)
         remaining = dedup.pending_pairs(conn)
     click.echo(f"pruned {pruned} resolved queue rows older than {days} days")
+    if prune_traces_days is not None:
+        click.echo(
+            f"pruned {pruned_traces} never-recalled traces older than {prune_traces_days} days"
+        )
+        if traces is not None and traces.protected:
+            click.echo(
+                f"kept {traces.protected} otherwise-prunable traces that another memory "
+                "names as its replacement"
+            )
     click.echo(f"size:    {_format_size(size_before)} -> {_format_size(size_after)}")
     click.echo(f"queue depth: {len(remaining)} pending near-duplicate pairs")
 
@@ -730,6 +799,22 @@ def _pair_payload(pair: dedup.DuplicatePair) -> dict[str, object]:
         "newer": {"id": pair.newer.id, "content": pair.newer.content},
         "older": {"id": pair.older.id, "content": pair.older.content},
     }
+
+
+def _echo_trace_prune_preview(traces: store.TracePruneReport) -> None:
+    """Print exactly which traces a real run would delete, and what it would spare."""
+    click.echo(
+        f"would delete {traces.eligible} never-recalled traces older than "
+        f"{traces.days} days (showing {len(traces.samples)})"
+    )
+    for trace in traces.samples:
+        click.echo(f"   id={trace.id} workspace={trace.workspace} created={trace.created_at}")
+        click.echo(f"     {_preview(trace.content)}")
+    if traces.protected:
+        click.echo(
+            f"   keeping {traces.protected} otherwise-prunable traces that another "
+            "memory names as its replacement"
+        )
 
 
 def _echo_pairs(pairs: list[dedup.DuplicatePair], as_json: bool) -> None:
@@ -1039,7 +1124,7 @@ def _benchmark_payload(report: benchmark.Benchmark, workspace: str) -> dict[str,
 
 
 def _echo_audit(report: audit.Audit) -> None:
-    """Render the hygiene report as six numbered sections."""
+    """Render the hygiene report as seven numbered sections."""
     scope = report.workspace if report.workspace is not None else "every workspace"
     click.echo(f"localmem audit — {scope}")
     click.echo(f"database: {report.db_path} ({_format_size(report.db_size_bytes)})")
@@ -1049,6 +1134,7 @@ def _echo_audit(report: audit.Audit) -> None:
     _echo_audit_core(report.core_health)
     _echo_audit_dead(report)
     _echo_audit_superseded(report)
+    _echo_audit_lessons(report.lessons)
 
 
 def _echo_audit_queue(queue: audit.QueueReport) -> None:
@@ -1154,6 +1240,94 @@ def _echo_audit_superseded(report: audit.Audit) -> None:
     click.echo(f"   {audit.SUPERSEDED_NOTE}")
 
 
+def _echo_audit_lessons(lessons: audit.LessonHealth) -> None:
+    """Render section 7 — is the store learning, and what would the gate do today?"""
+    click.echo("\n7. lesson health")
+    # First, before any number that leans on recall counts can be misread as a fact.
+    if lessons.tracking_disabled:
+        click.echo(f"   {audit.TRACKING_DISABLED_NOTE}")
+    click.echo(
+        f"   active lessons: {lessons.active_total} "
+        f"(superseded: {lessons.superseded_lessons} — listed in section 6)"
+    )
+    for name, count in lessons.active_per_workspace:
+        click.echo(f"     {name}  {count}")
+
+    if not lessons.stale_total:
+        click.echo(f"   none unused for {lessons.stale_age_days} days")
+    else:
+        click.echo(
+            f"   never recalled in {lessons.stale_age_days} days: {lessons.stale_total} "
+            f"(showing {len(lessons.stale)})"
+        )
+        for lesson in lessons.stale:
+            click.echo(
+                f"     id={lesson.id} workspace={lesson.workspace} "
+                f"created={lesson.created_at} ({_age(lesson.age_days)})"
+            )
+            click.echo(f"       {_preview(lesson.content)}")
+
+    if not lessons.unread_total:
+        click.echo("   nothing is being stored repeatedly and never read back")
+    else:
+        click.echo(
+            f"   stored repeatedly, never read back "
+            f"(seen >= {audit.UNREAD_SEEN_COUNT_THRESHOLD}, "
+            f"recalled < {audit.UNREAD_RECALLED_COUNT_THRESHOLD}): "
+            f"{lessons.unread_total} (showing {len(lessons.unread)})"
+        )
+        for row in lessons.unread:
+            click.echo(
+                f"     id={row.id} workspace={row.workspace} kind={row.kind} "
+                f"seen={row.seen_count} recalled={row.recalled_count}"
+            )
+            click.echo(f"       {_preview(row.content)}")
+
+    _echo_audit_prunable(lessons.prunable)
+    _echo_audit_similarity(lessons.similarity)
+
+
+def _echo_audit_prunable(prunable: store.TracePruneReport) -> None:
+    # The scope is named in the line itself. Without it this count sits directly above the
+    # similarity figures, which are workspace-scoped, and the two read as contradicting
+    # each other whenever the traces live somewhere else.
+    scope = (
+        "across every workspace"
+        if prunable.workspace is None
+        else f"in workspace {prunable.workspace!r}"
+    )
+    click.echo(
+        f"   traces eligible for `gc --prune-traces {prunable.days}` {scope}: "
+        f"{prunable.eligible}"
+        + (f", kept as a replacement: {prunable.protected}" if prunable.protected else "")
+    )
+    click.echo(f"   {audit.PRUNE_NOTE}")
+
+
+def _echo_audit_similarity(similarity: audit.TraceSimilarity) -> None:
+    """Render the Jaccard distribution the capture threshold can be re-derived from."""
+    if not similarity.scanned:
+        click.echo("   trace similarity: no traces stored yet, nothing to measure")
+        return
+    sampled = "" if similarity.scanned == similarity.total else f" of {similarity.total}"
+    click.echo(
+        f"   trace similarity over {similarity.scanned}{sampled} traces "
+        f"(median {similarity.median:g}, {similarity.with_neighbour} with any neighbour):"
+    )
+    widest = max(bucket.count for bucket in similarity.buckets) or 1
+    for bucket in similarity.buckets:
+        mark = " <- gate" if bucket.lower == similarity.threshold else ""
+        bar = "#" * round(_HISTOGRAM_BAR_CHARS * bucket.count / widest)
+        click.echo(
+            f"     {bucket.lower:.2f}-{bucket.upper:.2f}  {str(bucket.count).rjust(4)}  {bar}{mark}"
+        )
+    click.echo(
+        f"   at or above {similarity.threshold}: {similarity.at_or_above_threshold} "
+        "— these are what the capture gate would skip today"
+    )
+    click.echo(f"   {audit.SIMILARITY_NOTE}")
+
+
 def _age(age_days: float | None) -> str:
     """Render an age in days, or say so when the timestamp could not be read."""
     return "age unknown" if age_days is None else f"{age_days:g} days old"
@@ -1230,6 +1404,7 @@ def _audit_payload(report: audit.Audit) -> dict[str, object]:
                 for dead in report.dead
             ],
         },
+        "lesson_health": _lesson_health_payload(report.lessons),
         "superseded": {
             "total": report.superseded_total,
             "note": audit.SUPERSEDED_NOTE,
@@ -1246,6 +1421,75 @@ def _audit_payload(report: audit.Audit) -> dict[str, object]:
                 }
                 for row in report.superseded
             ],
+        },
+    }
+
+
+def _lesson_health_payload(lessons: audit.LessonHealth) -> dict[str, object]:
+    """Return section 7 as JSON-ready data — same numbers, same notes, no rendering."""
+    return {
+        # First key in the object, mirroring the text mode: a consumer that reads the
+        # counts without reading this flag is drawing the wrong conclusion from them.
+        "tracking_disabled": lessons.tracking_disabled,
+        "tracking_note": audit.TRACKING_DISABLED_NOTE if lessons.tracking_disabled else None,
+        "active": {
+            "total": lessons.active_total,
+            "per_workspace": [
+                {"workspace": name, "count": count} for name, count in lessons.active_per_workspace
+            ],
+            "superseded": lessons.superseded_lessons,
+        },
+        "stale": {
+            "age_days": lessons.stale_age_days,
+            "total": lessons.stale_total,
+            "rows": [
+                {
+                    "id": lesson.id,
+                    "workspace": lesson.workspace,
+                    "created_at": lesson.created_at,
+                    "age_days": lesson.age_days,
+                    "content": lesson.content,
+                }
+                for lesson in lessons.stale
+            ],
+        },
+        "unread": {
+            "seen_count_threshold": audit.UNREAD_SEEN_COUNT_THRESHOLD,
+            "recalled_count_threshold": audit.UNREAD_RECALLED_COUNT_THRESHOLD,
+            "total": lessons.unread_total,
+            "rows": [
+                {
+                    "id": row.id,
+                    "workspace": row.workspace,
+                    "kind": row.kind,
+                    "seen_count": row.seen_count,
+                    "recalled_count": row.recalled_count,
+                    "content": row.content,
+                }
+                for row in lessons.unread
+            ],
+        },
+        "prunable_traces": {
+            "days": lessons.prunable.days,
+            # Explicit, because `gc --prune-traces` is NOT scoped: a consumer comparing
+            # this count against what the command deletes needs to know which it is.
+            "workspace": lessons.prunable.workspace,
+            "eligible": lessons.prunable.eligible,
+            "protected": lessons.prunable.protected,
+            "note": audit.PRUNE_NOTE,
+        },
+        "trace_similarity": {
+            "total": lessons.similarity.total,
+            "scanned": lessons.similarity.scanned,
+            "with_neighbour": lessons.similarity.with_neighbour,
+            "threshold": lessons.similarity.threshold,
+            "at_or_above_threshold": lessons.similarity.at_or_above_threshold,
+            "median": lessons.similarity.median,
+            "buckets": [
+                {"lower": bucket.lower, "upper": bucket.upper, "count": bucket.count}
+                for bucket in lessons.similarity.buckets
+            ],
+            "note": audit.SIMILARITY_NOTE,
         },
     }
 

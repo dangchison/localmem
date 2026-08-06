@@ -35,6 +35,28 @@ TIER2_JACCARD_THRESHOLD = 0.7
 TIER2_MAX_CANDIDATES = 10
 TIER2_TOP_TERMS = 5
 
+#: The capture hook's redundancy gate — see :func:`nearest_neighbour`.
+#:
+#: **This is not :data:`TIER2_JACCARD_THRESHOLD` and must never be "harmonised" with it.**
+#: The two answer different questions. Tier 2 asks "are these the same memory?" and may
+#: delete one of them, so it demands near-total overlap. This gate asks "has this session
+#: already been recorded, in other words?" and only ever declines to write, so it has to
+#: fire on a restatement.
+#:
+#: Measured before it was chosen (``.corp/localmem-v1/gate-d-capture.md``): over a fixture
+#: of restatements versus their originals the *minimum* overlap is **0.314**, and over
+#: novel traces versus their nearest neighbour the *maximum* is **0.140** — separable,
+#: with a gap of 0.174. Scored end to end through :func:`nearest_neighbour`, 0.25 skips
+#: 3/3 restatements and wrongly skips 0/8 novel traces; so do 0.20 and 0.30, and 0.25 sits
+#: in the middle of that band. At 0.40 the gate stops firing at all, and at tier-2's 0.70
+#: it is dead code: restatements in different words share about a third of their tokens,
+#: not seven tenths.
+#:
+#: The fixture is synthetic — the user's real database holds one row — so this number is
+#: provisional by construction. ``localmem audit`` reports the observed distribution over
+#: stored traces precisely so it can be re-derived from real data later.
+CAPTURE_JACCARD_THRESHOLD = 0.25
+
 QUEUE_STATUS_PENDING = "pending"
 QUEUE_STATUS_MERGED = "merged"
 QUEUE_STATUS_KEPT_BOTH = "kept_both"
@@ -56,7 +78,7 @@ _STOPWORDS = frozenset(
 )  # fmt: skip
 
 _CANDIDATE_SQL = """
-SELECT m.id AS id, m.content AS content
+SELECT m.id AS id, m.content AS content, m.seen_count AS seen_count
   FROM memories_fts
   JOIN memories AS m ON m.id = memories_fts.rowid
  WHERE memories_fts MATCH ?
@@ -150,6 +172,21 @@ class DuplicatePair:
     queued_at: str
     newer: PairMember
     older: PairMember
+
+
+@dataclass(frozen=True)
+class Neighbour:
+    """The closest existing memory to some text, by :func:`jaccard` overlap.
+
+    Returned by :func:`nearest_neighbour`. ``score`` is the overlap itself, carried out
+    so callers can apply their own threshold — and so ``audit`` can report the raw
+    distribution instead of a yes/no.
+    """
+
+    id: int
+    content: str
+    seen_count: int
+    score: float
 
 
 @dataclass(frozen=True)
@@ -255,22 +292,99 @@ def enqueue_near_duplicates(
 
     queued: list[int] = []
     try:
-        candidates = conn.execute(
-            _CANDIDATE_SQL, (match_expression, workspace, memory_id, TIER2_MAX_CANDIDATES)
-        ).fetchall()
-        for candidate in candidates:
-            score = jaccard(content, candidate["content"])
-            if score < TIER2_JACCARD_THRESHOLD:
+        for candidate in _scored_candidates(conn, content, workspace, memory_id, match_expression):
+            if candidate.score < TIER2_JACCARD_THRESHOLD:
                 continue
-            candidate_id = int(candidate["id"])
-            conn.execute(_INSERT_QUEUE_SQL, (memory_id, candidate_id, score))
-            queued.append(candidate_id)
+            conn.execute(_INSERT_QUEUE_SQL, (memory_id, candidate.id, candidate.score))
+            queued.append(candidate.id)
     except sqlite3.Error:
         # A tier-2 failure must never cost the user the memory they just wrote, so the
         # queue write is contained here. Anything that is not a database error is a bug
         # and propagates untouched.
         return queued
     return queued
+
+
+def nearest_neighbour(
+    conn: sqlite3.Connection,
+    content: str,
+    workspace: str,
+    build_or_match_expression: Callable[[str], str],
+    exclude_id: int = 0,
+) -> Neighbour | None:
+    """Return the existing memory closest to ``content``, or ``None`` if there is none.
+
+    This is the read-only half of near-duplicate detection: it decides nothing and writes
+    nothing. Two callers apply their own threshold to the score — the capture gate behind
+    ``localmem add --if-novel`` (:data:`CAPTURE_JACCARD_THRESHOLD`) and ``localmem audit``,
+    which reports the distribution rather than thresholding at all.
+
+    **The candidate query is disjunctive, and that is the whole point.**
+    :func:`enqueue_near_duplicates` builds a *conjunctive* expression, where every one of
+    the top terms must appear; that is adequate at tier 2's 0.7, because a pair which
+    overlaps that heavily shares nearly all its words anyway. It is useless here.
+    Measured on the milestone-D fixture: a restatement shares only two or three of its
+    five top terms with the original — that is precisely what makes it a restatement
+    rather than a copy — so the conjunctive query returned **zero candidates for 3 of 3
+    restatements** and the gate could never fire, at any threshold. The disjunctive
+    expression returns them and reproduces the pairwise scores (min 0.314 over
+    restatements, max 0.121 over novel traces).
+
+    The lesson generalises: candidate *recall* has to match how loose the decision
+    threshold is. A low threshold with a high-precision candidate query is dead code.
+
+    Args:
+        conn: an open connection; only ``SELECT`` runs here.
+        content: the text to find a neighbour for.
+        workspace: the workspace to stay inside.
+        build_or_match_expression: the *disjunctive* FTS5 sanitizer, injected by the
+            caller so this module does not have to import :mod:`localmem.store` back.
+        exclude_id: a row to leave out — the row itself, when it is already stored. The
+            default of ``0`` excludes nothing, since SQLite row ids start at 1.
+
+    Returns:
+        The highest-scoring candidate, or ``None`` when FTS5 proposes nobody. A database
+        error is reported the same way: this function is only ever consulted for advice,
+        and no caller should lose a write because the advice was unavailable.
+    """
+    terms = top_terms(content)
+    if not terms:
+        return None
+    match_expression = build_or_match_expression(" ".join(terms))
+    if not match_expression:
+        return None
+    try:
+        candidates = _scored_candidates(conn, content, workspace, exclude_id, match_expression)
+    except sqlite3.Error:
+        return None
+    return max(candidates, key=lambda candidate: (candidate.score, -candidate.id), default=None)
+
+
+def _scored_candidates(
+    conn: sqlite3.Connection,
+    content: str,
+    workspace: str,
+    exclude_id: int,
+    match_expression: str,
+) -> list[Neighbour]:
+    """Return every FTS5 candidate for ``content``, each scored by :func:`jaccard`.
+
+    The one place a stored memory is compared against new text. Both near-duplicate
+    tiers and the audit report go through it, so the overlap is computed by exactly one
+    piece of code; only the match expression and the threshold differ between callers.
+    """
+    rows = conn.execute(
+        _CANDIDATE_SQL, (match_expression, workspace, exclude_id, TIER2_MAX_CANDIDATES)
+    ).fetchall()
+    return [
+        Neighbour(
+            id=int(row["id"]),
+            content=row["content"],
+            seen_count=int(row["seen_count"]),
+            score=jaccard(content, row["content"]),
+        )
+        for row in rows
+    ]
 
 
 def pending_pairs(conn: sqlite3.Connection, workspace: str | None = None) -> list[DuplicatePair]:

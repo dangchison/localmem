@@ -416,20 +416,20 @@ Fifteen commands, no more:
 | Command | What it does |
 |---|---|
 | `localmem init` | guided setup — the five steps above; `--yes` (step 2 only), `--import-all` (step 3 only), `-w` |
-| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core,lesson}` (default `note`), `--source`, `--session-id`, `-K`/`--keyword` (**repeatable** — another word this memory should be findable by; merging an identical memory unions its keywords in), `--supersedes ID` (**repeatable** — the memory this one corrects; the old one is kept and stays searchable, just ranked below this one) |
+| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core,lesson}` (default `note`), `--source`, `--session-id`, `--if-novel` (**store only if nothing already stored says the same thing** — reports `skipped_redundant` and writes nothing otherwise; cannot be combined with `--supersedes`), `-K`/`--keyword` (**repeatable** — another word this memory should be findable by; merging an identical memory unions its keywords in), `--supersedes ID` (**repeatable** — the memory this one corrects; the old one is kept and stays searchable, just ranked below this one) |
 | `localmem promote ID` | reclassify the memory ID **by id**; `--kind {note,trace,core,lesson}` (default `lesson`). Nothing but the kind changes, and running it twice is a no-op. Re-adding the same text with a different `--kind` does *not* work — `add` merges on the content hash and keeps the stored kind |
 | `localmem search QUERY` | ranked recall; `-w`, `-k N` (1–20, **default 5**), `--all`, `--context` (compact output for a prompt hook, silent when nothing matches, and **drops weak OR-fallback hits**), `--context-fallback` (include them anyway; implies `--context`) |
 | `localmem import PATH…` | import markdown instruction files; `-w`, `--dry-run`, `--select`, `--whole-file` |
 | `localmem agents` | list detected agents; `--install NAME` registers one |
 | `localmem serve` | run the MCP server on stdio — this is what agent configs invoke |
 | `localmem stats` | row counts, entity graph size, recalls, queue depth, core-memory cost |
-| `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows, superseded rows and what replaced them; `-w`, `--json` |
+| `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows, superseded rows and what replaced them, and **lesson health** (active lessons, lessons never recalled, rows stored repeatedly but never read back, prunable traces, and the trace-similarity distribution the capture threshold is derived from); `-w`, `--json` |
 | `localmem benchmark [PATHS…]` | estimate instruction-file cost against localmem's fixed cost; `-w`, `--json`. The optional `PATHS` are measured **in addition to** the files it finds by itself |
 | `localmem dedupe` | review the near-duplicate queue; `--review`, `--list`, `--merge ID`, `--keep-both ID`, `-w`, `--json` |
 | `localmem backfill` | extract entities for memories stored before indexing; `-w` |
 | `localmem export` | write the raw memory rows as JSON; `-w`, `-o FILE` |
 | `localmem restore FILE` | merge an export document back in; idempotent |
-| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` (**default 30**) |
+| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` (**default 30**). Deletes **no memory** unless you pass `--prune-traces N`, which additionally removes auto-captured traces never recalled and older than N days — off by default, and it never touches a trace another memory names as its replacement |
 
 Plus `localmem --version`, which prints the installed version and exits.
 
@@ -442,7 +442,7 @@ Two, and no others.
 | Variable | Effect |
 |---|---|
 | `LOCALMEM_DB` | path to the database file, instead of `~/.localmem/memory.db`. `~` is expanded. **Setting it to an empty or whitespace-only value is an error**, not a fall-back to the default — every command fails with `LOCALMEM_DB is set but empty`. Unset it rather than blanking it |
-| `LOCALMEM_NO_TRACKING` | any **non-empty** value makes recall strictly read-only: it stops bumping `recalled_count` and `last_recalled_at`. The test is emptiness, not truthiness — **`LOCALMEM_NO_TRACKING=0` disables tracking too**. The cost is that `audit`'s dead-memory and promotion-candidate sections can no longer tell a memory that is never used from one recalled daily |
+| `LOCALMEM_NO_TRACKING` | any **non-empty** value makes recall strictly read-only: it stops bumping `recalled_count` and `last_recalled_at`. The test is emptiness, not truthiness — **`LOCALMEM_NO_TRACKING=0` disables tracking too**. The cost is that `audit`'s dead-memory, promotion-candidate and lesson-health sections can no longer tell a memory that is never used from one recalled daily — and that `gc --prune-traces` would consider every trace eligible, so **do not prune with tracking off** |
 
 ---
 
@@ -663,13 +663,41 @@ mechanism; there is no separate skill engine.
 ### Keeping it clean
 
 ```bash
-localmem audit          # queue, promotion candidates, distribution, core health, dead rows
+localmem audit          # queue, promotion candidates, distribution, core health, dead rows, lessons
 localmem audit --json   # the same numbers, machine-readable
+
+localmem gc                              # queue rows and disk space only — deletes no memory
+localmem gc --prune-traces 30 --dry-run  # what an auto-capture cleanup would remove
+localmem gc --prune-traces 30            # remove it
 ```
 
-Six sections: the near-duplicate queue, promotion candidates, distribution, core-memory health,
-dead rows, and — since v0.4.0 — **superseded rows, each shown with the memory that replaced
-it**, so you can see what the store has learned and unlearned.
+Seven sections: the near-duplicate queue, promotion candidates, distribution, core-memory health,
+dead rows, **superseded rows, each shown with the memory that replaced it** (v0.4.0), and — since
+v0.5.0 — **lesson health**, so you can see what the store has learned, unlearned, and is merely
+hoarding.
+
+Section 7 answers "is this thing actually learning?": active lessons per workspace, lessons
+nobody has recalled in 30 days, rows stored over and over but never read back (prime `promote`
+or dedup candidates), how many traces a prune would remove — **counted, never deleted**, scoped to `-w` like
+every other number here even though `gc --prune-traces` itself has no `-w` and acts on the whole
+database — and a histogram of how similar the stored traces are to each other, with the capture threshold marked
+on it:
+
+```
+   trace similarity over 3 traces (median 0.314, 3 with any neighbour):
+     0.00-0.10     1  ####################
+     0.10-0.20     0
+     0.20-0.25     0
+     0.25-0.30     0   <- gate
+     0.30-0.40     2  ########################################
+   at or above 0.25: 2 — these are what the capture gate would skip today
+```
+
+That histogram is the point: the two capture thresholds below were measured against a
+**synthetic** fixture, and this is how you re-derive them from your own traces once you have
+some. If `LOCALMEM_NO_TRACKING` is set, every recall-derived number in the section is measuring
+missing data rather than disuse, and the section says so on every run instead of reporting zeros
+as fact.
 
 `audit` writes nothing — a test asserts the database file is byte-identical afterwards. It is
 deterministic and makes no model call, which means it cannot judge whether two memories
@@ -717,8 +745,46 @@ the document is byte-identical to the file. It is an example: you install it int
 settings, because localmem never edits an agent's configuration without a yes and never edits
 hooks at all.
 
-It stores the session's final assistant message as `--kind trace`. A summary longer than
-**100,000 characters is truncated**, and the stored trace then ends with
+It stores the session's final assistant message as `--kind trace` — but only if the message
+gets past **two gates**, both added in v0.5.0 and both measured before they were chosen. Without
+them a Stop hook turns every session into a permanent row, which is the opposite of storing only
+what is worth learning from.
+
+**The noise gate: 80 characters.** Over a fixture of ten trivial summaries and eight that
+recorded a real lesson, the noise topped out at **61** characters and the real traces started at
+**120**. The gate this replaced was 40, which let **9 of those 10** through.
+
+| minimum length | noise kept | real traces lost |
+|---|---|---|
+| 40 (v0.4.0) | **9/10** | 0/8 |
+| **80 (now)** | **0/10** | **0/8** |
+| 160 | 0/10 | 7/8 |
+
+**The redundancy gate: Jaccard 0.25.** The hook passes `--if-novel`, so a session that restates
+something already stored is not written again. Restatements of an earlier trace overlapped it by
+at least **0.314**; novel traces overlapped their nearest neighbour by at most **0.140**.
+
+| threshold | skips redundant | wrongly skips novel |
+|---|---|---|
+| **0.25 (chosen)** | **3/3** | **0/8** |
+| 0.40 | 0/3 | 0/8 |
+| **0.70** — the near-duplicate queue's value | **0/3** | 0/8 |
+
+Note the last row. Reusing the existing near-duplicate threshold would have shipped **dead
+code**: two independently written accounts of the same session share about a third of their
+words, not seven tenths. The capture gate gets its own number for that reason, and
+`docs/design_decisions.md` §44 says so at length so nobody unifies them later.
+
+> **Both numbers are provisional, and honestly so.** The fixture is *synthetic* — the real
+> database held exactly one row when this was measured — and the same person wrote both classes
+> of summary. `localmem audit` section 7 reports the similarity distribution over your actual
+> traces precisely so these can be re-derived from real data instead. Treat them as a starting
+> point, not a finding.
+
+The gate declines writes; it never deletes or edits anything. To remove traces already captured,
+`localmem gc --prune-traces N` exists and is off by default.
+
+A summary longer than **100,000 characters is truncated**, and the stored trace then ends with
 `…[truncated by capture hook]` so a cut record admits it. That cap is not tidiness: the
 summary is passed to `localmem add` as an exec argument, and past `ARG_MAX` (1 MiB on macOS)
 exec fails with `E2BIG`, which the script's `|| exit 0` would swallow — storing **nothing**,
@@ -868,7 +934,7 @@ trimming is yours to do. Full guide, including what to keep and what to move:
 ## Limitations
 
 Read this section before deciding localmem is right for you. Everything below is measured
-behaviour of v0.4.0, not speculation.
+behaviour of v0.5.0, not speculation.
 
 1. **Retrieval is still lexical — keywords and an OR fallback work around that, they do not
    remove it.** BM25 matches words, not meaning. Two things mitigate it, and each has a cost
@@ -983,6 +1049,32 @@ behaviour of v0.4.0, not speculation.
     a per-prompt hook, not for reading: long memories are cut with the id to recall for the
     rest, and core memory is left out on purpose. Use plain `localmem search` for everything
     else.
+
+22. **The capture gate can discard a lesson worth keeping, and this is the cost of it working
+    at all.** With `--if-novel` — which the Stop hook now passes — a summary that overlaps an
+    already-stored memory by Jaccard ≥ 0.25 is **not written**. Token overlap is not meaning: a
+    genuinely new lesson about the same subsystem, phrased in the same vocabulary as one you
+    already have, can score above the line and be dropped. Nothing warns you, because the hook
+    is deliberately silent. Two things bound the damage — the gate only ever *declines a write*,
+    so no stored memory is ever deleted or edited by it, and it is scoped to one workspace — but
+    the loss is real and the flag is opt-in for that reason. `localmem add` without it stores
+    unconditionally, exactly as before.
+23. **Both capture thresholds were measured against a synthetic fixture.** 80 characters and
+    Jaccard 0.25 were each scored before being chosen, but against summaries written for the
+    purpose, because the real database held one row at the time. The separations are wide (19
+    characters of margin on one, 0.174 of Jaccard on the other) and one of them rests on overlap
+    between independently written restatements, which is harder to fake than it looks — but
+    neither is a finding from production data. `audit`'s section 7 reports the real distribution
+    so they can be re-derived; until you have traces in there, treat both as defaults.
+24. **`gc --prune-traces` will not delete a trace another memory names as its replacement**, no
+    matter how old or how unread it is. That is deliberate — dropping the link would restore a
+    memory somebody corrected to full rank — but it means the prunable count can sit stubbornly
+    above zero. The command reports how many it kept and why.
+25. **Prune eligibility is meaningless when `LOCALMEM_NO_TRACKING` is set.** Nothing writes
+    `recalled_count`, so every row looks never-recalled and the entire trace population becomes
+    "eligible". `audit` prints a warning instead of the numbers' usual meaning, and you should
+    not prune on that evidence. This is the one place where turning off tracking can cost you
+    data rather than just a report.
 
 Also **not** built, and not described anywhere in this repo as if they were: HTTP/SSE transport
 exists as a single function parameter for v2's benefit and is not reachable from the CLI; there

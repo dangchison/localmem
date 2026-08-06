@@ -5,6 +5,101 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-08-06
+
+The release where the store stops **accumulating** and the growth becomes **visible**.
+
+v0.4.0 taught localmem to learn. This one teaches it what not to bother remembering. The
+auto-capture hook fired on every Claude Code session and stored the final assistant message
+unconditionally, gated only on a 40-character minimum — so "Done." and "The tests pass."
+became permanent rows alongside the debugging session that actually taught something. That is
+the opposite of the requirement, which is to keep the lessons and the stumbles, not a
+transcript.
+
+Two gates now stand in front of that hook, and both were measured before they were chosen
+rather than picked for plausibility. A third change makes the measurements repeatable against
+real data, so neither number has to stay a guess.
+
+### Added
+
+- **`localmem add --if-novel`** — makes the write conditional. If a memory already in this
+  workspace overlaps the new text by Jaccard **0.25** or more, nothing is written and the
+  result reports `skipped_redundant` naming the memory that already covered it. It can only
+  ever prevent a *new row*: the tier-1 hash lookup still runs first, so re-storing identical
+  text still bumps `seen_count`, which is the signal `audit` reports on. It never deletes and
+  never edits.
+- **`localmem gc --prune-traces N`** — deletes `kind='trace'` rows that were never recalled and
+  are older than N days. **Off by default**; plain `gc` behaves exactly as it did in v0.4.0 and
+  deletes no memory. Works with the existing `--dry-run`, which prints the doomed rows by id.
+- **`localmem audit` section 7, lesson health** — active lessons per workspace, lessons never
+  recalled in 30 days, rows stored repeatedly but never read back, traces eligible for a prune
+  (**count only** — audit still writes nothing), and the observed Jaccard distribution across
+  stored traces as a histogram with the capture threshold marked on it. In text and `--json`.
+- `dedup.nearest_neighbour`, the read-only half of near-duplicate detection: it returns the
+  closest stored memory and its score, decides nothing and writes nothing. The capture gate and
+  the audit report both use it, so the report measures exactly what the gate decides on.
+
+### Changed
+
+- **The capture hook's noise gate rises from 40 to 80 characters.** Measured: the fixture's ten
+  trivial summaries top out at 61 characters and its eight real traces start at 120, so 40 let
+  **9 of 10** noise summaries through while 80 lets none through and loses no real trace, with
+  19 characters of margin below and 40 above.
+- **The capture hook passes `--if-novel`.** The redundancy arithmetic stays in Python, where
+  `localmem/dedup.py` already implements normalization, tokenization and Jaccard; the shell only
+  asks the question. A test asserts no second implementation creeps into the script.
+- `audit` now has seven sections rather than six. The superseded section is **extended, not
+  duplicated**: section 7 tallies how many lessons are retracted and points at section 6, which
+  already lists each one beside its replacement.
+
+### Fixed
+
+- **The redundancy gate would have shipped as dead code, and not because of the threshold.**
+  Tier 2 generates candidates with a *conjunctive* FTS5 expression — every one of the top 5
+  terms must appear. Measured end to end through that path, it returned **zero candidates for
+  3 of 3 restatements**, so the Jaccard comparison never ran and no threshold could have fired.
+  A restatement shares only two or three of its five top terms with the original, which is
+  precisely what makes it a restatement rather than a copy. The capture gate therefore generates
+  candidates with the *disjunctive* builder v0.3.0 already shipped for the retriever fallback,
+  which reproduces the pairwise numbers exactly. The general rule is recorded in
+  `docs/design_decisions.md` §44.1: **candidate recall has to match how loose the decision
+  threshold is**, and when it does not, the failure is silent. Tier 2's own path is unchanged.
+- **A single supersede reference would have made `--prune-traces` prune nothing.** `superseded_by`
+  has no `ON DELETE` clause and foreign keys are on, so a bulk delete that touches one referenced
+  trace raises `FOREIGN KEY constraint failed` and rolls back the whole statement — while the
+  command still reports success. Measured, then handled by excluding referenced traces from the
+  prune entirely. Reassigning the links the way `dedupe --merge` does would be wrong here: a
+  merge has a surviving twin that *is* the same correction, a prune has none, and the only
+  reassignment available (`SET NULL`) would restore a retracted memory to full rank — the
+  garbage collector would un-correct a correction. `dedup_queue` and `memory_entities` do
+  cascade, confirmed rather than assumed.
+- **`audit`'s prunable-trace count ignored the `-w` scope.** Every other number in section 7
+  filtered by workspace, so `audit -w global` on a database whose only trace lived elsewhere
+  printed "traces eligible: 1" directly above "no traces stored yet, nothing to measure" — two
+  adjacent lines contradicting each other, and a breach of the exact-scoping rule the module's
+  own docstring states. The count is now scoped like the rest of the section **and labelled**,
+  because `gc --prune-traces` really does have no `-w` and acts on every workspace: the line
+  names its scope, `TracePruneReport` carries it, and the note says the command's own dry run
+  reports the real total. Caught in review — every fixture had kept its traces in one workspace,
+  which is the one shape that cannot detect a missing filter.
+- `localmem add --if-novel --supersedes ID` is **refused** rather than resolved either way.
+  Applying the correction after declining the write would retract a memory in favour of one that
+  was never stored; dropping it silently would lose a retraction the caller believes it made.
+
+### Notes
+
+- **Both thresholds are provisional, and the release says so everywhere it states them.** The
+  fixture they were measured against is synthetic, because the user's real database held exactly
+  one row when the measurement was taken. Section 7's histogram is the feedback loop that makes
+  them re-derivable from real traces — that is what it is for.
+- The capture gate can discard something worth keeping: a genuinely new lesson phrased in the
+  same vocabulary as one already stored scores above 0.25 and is skipped. Recorded as a
+  limitation in both READMEs rather than left to be discovered.
+- `benchmark`'s `after_tokens` is **unchanged at 222**. Neither milestone adds prompt text — the
+  pointer snippet and both tool descriptions are untouched.
+- The MCP surface is unchanged. `--if-novel` is a CLI flag; the frozen `memory_add` schema does
+  not gain a parameter, and the command set stays at exactly fifteen.
+
 ## [0.4.0] — 2026-08-06
 
 The release where the memory store stops accumulating and starts **learning**.

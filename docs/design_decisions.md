@@ -1683,3 +1683,213 @@ candidates** — capped at `replacement * penalty`.
   corpus against the previous commit in a detached worktree rather than by copying what the new
   code prints.
 - Both weight rows still sum to 1.0; the fusion itself is untouched.
+
+## 44. The capture gate has its own Jaccard threshold — 0.25, not tier 2's 0.7
+
+**Milestone:** v0.5.0
+
+The auto-capture hook fires on every Claude Code `Stop` and stored the final assistant message
+unconditionally. Requirement R5 is the opposite: keep the lessons and the stumbles, not a
+transcript. So the hook needed to ask "have I already recorded this session, in other words?"
+before writing — and the obvious move was to reuse `TIER2_JACCARD_THRESHOLD`, which already
+exists and already means "these two are the same memory".
+
+**Measured before it was chosen** (`.corp/localmem-v1/gate-d-capture.md`). Over a fixture of
+sessions that taught something, sessions that taught nothing, and later restatements of the
+first group:
+
+| | value |
+|---|---|
+| min(Jaccard) over restatements vs their original | **0.314** |
+| max(Jaccard) over novel traces vs nearest neighbour | **0.140** |
+| separable? | **yes**, gap 0.174 |
+
+| threshold | skips redundant | wrongly skips novel |
+|---|---|---|
+| 0.20 | 3/3 | 0/8 |
+| **0.25 ← chosen** | **3/3** | **0/8** |
+| 0.30 | 3/3 | 0/8 |
+| 0.40 | 0/3 | 0/8 |
+| **0.70 — tier 2's shipped value** | **0/3** | 0/8 |
+
+**Reusing 0.7 would have shipped dead code.** Two independently written accounts of the same
+debugging session share about a third of their tokens, not seven tenths — 0.7 is calibrated for
+"the same text, lightly edited", which is the tier-2 question, not this one. This is the same
+failure the M3 review caught with a proposed bm25 threshold of 0.5 against measured scores
+around 5e-06: a number that reads plausibly and can never fire.
+
+**Decision:** `CAPTURE_JACCARD_THRESHOLD = 0.25`, defined next to tier 2's constant with the
+measurement in its docstring and an explicit instruction not to harmonise the two. They answer
+different questions and one of them can delete a memory.
+
+### 44.1 The threshold was only half the problem: candidate generation had to widen too
+
+Implementing the above surfaced a second defect that the pairwise measurement could not see.
+The gate does not compare against every stored memory — it compares against whatever FTS5
+proposes, and `enqueue_near_duplicates` builds that candidate query with
+`build_match_expression`, which is **conjunctive**: every one of the new text's top 5 terms must
+appear in the candidate.
+
+Measured end to end through that path, the gate returned **zero candidates for 3 of 3
+restatements**. The Jaccard comparison never ran. The threshold was correct and the gate was
+still dead code, at 0.25 and at every other value.
+
+The cause is structural rather than incidental: a restatement shares only two or three of its
+five top terms with the original — *that is what makes it a restatement rather than a copy*. The
+conjunctive query is adequate at tier 2's 0.7 only because a pair overlapping that heavily
+shares nearly all its words anyway.
+
+**Decision:** the capture gate generates candidates with `build_or_match_expression` — the
+disjunctive builder v0.3.0 already shipped for the retriever's fallback — and keeps `jaccard` as
+the sole decision. Scored through the real path, that reproduces the pairwise numbers: min 0.314
+over restatements, max 0.121 over novel traces, 3/3 skipped and 0/8 falsely skipped at 0.25.
+
+**The general rule, worth keeping:** candidate recall has to match how loose the decision
+threshold is. A low threshold behind a high-precision candidate query is dead code, and it fails
+silently — the command exits 0, writes the row, and reports success.
+
+Tier 2's own path is unchanged (§36 left it alone deliberately, and nothing measured here
+justifies touching a threshold that can delete a memory).
+
+**Consequences**
+
+- `dedup.nearest_neighbour` is the read-only half of near-duplicate detection: it decides
+  nothing, writes nothing, and returns the closest row with its score. The gate and `audit` both
+  use it, so the report measures exactly what the gate decides on.
+- `_scored_candidates` is now the single place a stored memory is compared against new text.
+  Both tiers and the audit go through it; only the match expression and the threshold differ.
+- Two tests pin the discovery: one asserts a real neighbour is found above the capture threshold
+  and below tier 2's, the other asserts the conjunctive query still finds *nothing* — so if that
+  ever changes, the threshold gets re-measured rather than the test deleted.
+
+## 45. The noise gate is 80 characters, because length is the only model-free signal
+
+**Milestone:** v0.5.0
+
+The shipped hook dropped summaries under 40 characters. Measured against the fixture's ten
+trivial summaries — "Done.", "The tests pass. Nothing further to do here." — that gate let
+**9 of 10** through, and each one became a permanent row.
+
+| | lengths |
+|---|---|
+| the 10 noise summaries | 5, 41, 43, 44, 49, 52, 55, 58, 59, **61** |
+| the 8 real traces | **120**, 126, 137, 139, 140, 147, 159, 165 |
+
+| minimum length | noise kept | real traces lost |
+|---|---|---|
+| 40 (shipped) | **9/10** | 0/8 |
+| **80 ← chosen** | **0/10** | **0/8** |
+| 120 | 0/10 | 0/8 |
+| 160 | 0/10 | 7/8 |
+
+**Decision:** 80, for the margin — 19 characters above the longest noise item and 40 below the
+shortest real one, so neither class sits near the line. localmem calls no model, so nothing
+better than length is available at this point in the pipeline, and length is not arbitrary here:
+an answer that taught nothing really is short.
+
+**Honest limit.** The fixture is synthetic, because the user's real database held exactly one
+row (an 880 KB leftover from E2BIG testing) when this was measured, and the same person wrote
+both classes. Two things reduce that: trivial answers being short is a property of the world
+rather than of the fixture, and the redundancy result rests on token overlap between
+independently written restatements, which is harder to fake. **Neither threshold is final.**
+`localmem audit` section 7 exists to make both re-derivable from real traces — see §47.
+
+## 46. Trace pruning is opt-in, and plain `gc` still deletes no memory
+
+**Milestone:** v0.5.0
+
+Capturing less does not shrink what was already captured, so `gc` gained
+`--prune-traces N`: delete `kind='trace'` rows that have `recalled_count = 0` and are older than
+N days.
+
+**Decision: off unless asked.** Plain `localmem gc` does exactly what it did in v0.4.0 — prunes
+resolved *queue* rows, vacuums, and deletes no memory at all.
+
+This preserves the standing principle rather than contradicting it. Until v0.4.0 the only path
+that deleted a memory was `dedupe --merge`, and it runs on a pair a human has just reviewed
+(§12 of the original spec forbids automatic near-duplicate deletion outright). A garbage
+collector that silently enforced a retention policy would break that promise in the one command
+people run without reading — and `gc` is exactly that command, because its existing job is
+reclaiming disk space, which nobody expects to cost them data.
+
+The three conditions are each doing work: `kind='trace'` restricts it to the auto-capture hook's
+own output, never anything a person or an agent wrote deliberately; `recalled_count = 0` spares
+anything that has ever proved useful; and the age bound spares the recent past. `--dry-run`
+prints the rows by id and content before any of it happens.
+
+**Consequences**
+
+- `audit` reports the eligible count on every run and deletes nothing, so the population is
+  visible long before anyone chooses to act on it.
+
+### 46.1 The count is workspace-scoped; the prune is not — and the report says so
+
+Caught in review, not by the test suite, because every fixture held its traces in a single
+workspace and therefore agreed with itself by accident. `audit -w global` on a database whose
+only trace lived in `repo-a` printed:
+
+```
+traces eligible for `gc --prune-traces 30`: 1
+trace similarity: no traces stored yet, nothing to measure
+```
+
+Two adjacent lines about the same workspace, contradicting each other. `count_prunable_traces`
+was being called without the report's scope while every other number in section 7 was scoped,
+which breaks the contract this module's own docstring sets: *"`workspace` filters exactly, with
+no shared-`global` fallback … an inventory of what is stored where must not blur them."*
+
+**Decision:** scope the count like everything else in the section, **and label it**, because
+`gc --prune-traces` genuinely has no `-w` and deletes across the whole database. Scoping alone
+would have replaced one wrong impression with another — a user reading "1 eligible in this
+workspace" and running the command could delete rows from four other workspaces.
+
+So the number answers "what is in *here*?", which is what an audit is for, and the line names
+its scope (`in workspace 'repo-a'` / `across every workspace`) while `PRUNE_NOTE` states that
+the command itself is unscoped and that the dry run reports the real total. `TracePruneReport`
+carries the `workspace` it was built for, so the JSON consumer can tell the two apart too.
+
+The general lesson is about the fixture rather than the code: **a test whose data all sits in
+one workspace cannot detect a missing workspace filter.** The regression test now asserts the
+empty side — a workspace holding no traces reports zero — which is the only shape that fails.
+- When `LOCALMEM_NO_TRACKING` is set, `recalled_count` stops being written, so *everything* looks
+  never-recalled. Section 7 says so in the output and tells the reader not to prune on that
+  evidence; this is the one caveat that can turn a report into data loss.
+
+## 47. A trace another memory names as its replacement is never pruned
+
+**Milestone:** v0.5.0
+
+`superseded_by` is `REFERENCES memories(id)` with **no `ON DELETE` clause** and
+`foreign_keys=ON`. §42 established that deleting a referenced row fails outright; the prune had
+to be measured against that rather than assumed safe.
+
+**Measured.** A bulk `DELETE FROM memories WHERE kind='trace'` against a database holding one
+referenced trace raises `FOREIGN KEY constraint failed` and **rolls back the entire statement** —
+so a single load-bearing trace would leave the command reporting success having pruned nothing.
+`dedup_queue` and `memory_entities` do cascade, confirmed the same way: a pruned trace takes its
+queue rows and entity links with it.
+
+**Decision: exclude referenced traces from the prune**, rather than reassign the links the way
+`resolve_merge` does.
+
+The reassignment `resolve_merge` performs is right *there* and wrong here, and the difference is
+worth stating. A reviewed merge has a surviving twin which the user has just declared to be the
+same memory, so the kept row *is* the same correction and the link should follow it. A prune has
+no twin. The only reassignment available would be `superseded_by = NULL`, which would restore a
+retracted memory to full rank — the garbage collector would quietly un-correct a correction, and
+the stale answer it demoted would start winning recalls again.
+
+So the rule is simply: **a trace that is somebody's correction is not garbage**, whatever its
+recall count says. It is excluded from the prune, and both `--dry-run` and the real run report
+how many were kept for that reason rather than leaving the arithmetic unexplained.
+
+**Consequences**
+
+- The four prune statements (two counts, the preview, the `DELETE`) each carry the same
+  `NOT EXISTS` clause and are written out in full rather than assembled, following the rule
+  `dedup._COUNT_PRUNABLE_SQL` set. A test asserts the preview lists exactly what the `DELETE`
+  removes, which is what catches them drifting apart.
+- The clause is `NOT EXISTS (SELECT 1 …)`, **not** `id NOT IN (SELECT superseded_by …)`. `NOT IN`
+  against a subquery yielding any NULL is NULL for every row, so it would match nothing and
+  prune nothing — and `superseded_by` is NULL for almost every row in the table, so that is the
+  normal case rather than an edge one.

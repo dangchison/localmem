@@ -14,6 +14,18 @@ set -uo pipefail
 readonly LOCALMEM_MAX_SUMMARY_CHARS=100000
 readonly LOCALMEM_TRUNCATION_MARKER="…[truncated by capture hook]"
 
+# The noise gate. A Stop hook fires on EVERY session, so without a floor here the store
+# fills with "Done." and "The tests pass." — permanent rows that teach nothing. Length is
+# the only signal available without a model, and it was measured before it was chosen
+# (.corp/localmem-v1/gate-d-capture.md): over a fixture of 10 trivial summaries and 8 that
+# recorded a real lesson, the noise tops out at 61 characters and the real traces start at
+# 120. A floor of 80 drops 10/10 noise and loses 0/8 real traces, with 19 characters of
+# margin below and 40 above. The 40 this replaced let 9 of those 10 through.
+#
+# The fixture is synthetic — the real database had one row in it when this was measured —
+# so treat 80 as provisional. `localmem audit` reports what is actually being stored.
+readonly LOCALMEM_MIN_SUMMARY_CHARS=80
+
 command -v localmem >/dev/null 2>&1 || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
@@ -45,7 +57,7 @@ case "$summary" in
     *[![:space:]]*) ;;
     *) exit 0 ;;
 esac
-[ "${#summary}" -lt 40 ] && exit 0
+[ "${#summary}" -lt "$LOCALMEM_MIN_SUMMARY_CHARS" ] && exit 0
 
 # Say so in the record itself: a trace that was cut should admit it rather than read as a
 # complete summary that happens to stop mid-sentence.
@@ -56,5 +68,18 @@ fi
 # Workspace: let localmem detect it from the repository the session ran in.
 cd "$(printf '%s' "$payload" | jq -r '.cwd // "."')" 2>/dev/null || exit 0
 
-localmem add "$summary" --kind trace --source claude-code-hook >/dev/null 2>&1 || exit 0
+# The redundancy gate, and the reason it lives inside `localmem` rather than here.
+#
+# Deciding "have I already recorded this session, in other words?" needs the summary
+# tokenized and compared against what is stored. localmem/dedup.py already does exactly
+# that — normalize, tokenize, Jaccard — and re-implementing any of it in shell would be a
+# second copy free to drift from the one the rest of the system decides on. So the hook
+# asks the question instead of answering it: --if-novel makes the write conditional and
+# skips it when an existing memory in this workspace overlaps by >= 0.25 (measured; see
+# dedup.CAPTURE_JACCARD_THRESHOLD for why it is not tier 2's 0.7).
+#
+# Nothing is deleted or edited by this: the redundant summary is simply not written. The
+# hook stays silent either way — stdout is discarded, and a skip is a success, not an
+# error, so `|| exit 0` is still only there for the E2BIG case above.
+localmem add "$summary" --kind trace --source claude-code-hook --if-novel >/dev/null 2>&1 || exit 0
 exit 0

@@ -25,6 +25,15 @@ MAX_LIMIT = 20
 STATUS_ADDED = "added"
 STATUS_DUPLICATE_MERGED = "duplicate_merged"
 
+#: What ``add --if-novel`` reports when it declined to write. Not an error and not a
+#: failure — the caller asked for the row only if it said something new, and it did not.
+STATUS_SKIPPED_REDUNDANT = "skipped_redundant"
+
+#: ``kind='trace'`` — the auto-capture hook's stamp, and the only kind ``gc
+#: --prune-traces`` will delete. Named here rather than spelled as a literal in the two
+#: prune statements, so the pruner and the hook can never disagree about what a trace is.
+TRACE_KIND = "trace"
+
 #: :func:`promote_memory`'s two outcomes. ``unchanged`` is not a failure — it is what
 #: makes the command idempotent, so a script may run it twice without special-casing.
 STATUS_PROMOTED = "promoted"
@@ -110,6 +119,74 @@ UPDATE memories
  WHERE workspace = ? AND content_hash = ?
 """
 
+#: How many doomed traces ``gc --prune-traces --dry-run`` prints before summarising.
+TRACE_PRUNE_SAMPLE_LIMIT = 10
+
+# The four trace-prune statements. Each is written out in full rather than assembled from
+# a shared predicate — the same rule `dedup._COUNT_PRUNABLE_SQL` follows, so no value can
+# ever reach the statement text. **They must be edited together**: the preview, the two
+# counts and the DELETE all have to agree on which rows are doomed, and the test suite
+# asserts the preview lists exactly what the DELETE removes. All four bind (kind, days).
+#
+# The NOT EXISTS clause is the supersede exclusion `prune_traces` documents: a trace that
+# some other row names as its replacement is kept. It is spelled as a correlated subquery
+# rather than `id NOT IN (SELECT superseded_by FROM memories)`, because `NOT IN` against a
+# subquery yielding any NULL is NULL for *every* row — which would match nothing and prune
+# nothing, the exact opposite of the intent. `superseded_by` is NULL for almost every row
+# in this table, so that is not a hypothetical.
+_COUNT_PRUNABLE_TRACES_SQL = """
+SELECT COUNT(*) AS n
+  FROM memories AS m
+ WHERE m.kind = ?
+   AND m.recalled_count = 0
+   AND m.created_at < datetime('now', ?)
+   AND NOT EXISTS (SELECT 1 FROM memories AS r WHERE r.superseded_by = m.id)
+"""
+
+_COUNT_PROTECTED_TRACES_SQL = """
+SELECT COUNT(*) AS n
+  FROM memories AS m
+ WHERE m.kind = ?
+   AND m.recalled_count = 0
+   AND m.created_at < datetime('now', ?)
+   AND EXISTS (SELECT 1 FROM memories AS r WHERE r.superseded_by = m.id)
+"""
+
+_SELECT_PRUNABLE_TRACES_SQL = """
+SELECT m.id         AS id,
+       m.workspace  AS workspace,
+       m.created_at AS created_at,
+       m.content    AS content
+  FROM memories AS m
+ WHERE m.kind = ?
+   AND m.recalled_count = 0
+   AND m.created_at < datetime('now', ?)
+   AND NOT EXISTS (SELECT 1 FROM memories AS r WHERE r.superseded_by = m.id)
+"""
+
+#: Appended by :func:`count_prunable_traces` when it is asked for one workspace, and bound
+#: after ``(kind, days)``. Qualified with the ``m`` alias — the statements above join
+#: ``memories`` to itself, so a bare ``workspace`` would be ambiguous.
+_TRACE_WORKSPACE_FILTER = " AND m.workspace = ?"
+
+#: Split off :data:`_SELECT_PRUNABLE_TRACES_SQL` so the workspace filter can land in the
+#: ``WHERE`` clause rather than after ``LIMIT``.
+_PRUNABLE_TRACES_ORDER_BY = " ORDER BY m.created_at ASC, m.id ASC LIMIT ?"
+
+# SQLite does not accept a table alias in `DELETE FROM`, so the predicate is applied
+# through a subquery that names the table again.
+_PRUNE_TRACES_SQL = """
+DELETE FROM memories
+ WHERE id IN (
+    SELECT m.id
+      FROM memories AS m
+     WHERE m.kind = ?
+       AND m.recalled_count = 0
+       AND m.created_at < datetime('now', ?)
+       AND NOT EXISTS (SELECT 1 FROM memories AS r WHERE r.superseded_by = m.id)
+ )
+"""
+
 # The two `?` in bm25() are the column weights; see BM25_COLUMN_WEIGHTS. They bind ahead
 # of the MATCH expression, because that is the order they appear in.
 _SEARCH_SQL = """
@@ -168,6 +245,38 @@ class SearchHit:
 
 
 @dataclass(frozen=True)
+class PrunableTrace:
+    """One trace ``gc --prune-traces`` would delete."""
+
+    id: int
+    workspace: str
+    created_at: str
+    content: str
+
+
+@dataclass(frozen=True)
+class TracePruneReport:
+    """What a trace prune would do, for the preview and for ``audit``.
+
+    Attributes:
+        days: the age cut-off this report was built against.
+        workspace: the workspace the counts are scoped to, or ``None`` for the whole
+            database. ``None`` is what :func:`prune_traces` actually acts on, so a report
+            carrying a workspace is an inventory, not a prediction of what ``gc`` removes.
+        eligible: how many traces would actually be deleted.
+        protected: how many match every other condition but are named by another row's
+            ``superseded_by`` and are therefore kept — see :func:`prune_traces`.
+        samples: up to :data:`TRACE_PRUNE_SAMPLE_LIMIT` of the eligible rows, oldest first.
+    """
+
+    days: int
+    workspace: str | None
+    eligible: int
+    protected: int
+    samples: tuple[PrunableTrace, ...]
+
+
+@dataclass(frozen=True)
 class Stats:
     """Aggregate counts for the ``stats`` command."""
 
@@ -193,6 +302,7 @@ def add_memory(
     session_id: str | None = None,
     keywords: Sequence[str] | None = None,
     supersedes: Sequence[int] | None = None,
+    if_novel: bool = False,
 ) -> AddResult:
     """Store ``content``, merging it into an existing row on an exact-hash match.
 
@@ -224,9 +334,25 @@ def add_memory(
     Tier-2 near-duplicate detection then runs over the new row and silently queues any
     pair it finds. It never blocks, never deletes and never changes the returned result.
 
+    ``if_novel`` makes the *insert* conditional: if some memory already in this workspace
+    overlaps ``content`` by :data:`localmem.dedup.CAPTURE_JACCARD_THRESHOLD` or more,
+    nothing is written and the result names the memory that made this one redundant. It
+    exists for the auto-capture hook, which would otherwise turn every session into a
+    permanent row — the requirement is to keep lessons worth learning from, not a
+    transcript. Two properties are deliberate:
+
+    * **it can only ever prevent a new row**, never a merge. The tier-1 hash lookup runs
+      first and still wins, so re-storing the *same* text still bumps ``seen_count``
+      exactly as it always did. That keeps the "stored repeatedly, never recalled"
+      signal ``audit`` reports, which a skip would erase;
+    * **it never deletes and never edits.** A redundant write is declined, not resolved
+      against what is already there. Nothing about this path can lose a stored memory.
+
     Returns:
         ``("added", id, 1)`` for a new row, ``("duplicate_merged", id, n)`` when an
-        existing row in the same workspace was bumped.
+        existing row in the same workspace was bumped, and — only under ``if_novel`` —
+        ``("skipped_redundant", id, n)`` naming the *existing* memory that already
+        covered this text, which was left untouched.
 
     Raises:
         ValueError: if ``content`` is blank, ``workspace`` is empty, or any
@@ -250,6 +376,15 @@ def add_memory(
                 *_merge_duplicate(conn, target_workspace, digest, keyword_text),
             )
         else:
+            redundant = (
+                dedup.nearest_neighbour(conn, content, target_workspace, build_or_match_expression)
+                if if_novel
+                else None
+            )
+            if redundant is not None and redundant.score >= dedup.CAPTURE_JACCARD_THRESHOLD:
+                # Nothing is written, so there is nothing to supersede with either; the
+                # caller is refused that combination before it reaches this function.
+                return AddResult(STATUS_SKIPPED_REDUNDANT, redundant.id, redundant.seen_count)
             try:
                 cursor = conn.execute(
                     _INSERT_MEMORY_SQL,
@@ -311,6 +446,103 @@ def promote_memory(conn: sqlite3.Connection, memory_id: int, kind: str) -> Promo
             return PromoteResult(STATUS_UNCHANGED, memory_id, workspace, kind, previous)
         conn.execute(_PROMOTE_SQL, (kind, memory_id))
     return PromoteResult(STATUS_PROMOTED, memory_id, workspace, kind, previous)
+
+
+def count_prunable_traces(
+    conn: sqlite3.Connection, days: int, workspace: str | None = None
+) -> TracePruneReport:
+    """Report what ``gc --prune-traces days`` would delete. Writes nothing.
+
+    ``protected`` counts the traces that match every other condition but are named by
+    some other row's ``superseded_by`` — see :func:`prune_traces` for why they survive.
+
+    ``workspace`` narrows the count to one workspace, filtering *exactly* with no shared
+    ``global`` fallback — the rule ``localmem.audit`` states and applies to every other
+    number it reports. ``audit`` passes its own scope so the section cannot contradict
+    itself; ``gc`` passes ``None``, because :func:`prune_traces` has no workspace argument
+    and deletes across the whole database. That asymmetry is real and is labelled in the
+    report rather than smoothed over: a count scoped to one workspace must not be read as
+    a prediction of what the command will remove.
+    """
+    counts = [
+        int(conn.execute(*_scoped(sql, days, workspace)).fetchone()["n"])
+        for sql in (_COUNT_PRUNABLE_TRACES_SQL, _COUNT_PROTECTED_TRACES_SQL)
+    ]
+    sql, params = _scoped(_SELECT_PRUNABLE_TRACES_SQL, days, workspace)
+    samples = tuple(
+        PrunableTrace(
+            id=int(row["id"]),
+            workspace=row["workspace"],
+            created_at=row["created_at"],
+            content=row["content"],
+        )
+        for row in conn.execute(
+            sql + _PRUNABLE_TRACES_ORDER_BY, (*params, TRACE_PRUNE_SAMPLE_LIMIT)
+        ).fetchall()
+    )
+    return TracePruneReport(
+        days=days,
+        workspace=workspace,
+        eligible=counts[0],
+        protected=counts[1],
+        samples=samples,
+    )
+
+
+def _scoped(sql: str, days: int, workspace: str | None) -> tuple[str, tuple[object, ...]]:
+    """Return ``sql`` and its parameters, narrowed to ``workspace`` when one is given."""
+    if workspace is None:
+        return sql, _prune_params(days)
+    return sql + _TRACE_WORKSPACE_FILTER, (*_prune_params(days), workspace)
+
+
+def prune_traces(conn: sqlite3.Connection, days: int) -> int:
+    """Delete never-recalled traces older than ``days`` and return how many went.
+
+    Opt-in, and off unless ``gc`` is given ``--prune-traces``: localmem's standing rule is
+    that it does not delete your memories behind your back, and a garbage collector that
+    quietly enforced a retention policy would break it. Plain ``gc`` still deletes no
+    memory at all.
+
+    Three conditions, all required. ``kind='trace'`` — only the auto-capture hook's own
+    output, never anything a person or an agent wrote deliberately. ``recalled_count = 0``
+    — a trace that was ever read back has proved its worth. And older than ``days``.
+
+    **There is deliberately no workspace argument**, and ``gc`` exposes no ``-w``: a prune
+    acts on the whole database. :func:`count_prunable_traces` *can* be scoped, because
+    ``audit`` is an inventory and must not blur workspaces the way a recall does — so a
+    scoped count is a smaller number than this function will delete, and both the report
+    and the ``gc`` output say so rather than leaving the reader to discover it.
+
+    **Traces another row names as its replacement are excluded**, however old and however
+    unread. This is measured behaviour, not caution: ``superseded_by`` is declared
+    ``REFERENCES memories(id)`` with no ``ON DELETE`` clause and foreign keys are on, so
+    deleting a referenced row raises ``FOREIGN KEY constraint failed`` — and because the
+    prune is one bulk ``DELETE``, a single referenced trace would abort the whole
+    statement and prune *nothing*.
+
+    :func:`localmem.dedup.resolve_merge` solves the same collision by moving the links
+    onto the row that survives, and that is right *there*: a reviewed merge has a
+    surviving twin which the pair was judged to be the same memory as, so it is the same
+    correction. A prune has no twin. The only reassignment available would be
+    ``superseded_by = NULL``, which would silently restore a retracted memory to full
+    rank — the garbage collector would un-correct a correction. So the trace stays.
+    A trace that is somebody's correction is load-bearing, whatever its recall count.
+
+    The other two references *do* cascade, which was measured rather than assumed: a
+    pruned trace takes its ``dedup_queue`` rows and its ``memory_entities`` links with it.
+    A pending near-duplicate pair built on a pruned trace therefore disappears, exactly as
+    it does after ``dedupe --merge``.
+    """
+    with db.transaction(conn):
+        cursor = conn.execute(_PRUNE_TRACES_SQL, _prune_params(days))
+        pruned = cursor.rowcount
+    return max(pruned, 0)
+
+
+def _prune_params(days: int) -> tuple[str, str]:
+    """Return the bound parameters shared by every trace-prune statement."""
+    return (TRACE_KIND, f"-{days} days")
 
 
 def search_memories(

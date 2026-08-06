@@ -13,8 +13,8 @@ localmem/
 ├── config.py       resolve $LOCALMEM_DB → path; detect workspace from git/dirname
 ├── db.py           connection PRAGMAs, BEGIN IMMEDIATE transactions, forward-only migrations
 ├── schema.sql      the canonical schema, version 1
-├── store.py        add_memory(), the FTS5 MATCH sanitizer, stats aggregation
-├── dedup.py        tier-1 hashing, tier-2 candidate + Jaccard gate, queue review, gc
+├── store.py        add_memory(), the FTS5 MATCH sanitizer, stats aggregation, trace prune
+├── dedup.py        tier-1 hashing, tier-2 candidate + Jaccard gate, nearest_neighbour, queue review, gc
 ├── indexer.py      regex entity extraction, entities/memory_entities maintenance, backfill
 ├── core_memory.py  the always-load tier: kind='core' rows, token-capped, two-tier merge
 ├── retriever.py    dual-view retrieval, fusion, boosts, evidence closure, recall tracking
@@ -271,6 +271,19 @@ row gains keywords is the duplicate merge, which unions the two sets. See
 `candidate_id` declare `ON DELETE CASCADE`, so resolving a pair with `--merge` — which deletes
 the older memory — removes the queue row along with it. A merged pair therefore leaves *no*
 row behind, and `gc` only ever prunes `kept_both` rows. See `design_decisions.md` §11.
+
+**`memories.superseded_by` is the one reference with no `ON DELETE` clause**, so deleting a row
+another row names as its replacement fails with `FOREIGN KEY constraint failed`. The two paths
+that delete a memory handle it differently and both are deliberate: `dedupe --merge` repoints
+the links onto the surviving twin (§42), while `gc --prune-traces` **excludes referenced rows
+from the prune entirely** (§47) — a prune has no twin to repoint to, and nulling the link would
+restore a corrected memory to full rank.
+
+**Two Jaccard thresholds, and they are not the same number.** Tier 2 queues near-duplicates for
+human review at ≥ 0.7 using *conjunctive* candidate generation; the capture gate behind
+`add --if-novel` declines a write at ≥ 0.25 using *disjunctive* generation. The pairing is not
+arbitrary — a low threshold behind a high-precision candidate query never fires at all, which is
+measured in `design_decisions.md` §44.1.
 
 **`entities.norm_name` is `UNIQUE` and there is no class column.** The extractor can report one
 span under two classes (a quoted `"ConfigLoader"` is both `QUOTED_STRING` and `CAMEL_CASE`);

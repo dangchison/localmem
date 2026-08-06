@@ -370,13 +370,13 @@ nên nó phải do con người viết, bằng `localmem add --kind core` từ C
 | `localmem agents` | liệt kê agent nhận diện được; `--install TÊN` đăng ký một cái |
 | `localmem serve` | chạy MCP server trên stdio — đây là thứ config của agent gọi |
 | `localmem stats` | số dòng, kích thước đồ thị thực thể, số lần recall, độ sâu hàng đợi, chi phí core memory |
-| `localmem audit` | báo cáo vệ sinh bộ nhớ — hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, và dòng đã bị sửa lại kèm cái đã thay thế nó; `-w`, `--json` |
+| `localmem audit` | báo cáo vệ sinh bộ nhớ — hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, dòng đã bị sửa lại kèm cái đã thay thế nó, và **sức khoẻ bài học** (lesson đang hiệu lực, lesson chưa từng được recall, dòng lưu đi lưu lại mà không ai đọc, trace đủ điều kiện dọn (đếm theo đúng workspace của `-w`, dù bản thân `gc --prune-traces` không có `-w` và xoá trên toàn database — nhãn có nói rõ), và phân bố độ giống giữa các trace để suy lại ngưỡng); `-w`, `--json` |
 | `localmem benchmark [PATHS…]` | ước lượng chi phí file chỉ dẫn so với chi phí cố định của localmem; `-w`, `--json`. `PATHS` tuỳ chọn được đo **thêm vào** những file nó tự tìm thấy |
 | `localmem dedupe` | duyệt hàng đợi gần-trùng; `--review`, `--list`, `--merge ID`, `--keep-both ID`, `-w`, `--json` |
 | `localmem backfill` | trích thực thể cho memory lưu trước khi có indexer; `-w` |
 | `localmem export` | xuất các dòng memory thô ra JSON; `-w`, `-o FILE` |
 | `localmem restore FILE` | trộn một file export trở lại vào DB; chạy lại nhiều lần không đổi kết quả |
-| `localmem gc` | dọn các dòng hàng đợi đã xử lý và thu hồi dung lượng; `--dry-run`, `--days N` (**mặc định 30**) |
+| `localmem gc` | dọn các dòng hàng đợi đã xử lý và thu hồi dung lượng; `--dry-run`, `--days N` (**mặc định 30**). **Không xoá memory nào** trừ khi bạn truyền `--prune-traces N` — khi đó nó xoá thêm các trace tự-lưu chưa từng được recall và cũ hơn N ngày; mặc định tắt, và không bao giờ đụng vào trace đang được memory khác coi là bản thay thế |
 
 Thêm `localmem --version` để in phiên bản đang cài rồi thoát.
 
@@ -395,7 +395,7 @@ xử y hệt `note`.
 | Biến | Tác dụng |
 |---|---|
 | `LOCALMEM_DB` | đường dẫn file database, thay cho `~/.localmem/memory.db`. `~` được mở rộng. **Đặt thành rỗng hoặc toàn khoảng trắng là LỖI**, không phải quay về mặc định — mọi lệnh sẽ hỏng với `LOCALMEM_DB is set but empty`. Muốn dùng mặc định thì **unset** nó, đừng gán rỗng |
-| `LOCALMEM_NO_TRACKING` | bất kỳ giá trị **khác rỗng** nào cũng làm recall trở thành chỉ-đọc: không tăng `recalled_count` và `last_recalled_at` nữa. Điều kiện là **rỗng hay không**, không phải đúng/sai — nên **`LOCALMEM_NO_TRACKING=0` cũng tắt tracking**. Cái giá phải trả: mục "dòng chết" và "ứng viên thăng hạng" của `audit` không còn phân biệt được memory chưa ai dùng với memory ngày nào cũng recall |
+| `LOCALMEM_NO_TRACKING` | bất kỳ giá trị **khác rỗng** nào cũng làm recall trở thành chỉ-đọc: không tăng `recalled_count` và `last_recalled_at` nữa. Điều kiện là **rỗng hay không**, không phải đúng/sai — nên **`LOCALMEM_NO_TRACKING=0` cũng tắt tracking**. Cái giá phải trả: mục "dòng chết", "ứng viên thăng hạng" và "sức khoẻ bài học" của `audit` không còn phân biệt được memory chưa ai dùng với memory ngày nào cũng recall — và `gc --prune-traces` sẽ coi **mọi** trace là đủ điều kiện xoá, nên **đừng dọn khi đang tắt tracking** |
 
 ---
 
@@ -627,7 +627,38 @@ là ví dụ **opt-in** — localmem không cài chúng, không bao giờ sửa 
 
 - **Tự lưu (Stop hook)** — [`examples/claude_code_hook.md`](examples/claude_code_hook.md), bọc
   script thật [`examples/localmem-capture.sh`](examples/localmem-capture.sh). Nó lưu tin nhắn
-  cuối của phiên với `--kind trace`. Bản tóm tắt dài quá **100.000 ký tự sẽ bị cắt**, và trace
+  cuối của phiên với `--kind trace` — nhưng từ v0.5.0 chỉ khi tin nhắn đó qua được **hai cổng
+  lọc**, cả hai đều được **đo trước khi chọn**, không phải chọn theo cảm tính. Không có chúng,
+  Stop hook biến **mọi** phiên thành một dòng vĩnh viễn — đúng ngược với việc chỉ giữ những gì
+  đáng học.
+
+  **Cổng nhiễu: 80 ký tự.** Trên tập mẫu gồm 10 bản tóm tắt vô nghĩa và 8 bản ghi lại một bài
+  học thật, nhóm nhiễu dài **tối đa 61** ký tự còn nhóm thật bắt đầu từ **120**. Ngưỡng cũ là 40
+  — nó cho lọt **9/10** bản nhiễu. Ở 80: lọt **0/10**, mất **0/8** trace thật.
+
+  **Cổng trùng lặp: Jaccard 0.25.** Hook truyền `--if-novel`, nên một phiên chỉ nói lại điều đã
+  lưu sẽ **không được ghi lần nữa**. Bản nói lại trùng với bản gốc tối thiểu **0.314**; trace
+  thật sự mới trùng với hàng xóm gần nhất tối đa **0.140**.
+
+  | ngưỡng | chặn được bản nói lại | chặn nhầm bản mới |
+  |---|---|---|
+  | **0.25 (đã chọn)** | **3/3** | **0/8** |
+  | 0.40 | 0/3 | 0/8 |
+  | **0.70** — ngưỡng của hàng đợi trùng lặp | **0/3** | 0/8 |
+
+  Để ý dòng cuối: **dùng lại ngưỡng 0.70 có sẵn thì cổng này sẽ không bao giờ kích hoạt** — hai
+  bản mô tả cùng một phiên viết độc lập chỉ dùng chung khoảng một phần ba số từ, không phải bảy
+  phần mười. Vì vậy cổng lưu có con số riêng; xem `docs/design_decisions.md` §44.
+
+  > **Cả hai con số đều là tạm thời, và nói thẳng ra như vậy.** Tập mẫu là **tổng hợp** — database
+  > thật lúc đo chỉ có đúng một dòng — và do cùng một người viết cả hai nhóm. Mục 7 của
+  > `localmem audit` báo cáo phân bố độ giống trên trace **thật của bạn** chính là để suy lại hai
+  > ngưỡng này từ dữ liệu thật.
+
+  Cổng chỉ **từ chối ghi**, không bao giờ xoá hay sửa gì. Muốn dọn trace đã lưu thì dùng
+  `localmem gc --prune-traces N` — mặc định tắt.
+
+  Bản tóm tắt dài quá **100.000 ký tự sẽ bị cắt**, và trace
   lưu lại kết thúc bằng `…[truncated by capture hook]` để bản ghi tự thú nhận là đã bị cắt. Cái
   cap đó không phải để gọn gàng: bản tóm tắt được truyền cho `localmem add` như một tham số
   exec, vượt `ARG_MAX` (1 MiB trên macOS) thì exec hỏng với `E2BIG`, và `|| exit 0` trong script
@@ -709,7 +740,7 @@ tier-2 chỉ có tiếng Anh, ảnh hưởng độ phủ chứ không ảnh hư�
 
 ## Giới hạn — bản rút gọn
 
-[README.md](README.md) liệt kê đủ **21** giới hạn đã đo được. Những cái nặng nhất:
+[README.md](README.md) liệt kê đủ **25** giới hạn đã đo được. Những cái nặng nhất:
 
 1. **Vẫn khớp theo từ vựng — `keywords` và OR fallback chỉ giảm nhẹ, không xoá bỏ.** BM25 khớp
    chữ, không khớp nghĩa. Con số đã đo: với 14 cặp câu hỏi/memory thực tế không dùng chung chữ
@@ -763,6 +794,28 @@ tier-2 chỉ có tiếng Anh, ảnh hưởng độ phủ chứ không ảnh hư�
     chính chữ của dòng đó — dòng cũ vẫn ra, với một phần mười điểm, và bản sửa gắn kèm làm
     neighbour đầu tiên. Đó là câu trả lời đúng theo thiết kế, không phải một cú trượt.
 
+12. **Cổng lưu có thể loại bỏ một bài học đáng giữ — đó là cái giá của việc nó hoạt động.** Với
+    `--if-novel` (hook Stop nay có truyền), một bản tóm tắt trùng ≥ 0.25 Jaccard với memory đã
+    lưu sẽ **không được ghi**. Trùng từ vựng không phải trùng nghĩa: một bài học thật sự mới về
+    cùng một hệ thống, diễn đạt bằng đúng vốn từ đó, có thể vượt ngưỡng và bị bỏ. Không có cảnh
+    báo, vì hook cố ý im lặng. Hai điều giới hạn thiệt hại: cổng chỉ **từ chối ghi** nên không
+    memory nào bị xoá hay sửa, và nó chỉ soi trong cùng một workspace. `localmem add` không kèm
+    cờ này vẫn lưu vô điều kiện như trước.
+13. **Cả hai ngưỡng của cổng lưu đều đo trên tập mẫu tổng hợp.** 80 ký tự và Jaccard 0.25 đều
+    được chấm điểm trước khi chọn, nhưng trên các bản tóm tắt viết ra để phục vụ việc đo, vì
+    database thật lúc đó chỉ có một dòng. Khoảng cách phân tách rộng (19 ký tự ở cổng này,
+    0.174 Jaccard ở cổng kia) — nhưng đó chưa phải kết luận rút ra từ dữ liệu thật. Mục 7 của
+    `audit` báo cáo phân bố thật để bạn suy lại.
+14. **`gc --prune-traces` không xoá trace đang được memory khác coi là bản thay thế**, dù cũ và
+    chưa ai đọc tới đâu. Cố ý như vậy — bỏ mối nối đi sẽ khiến một memory đã bị sửa quay lại
+    xếp hạng đầy đủ — nhưng nghĩa là số trace "đủ điều kiện dọn" có thể mãi không về 0. Lệnh có
+    báo nó giữ lại bao nhiêu và vì sao.
+15. **Điều kiện dọn trace mất ý nghĩa khi bật `LOCALMEM_NO_TRACKING`.** Không gì ghi
+    `recalled_count` nữa, nên mọi dòng đều trông như chưa từng được recall và **toàn bộ** trace
+    thành "đủ điều kiện". `audit` in cảnh báo thay vì để con số bị đọc nhầm, và **đừng dọn dựa
+    trên bằng chứng đó**. Đây là chỗ duy nhất mà tắt tracking có thể làm bạn mất dữ liệu chứ
+    không chỉ mất một báo cáo.
+
 Hãy đọc mục **Limitations** đầy đủ trong [README.md](README.md) trước khi dùng thật.
 
 ---
@@ -786,8 +839,9 @@ Bề mặt nhỏ, nói thẳng.
   `memory_add` qua MCP từ chối `kind="core"` để một mệnh lệnh bị chèn vào không thể tự ghi mình
   vào mọi lần recall về sau.
 - **Recall có ghi, trừ khi bạn bảo đừng.** Đặt `LOCALMEM_NO_TRACKING=1` (bất kỳ giá trị khác
-  rỗng nào) thì recall thành chỉ-đọc — đổi lại `audit` không còn gì để đếm cho mục dòng chết và
-  ứng viên thăng hạng.
+  rỗng nào) thì recall thành chỉ-đọc — đổi lại `audit` không còn gì để đếm cho mục dòng chết,
+  ứng viên thăng hạng và sức khoẻ bài học, và **không nên chạy `gc --prune-traces`** trong trạng
+  thái đó.
 
 ---
 

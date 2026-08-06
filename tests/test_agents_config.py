@@ -39,6 +39,10 @@ HOOK_DEADLINE_SECONDS = 3.0
 #: all. The capture-hook test has to cross that line to test anything.
 E2BIG_SUMMARY_CHARS = 1_200_000
 
+#: The capture hook's noise gate, measured in .corp/localmem-v1/gate-d-capture.md:
+#: the fixture's noise tops out at 61 characters and its real traces start at 120.
+CAPTURE_MIN_SUMMARY_CHARS = 80
+
 LOCALMEM_ENTRY = {"command": "localmem", "args": ["serve"]}
 
 TRIPLE_BASIC = '"' * 3
@@ -1656,3 +1660,117 @@ def test_after_text_contains_the_pointer_snippet_and_both_descriptions() -> None
     assert mcp_server.RECALL_DESCRIPTION in text
     assert mcp_server.ADD_DESCRIPTION in text
     assert "core note" in text
+
+
+# --------------------------------------------------- v0.5.0: the two capture gates
+
+#: The milestone-D fixture's shortest real trace (120 chars) and a restatement of it.
+REAL_TRACE = (
+    "Tests were flaky under xdist because two fixtures shared a temp directory. Gave each "
+    "worker its own tmp_path and the intermittent failures stopped."
+)
+RESTATED_TRACE = (
+    "The flaky tests came back. Same cause as before — fixtures sharing one temp dir "
+    "across xdist workers. Each worker needs its own tmp_path."
+)
+#: The fixture's longest noise summary is 61 characters; this one is in that band.
+NOISE_SUMMARY = "Yes, that's correct — the function returns a list of strings."
+
+
+def _capture(tmp_path: Path, summary: str) -> subprocess.CompletedProcess[str]:
+    script = Path(__file__).resolve().parent.parent / "examples" / "localmem-capture.sh"
+    payload = json.dumps({"last_assistant_message": summary, "cwd": str(tmp_path)})
+    _elapsed, completed = _time_hook(script, payload, tmp_path, _real_localmem_path())
+    return completed
+
+
+def _stored(db_path: Path) -> list[str]:
+    connection = db.open_database(db_path)
+    try:
+        return [row["content"] for row in connection.execute("SELECT content FROM memories")]
+    finally:
+        connection.close()
+
+
+def test_the_capture_hook_drops_a_summary_below_the_length_gate(
+    tmp_path: Path, db_path: Path
+) -> None:
+    """Measured: the fixture's 10 noise summaries top out at 61 characters.
+
+    The gate this replaced was 40, which let 9 of those 10 through and turned every
+    trivial session into a permanent row.
+    """
+    assert len(NOISE_SUMMARY) < 80, "this fixture has to sit below the gate to test it"
+
+    completed = _capture(tmp_path, NOISE_SUMMARY)
+
+    assert completed.returncode == 0
+    assert _stored(db_path) == []
+
+
+def test_the_capture_hook_still_stores_a_real_trace(tmp_path: Path, db_path: Path) -> None:
+    """The other half of the gate: 80 loses 0 of the 8 real traces, the shortest 120."""
+    assert len(REAL_TRACE) >= 80
+
+    completed = _capture(tmp_path, REAL_TRACE)
+
+    assert completed.returncode == 0
+    assert _stored(db_path) == [REAL_TRACE]
+
+
+def test_the_capture_hook_skips_a_restatement_of_what_it_already_stored(
+    tmp_path: Path, db_path: Path
+) -> None:
+    """The redundancy gate, end to end through the real script and the real CLI.
+
+    This is the requirement in one test: a second session that re-learns the same lesson
+    in different words must not become a second permanent row.
+    """
+    assert _capture(tmp_path, REAL_TRACE).returncode == 0
+
+    completed = _capture(tmp_path, RESTATED_TRACE)
+
+    assert completed.returncode == 0
+    assert _stored(db_path) == [REAL_TRACE], "the restatement was stored anyway"
+
+
+def test_the_capture_hook_still_stores_something_genuinely_new(
+    tmp_path: Path, db_path: Path
+) -> None:
+    """The gate must decline restatements without declining novel traces."""
+    novel = (
+        "The deploy failed because the health check probed / while the app only serves "
+        "/healthz, so Kubernetes killed every pod before it finished booting."
+    )
+    assert _capture(tmp_path, REAL_TRACE).returncode == 0
+
+    assert _capture(tmp_path, novel).returncode == 0
+
+    assert sorted(_stored(db_path)) == sorted([REAL_TRACE, novel])
+
+
+def test_the_capture_hook_still_only_ever_exits_zero() -> None:
+    """The v0.5.0 edits must not have introduced a non-zero exit path."""
+    script = Path(__file__).resolve().parent.parent / "examples" / "localmem-capture.sh"
+    text = script.read_text(encoding="utf-8")
+
+    exits = re.findall(r"exit (\d+)", text)
+    assert exits and set(exits) == {"0"}
+    assert "set -uo pipefail" in text
+    assert "set -e" not in text
+
+
+def test_the_capture_hook_asks_localmem_rather_than_reimplementing_jaccard() -> None:
+    """The gate's arithmetic lives in one place — Python — and the shell only asks."""
+    script = Path(__file__).resolve().parent.parent / "examples" / "localmem-capture.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert "--if-novel" in text
+    assert f"LOCALMEM_MIN_SUMMARY_CHARS={CAPTURE_MIN_SUMMARY_CHARS}" in text
+    # No second implementation of the overlap in shell. Comments are stripped first —
+    # the *explanation* names Jaccard on purpose; what must not appear is the arithmetic.
+    body = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    ).lower()
+    for forbidden in ("jaccard", "awk ", "comm -12", "sort -u"):
+        assert forbidden not in body, forbidden

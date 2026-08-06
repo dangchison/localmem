@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from localmem import audit, core_memory, db, retriever, store
+from localmem import audit, core_memory, db, dedup, retriever, store
 from localmem.cli import main
 
 WORKSPACE = "proj"
@@ -374,3 +374,285 @@ def test_the_audit_command_reports_a_blank_workspace_cleanly(db_path: Path) -> N
 def test_the_schema_version_the_report_depends_on(conn: sqlite3.Connection) -> None:
     """Sections 2 and 5 read ``recalled_count``, which only exists from version 2."""
     assert db.schema_version(conn) >= 2
+
+
+# --------------------------------------------------------- section 7: lesson health
+
+#: The milestone-D fixture pair: a real trace and a later restatement of it. Their
+#: overlap is 0.314 — over the capture gate, under tier 2's.
+TRACE = (
+    "Tests were flaky under xdist because two fixtures shared a temp directory. Gave each "
+    "worker its own tmp_path and the intermittent failures stopped."
+)
+TRACE_RESTATED = (
+    "The flaky tests came back. Same cause as before — fixtures sharing one temp dir "
+    "across xdist workers. Each worker needs its own tmp_path."
+)
+
+
+@pytest.fixture
+def learning(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """A database with something in every part of section 7."""
+    store.add_memory(conn, "413 on upload is the proxy, not the app", WORKSPACE, "lesson")
+    store.add_memory(conn, "never trust a green suite you did not watch run", "global", "lesson")
+    forgotten = store.add_memory(
+        conn, "the ALTER TABLE needs a default or it locks the table", WORKSPACE, "lesson"
+    )
+    _age(conn, forgotten.id, 90)
+    retracted = store.add_memory(conn, "the leak is in the resizer", WORKSPACE, "lesson")
+    store.add_memory(
+        conn, "it was the connection pool all along", WORKSPACE, "lesson", supersedes=[retracted.id]
+    )
+    for _ in range(4):
+        store.add_memory(conn, "remember to bump the lockfile after a dependency change", WORKSPACE)
+    old_trace = store.add_memory(conn, TRACE, WORKSPACE, "trace")
+    _age(conn, old_trace.id, 90)
+    store.add_memory(conn, TRACE_RESTATED, WORKSPACE, "trace")
+    return conn
+
+
+def test_active_lessons_are_counted_per_workspace(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    lessons = audit.run(learning, db_path).lessons
+    # Five lessons stored, one of them retracted.
+    assert lessons.active_total == 4
+    assert dict(lessons.active_per_workspace) == {WORKSPACE: 3, "global": 1}
+    assert lessons.superseded_lessons == 1
+
+
+def test_the_superseded_count_does_not_duplicate_section_six(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    """Section 6 lists retracted rows; section 7 only tallies the lessons among them."""
+    report = audit.run(learning, db_path)
+    assert report.superseded_total == 1
+    assert report.lessons.superseded_lessons == 1
+    output = CliRunner().invoke(main, ["audit"]).output
+    assert output.count("the leak is in the resizer") == 1
+
+
+def test_stale_lessons_are_old_and_never_recalled(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    lessons = audit.run(learning, db_path).lessons
+    assert lessons.stale_total == 1
+    assert lessons.stale[0].content.startswith("the ALTER TABLE")
+    assert lessons.stale_age_days == audit.DEAD_MEMORY_AGE_DAYS
+
+
+def test_a_retracted_lesson_is_not_reported_as_stale(
+    conn: sqlite3.Connection, db_path: Path
+) -> None:
+    """A lesson nobody recalls because it was corrected is not a neglected lesson."""
+    wrong = store.add_memory(conn, "the leak is in the image resizer", WORKSPACE, "lesson")
+    store.add_memory(conn, "it was the pool", WORKSPACE, "lesson", supersedes=[wrong.id])
+    _age(conn, wrong.id, 90)
+
+    assert audit.run(conn, db_path).lessons.stale_total == 0
+
+
+def test_unread_rows_are_stored_repeatedly_and_never_recalled(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    lessons = audit.run(learning, db_path).lessons
+    assert lessons.unread_total == 1
+    assert lessons.unread[0].seen_count == 4
+    assert lessons.unread[0].recalled_count == 0
+    assert lessons.unread[0].content.startswith("remember to bump the lockfile")
+
+
+def test_prunable_traces_are_counted_and_nothing_is_deleted(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    before = learning.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
+
+    lessons = audit.run(learning, db_path).lessons
+
+    assert lessons.prunable.eligible == 1
+    assert lessons.prunable.days == audit.DEAD_MEMORY_AGE_DAYS
+    assert learning.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == before
+
+
+def test_the_prunable_count_agrees_with_gc(learning: sqlite3.Connection, db_path: Path) -> None:
+    """audit and `gc --prune-traces --dry-run` must never report different numbers."""
+    reported = audit.run(learning, db_path).lessons.prunable
+    direct = store.count_prunable_traces(learning, audit.DEAD_MEMORY_AGE_DAYS)
+    assert (reported.eligible, reported.protected) == (direct.eligible, direct.protected)
+
+
+def test_the_similarity_distribution_uses_the_gate_s_own_code_path(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    """The report must measure what the gate decides on, or it cannot inform it."""
+    similarity = audit.run(learning, db_path).lessons.similarity
+
+    assert similarity.total == 2
+    assert similarity.scanned == 2
+    assert similarity.threshold == dedup.CAPTURE_JACCARD_THRESHOLD
+    # The restatement pair scores 0.314, so both traces see each other over the gate.
+    assert similarity.at_or_above_threshold == 2
+    assert similarity.with_neighbour == 2
+    assert sum(bucket.count for bucket in similarity.buckets) == similarity.scanned
+
+
+def test_the_histogram_puts_the_gate_on_a_bucket_boundary() -> None:
+    """The whole point of the buckets: everything at or above the cut is one group."""
+    assert dedup.CAPTURE_JACCARD_THRESHOLD in audit.SIMILARITY_BUCKET_EDGES
+
+
+def test_similarity_is_empty_without_traces(conn: sqlite3.Connection, db_path: Path) -> None:
+    store.add_memory(conn, "just a note", WORKSPACE)
+    similarity = audit.run(conn, db_path).lessons.similarity
+    assert (similarity.total, similarity.scanned, similarity.median) == (0, 0, None)
+
+
+def test_lesson_health_says_so_when_tracking_is_off(
+    learning: sqlite3.Connection, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reporting a recall-derived zero as fact would justify deleting a live store."""
+    monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, "1")
+
+    assert audit.run(learning, db_path).lessons.tracking_disabled is True
+
+    output = CliRunner().invoke(main, ["audit"]).output
+    assert audit.TRACKING_DISABLED_NOTE in output
+
+
+def test_lesson_health_is_quiet_about_tracking_when_it_is_on(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    assert audit.run(learning, db_path).lessons.tracking_disabled is False
+    assert audit.TRACKING_DISABLED_NOTE not in CliRunner().invoke(main, ["audit"]).output
+
+
+def test_the_lesson_section_renders(learning: sqlite3.Connection, db_path: Path) -> None:
+    output = CliRunner().invoke(main, ["audit"]).output
+    assert "7. lesson health" in output
+    assert "active lessons: 4" in output
+    assert audit.PRUNE_NOTE in output
+    assert audit.SIMILARITY_NOTE in output
+    assert "<- gate" in output
+
+
+def test_lesson_health_is_workspace_scoped(learning: sqlite3.Connection, db_path: Path) -> None:
+    lessons = audit.run(learning, db_path, WORKSPACE).lessons
+    assert dict(lessons.active_per_workspace) == {WORKSPACE: 3}
+    assert lessons.active_total == 3
+
+
+def test_every_number_in_section_seven_is_scoped_including_the_trace_counts(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    """Both trace figures must answer for the same workspace, or they contradict each other.
+
+    Every trace in the fixture lives in ``WORKSPACE``; ``global`` holds one lesson and no
+    traces at all. ``prunable`` shipped unscoped once, so ``global`` claimed a prunable
+    trace on the same screen where ``similarity`` correctly reported having none to
+    measure. A fixture with traces in a single workspace cannot catch that, which is why
+    this asserts against the empty side too.
+    """
+    here = audit.run(learning, db_path, WORKSPACE).lessons
+    elsewhere = audit.run(learning, db_path, "global").lessons
+
+    assert (here.prunable.eligible, here.similarity.total) == (1, 2)
+    assert (elsewhere.prunable.eligible, elsewhere.similarity.total) == (0, 0)
+
+
+def test_lesson_health_reaches_the_json_payload(learning: sqlite3.Connection) -> None:
+    body = json.loads(CliRunner().invoke(main, ["audit", "--json"]).output)["lesson_health"]
+
+    assert body["active"]["total"] == 4
+    assert body["active"]["superseded"] == 1
+    assert body["stale"]["total"] == 1
+    assert body["unread"]["total"] == 1
+    assert body["prunable_traces"]["eligible"] == 1
+    assert body["prunable_traces"]["note"] == audit.PRUNE_NOTE
+    assert body["trace_similarity"]["threshold"] == dedup.CAPTURE_JACCARD_THRESHOLD
+    assert body["trace_similarity"]["note"] == audit.SIMILARITY_NOTE
+    assert body["tracking_disabled"] is False
+    assert body["tracking_note"] is None
+
+
+def test_the_json_payload_carries_the_tracking_caveat(
+    learning: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(retriever.NO_TRACKING_ENV_VAR, "1")
+    body = json.loads(CliRunner().invoke(main, ["audit", "--json"]).output)["lesson_health"]
+    assert body["tracking_disabled"] is True
+    assert body["tracking_note"] == audit.TRACKING_DISABLED_NOTE
+
+
+def test_audit_still_writes_nothing_with_the_new_section(
+    learning: sqlite3.Connection, db_path: Path
+) -> None:
+    """Section 7 runs FTS5 queries per trace; none of them may write."""
+    learning.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    before = db_path.read_bytes()
+
+    audit.run(learning, db_path)
+
+    assert db_path.read_bytes() == before
+
+
+def test_prunable_traces_are_scoped_to_the_requested_workspace(
+    conn: sqlite3.Connection, db_path: Path
+) -> None:
+    """**The regression detector for the section contradicting itself.**
+
+    A fixture whose traces all live in one workspace can never catch this: every number
+    agrees by accident. The failing shape is a workspace that holds no traces at all,
+    where an unscoped count reported "1 eligible" directly above "no traces stored yet".
+    """
+    store.add_memory(conn, "a global lesson that applies everywhere", "global", "lesson")
+    trace = store.add_memory(conn, TRACE, "repo-a", "trace")
+    _age(conn, trace.id, 90)
+
+    empty = audit.run(conn, db_path, "global").lessons
+    holding = audit.run(conn, db_path, "repo-a").lessons
+
+    assert empty.prunable.eligible == 0, "counted a trace from another workspace"
+    assert empty.prunable.workspace == "global"
+    assert holding.prunable.eligible == 1
+    # The two numbers in this section must tell the same story about the same workspace.
+    assert empty.similarity.total == 0
+    assert holding.similarity.total == 1
+
+
+def test_the_unscoped_report_still_counts_every_workspace(
+    conn: sqlite3.Connection, db_path: Path
+) -> None:
+    """`audit` with no `-w` is the whole database, which is what `gc` actually prunes."""
+    for workspace in ("repo-a", "repo-b"):
+        trace = store.add_memory(conn, f"{TRACE} in {workspace}", workspace, "trace")
+        _age(conn, trace.id, 90)
+
+    lessons = audit.run(conn, db_path).lessons
+
+    assert lessons.prunable.eligible == 2
+    assert lessons.prunable.workspace is None
+
+
+def test_the_prunable_line_names_its_scope(conn: sqlite3.Connection, db_path: Path) -> None:
+    """The label is the other half of the fix: a scoped count must say it is scoped."""
+    trace = store.add_memory(conn, TRACE, "repo-a", "trace")
+    _age(conn, trace.id, 90)
+    runner = CliRunner()
+
+    assert "across every workspace" in runner.invoke(main, ["audit"]).output
+    scoped = runner.invoke(main, ["audit", "-w", "repo-a"]).output
+    assert "in workspace 'repo-a'" in scoped
+    # And the caveat that gc itself is not scoped.
+    assert "has no `-w` flag and acts on EVERY workspace" in scoped
+
+
+def test_gc_reports_the_whole_database(conn: sqlite3.Connection) -> None:
+    """`gc --prune-traces` has no `-w`; its own preview must count every workspace."""
+    for workspace in ("repo-a", "repo-b"):
+        trace = store.add_memory(conn, f"{TRACE} in {workspace}", workspace, "trace")
+        _age(conn, trace.id, 90)
+
+    result = CliRunner().invoke(main, ["gc", "--prune-traces", "30", "--dry-run"])
+
+    assert "would delete 2 never-recalled traces" in result.output
+    assert store.count_prunable_traces(conn, 30).workspace is None
