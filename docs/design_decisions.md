@@ -2179,3 +2179,81 @@ The off-corpus column is the other half of the measurement and reproduces Gate 0
 **1 of 12** off-corpus queries stays silent. `cấu hình kubernetes ingress` returns the tailwind note
 because both contain `cấu hình`. That is the OR fallback's known price, now a number that moves when
 someone changes it rather than a sentence in a report.
+
+## 54. A query-coverage rerank was measured and not shipped
+
+The first thing `localmem eval` (§53) was pointed at was its own most obvious follow-up: the
+fallback answers 24 of 32 queries, it admits a row on a *single* shared word, and bm25 then orders
+those rows by term rarity rather than by how much of the question they cover. Adding a coverage term
+to `_fuse` is cheap, LLM-free and needs no schema change. It was built, swept, and **reverted**.
+Recording why, because the idea will occur to the next person too.
+
+### Jaccard is the wrong function, and the measurement says so bluntly
+
+The obvious primitive is `dedup.jaccard`, already in the codebase and already sharing the capture
+gate's tokenizer. Swept at 0.05 → 0.8, it moved **zero** queries at every weight up to 0.2 and made
+one *worse* above 0.3.
+
+The reason is the denominator. Jaccard divides by the union, and a stored memory is roughly four
+times the length of the question, so every word the question did not ask about counts against the
+row that answers it. Measured on the query `sao deploy chậm thế` across all 30 documents: **the
+Jaccard spread was 0.0000** — it did not separate the corpus at all.
+
+`coverage(query, text) = |query ∩ text| / |query|` is the asymmetric version and is what the
+argument above actually described. It is not a refinement of Jaccard; it is a different question.
+
+### Coverage must see keywords, not just content
+
+`sao deploy chậm thế` has **zero** token overlap with its own answer, whose content is
+*"CI cache miss làm build lâu gấp đôi"*. The words `deploy` and `chậm` live in that row's
+`keywords` column — which is the whole point of §34, and the lever that took recall from 0/14 to
+11/14. A coverage term reading `content` alone is blind to the mechanism the system actually relies
+on and would score the correct row at 0.
+
+So the honest version reads both indexed columns. Offline, that version separated the gold row from
+the row blocking it in **5 of the 7** misranked queries, worsening none. That is the number that
+made this worth building.
+
+### It still did not clear the bar
+
+Through the real pipeline, at every weight from 0.1 to 1.0:
+
+| | baseline | coverage 0.2 | coverage 0.8 + VI stopwords |
+|---|---|---|---|
+| recall@1 | 0.650 | 0.650 | 0.700 |
+| recall@3 | 0.850 | **0.900** | **0.900** |
+| MRR | 0.7750 | 0.7875 | 0.8125 |
+| off-corpus silent | 1/12 | 1/12 | 1/12 |
+| queries improved / worsened | — | +1 / −0 | +1 / −0 |
+
+Nothing regressed, and the off-corpus column — the one that killed the semantic view — did not
+move. But **one** query improved, on a 20-query fixture, which is five points of recall bought by a
+single row changing places. §53 fixed the rule for this case in advance: a change counts as an
+improvement when at least two queries move the right way. This is the same "within noise of zero"
+that Gate 0 refused to ship on, and refusing it here as well is the only consistent answer.
+
+The gap between the offline prediction (5 fixes) and the measured result (1) is itself the finding:
+beating the row *directly above* the gold is not the same as beating every row above it, and the
+coverage term is competing against a min-max-normalized lexical score whose spread is the full
+`[0, 1]` interval. Making coverage decisive requires a weight of 0.8 — larger than `LEXICAL_WEIGHT`
+itself, i.e. a redesign of the ranking rather than a term added to it, justified by one query.
+
+**What would change the answer.** A fixture large enough that one query is not 5% of the sample, or
+a query band built specifically to isolate the fallback's ordering. Not a bigger weight.
+
+### One live defect found on the way, unrelated to the rerank
+
+`_STOPWORDS` is **English only**, and `top_terms` — which generates tier-2 near-duplicate candidates
+— uses it. On Vietnamese text roughly two of the five term slots are spent on function words:
+
+```
+lỗi 500 khi gọi api là do gateway nuốt header…   ->  ['lỗi', '500', 'khi', 'gọi', 'api']
+retry chỉ an toàn khi endpoint idempotent…       ->  ['retry', 'chỉ', 'toàn', 'khi', 'endpoint']
+staging chạy trên snapshot của prod đã ẩn danh…  ->  ['staging', 'chạy', 'trên', 'snapshot', 'của']
+```
+
+`khi`, `chỉ`, `trên`, `của` are the Vietnamese equivalents of the words this frozenset exists to
+remove. The comment above it says "English only, and deliberately small" — deliberate for the
+language it was written against, and a real narrowing of candidate generation for half of this
+project's users. Fixing it needs its own before/after through the capture-gate fixture, so it is not
+folded into this entry.

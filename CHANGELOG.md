@@ -35,6 +35,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     perturbation: changing the keyword column weight, the recency weight or the candidate limit
     each turns the baseline test red; changing `RELATIONAL_WEIGHT_ON_ENTITY_HIT` does not.
 
+### Measured and not shipped
+
+- **A query-coverage rerank**, the first thing the new harness was pointed at. Built, swept and
+  reverted; `docs/design_decisions.md` §54 records the numbers so nobody repeats it.
+  `dedup.jaccard` turned out to be the wrong function — its spread across the whole corpus for a
+  real query is **0.0000**, because dividing by the union punishes a memory for every word the
+  question did not contain. The asymmetric version, reading `content` *and* `keywords`, does work:
+  recall@3 0.850 → **0.900**, MRR 0.7750 → 0.7875, nothing regressed, off-corpus silence unchanged.
+  It was still refused: that is **one** query moving on a 20-query fixture, which is the same
+  "within noise of zero" that Gate 0 refused the semantic view on. Making the term decisive needs a
+  weight above `LEXICAL_WEIGHT`, which is a redesign of the ranking, not a term added to it.
+
+### Known defect, not yet fixed
+
+- **`dedup._STOPWORDS` is English only, and `top_terms` uses it to generate tier-2 near-duplicate
+  candidates.** On Vietnamese text about two of the five term slots go to function words —
+  `khi`, `chỉ`, `trên`, `của` — narrowing candidate generation for half this project's users.
+  Found while measuring §54; fixing it needs its own before/after through the capture-gate fixture.
+
 ### Changed
 
 - `localmem.cli._KIND_CHOICES` and `localmem.mcp_server.ADD_KINDS` now name each other in comments.
