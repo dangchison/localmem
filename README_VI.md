@@ -2,10 +2,12 @@
 
 *[English → README.md](README.md)*
 
-**localmem** là lớp bộ nhớ cục bộ, không tốn token, cho các AI coding agent. Toàn bộ dữ liệu
-nằm trong một file SQLite ở `~/.localmem/memory.db`; mọi thao tác lưu, đánh chỉ mục, khử trùng
-lặp và xếp hạng đều là code Python và SQL thuần — **không có lần gọi model nào** trong đường đi
-của bộ nhớ. Agent truy cập qua đúng hai MCP tool: `memory_recall` và `memory_add`.
+**localmem** là lớp bộ nhớ cục bộ, không tốn token, cho các AI coding agent.
+
+Toàn bộ dữ liệu nằm trong một file SQLite ở `~/.localmem/memory.db`; mọi thao tác lưu,
+đánh chỉ mục, khử trùng lặp và xếp hạng đều là code Python và SQL thuần — **không có lần
+gọi model nào** trong đường đi của bộ nhớ. Agent truy cập qua đúng hai MCP tool:
+`memory_recall` và `memory_add`.
 
 Khác biệt so với `CLAUDE.md` / `AGENTS.md` / steering file: những file đó là **push** — cả file
 vào context mỗi phiên, dù có liên quan hay không, và phình ra theo thời gian. localmem là
@@ -15,6 +17,38 @@ Trạng thái: **v0.2.2**. Cần Python ≥ 3.10. Giấy phép MIT.
 
 Tài liệu này đủ để dùng thật. Phần lý thuyết (kiến trúc, phương pháp benchmark, danh sách 19
 giới hạn đầy đủ, roadmap, citation) nằm ở [README.md](README.md) bằng tiếng Anh.
+
+---
+
+## Mục lục
+
+- [Cài đặt](#cài-đặt)
+  - [1. Nhanh nhất — một lệnh toàn hệ thống, bằng `uv`](#1-nhanh-nhất--một-lệnh-toàn-hệ-thống-bằng-uv)
+  - [2. Chạy thử mà không cài gì](#2-chạy-thử-mà-không-cài-gì)
+  - [3. Từ source, để sửa code](#3-từ-source-để-sửa-code)
+  - [Nâng cấp từ v0.1](#nâng-cấp-từ-v01)
+- [Sử dụng](#sử-dụng)
+  - [Cài cho từng agent](#cài-cho-từng-agent)
+  - [Pointer snippet — bảo agent dùng bộ nhớ](#pointer-snippet--bảo-agent-dùng-bộ-nhớ)
+  - [Bảng lệnh — 14 lệnh, không hơn](#bảng-lệnh--14-lệnh-không-hơn)
+  - [Biến môi trường](#biến-môi-trường)
+- [Kiến trúc](#kiến-trúc)
+- [Chia sẻ tri thức giữa các repo](#chia-sẻ-tri-thức-giữa-các-repo)
+  - [Rule nào nên nằm ở đâu](#rule-nào-nên-nằm-ở-đâu)
+  - [1. Bug sửa ở repo này, nhớ ra ở repo khác](#1-bug-sửa-ở-repo-này-nhớ-ra-ở-repo-khác)
+  - [2. Chẩn đoán SAI cũng đáng lưu](#2-chẩn-đoán-sai-cũng-đáng-lưu)
+  - [3. Kỹ năng dùng được ở mọi nơi](#3-kỹ-năng-dùng-được-ở-mọi-nơi)
+  - [Giữ cho sạch](#giữ-cho-sạch)
+- [Hai hook: tự lưu và tự recall](#hai-hook-tự-lưu-và-tự-recall)
+- [Sao lưu và dùng trên máy thứ hai](#sao-lưu-và-dùng-trên-máy-thứ-hai)
+- [Bốn lưu ý riêng cho tiếng Việt](#bốn-lưu-ý-riêng-cho-tiếng-việt)
+- [Giới hạn — bản rút gọn](#giới-hạn--bản-rút-gọn)
+- [Bảo mật](#bảo-mật)
+- [API — công cụ MCP](#api--công-cụ-mcp)
+- [Còn gì ở bản tiếng Anh](#còn-gì-ở-bản-tiếng-anh)
+- [Người duy trì](#người-duy-trì)
+- [Đóng góp](#đóng-góp)
+- [Giấy phép](#giấy-phép)
 
 ---
 
@@ -88,7 +122,7 @@ nói rõ điều này ở mỗi lần chạy, để con số đó không bị đ
 
 ---
 
-## Dùng nhanh
+## Sử dụng
 
 ```bash
 localmem init                          # tạo DB, hỏi từng agent một, đề nghị import
@@ -120,9 +154,7 @@ Ba cờ của `init`, mỗi cờ chỉ trả lời sẵn một câu hỏi: `--ye
 chỉ bước 2, không import gì cả), `--import-all` (import mọi file tìm được — chỉ bước 3),
 `-w TÊN` (workspace cho các bản ghi import ở bước 3).
 
----
-
-## Cài cho từng agent
+### Cài cho từng agent
 
 `localmem agents` cho biết agent nào được nhận diện và file config nằm ở đâu.
 `localmem agents --install TÊN` đăng ký một agent — **gọi tên nó chính là sự đồng ý**, không có
@@ -287,9 +319,7 @@ gọi được tool thì đăng ký đã thành công. **Đây là cách kiểm 
 Hướng dẫn đầy đủ: [`examples/kiro.md`](examples/kiro.md).
 </details>
 
----
-
-## Pointer snippet — bảo agent dùng bộ nhớ
+### Pointer snippet — bảo agent dùng bộ nhớ
 
 Dán khối này vào file chỉ dẫn mà agent của bạn vốn đã đọc (`CLAUDE.md`, `AGENTS.md`, hoặc một
 steering file của Kiro). `localmem init` cũng in nó ra ở bước 4, và **localmem không bao giờ tự
@@ -313,9 +343,7 @@ một agent từng lưu đều có thể được đọc lại sau này, nên m�
 đó, `memory_add` qua MCP **từ chối** `kind="core"` — core memory được nạp vào mọi lần recall,
 nên nó phải do con người viết, bằng `localmem add --kind core` từ CLI.
 
----
-
-## Bảng lệnh — 14 lệnh, không hơn
+### Bảng lệnh — 14 lệnh, không hơn
 
 | Lệnh | Làm gì |
 |---|---|
@@ -344,9 +372,7 @@ mọi bản ghi nó tạo. Nó xuất hiện trong `localmem stats` mục `by ki
 ghi được qua MCP, cũng không có cờ nào của `localmem add` tạo ra nó. Khi recall, nó được đối
 xử y hệt `note`.
 
----
-
-## Biến môi trường
+### Biến môi trường
 
 Đúng hai biến, không có biến nào khác.
 
@@ -354,6 +380,62 @@ xử y hệt `note`.
 |---|---|
 | `LOCALMEM_DB` | đường dẫn file database, thay cho `~/.localmem/memory.db`. `~` được mở rộng. **Đặt thành rỗng hoặc toàn khoảng trắng là LỖI**, không phải quay về mặc định — mọi lệnh sẽ hỏng với `LOCALMEM_DB is set but empty`. Muốn dùng mặc định thì **unset** nó, đừng gán rỗng |
 | `LOCALMEM_NO_TRACKING` | bất kỳ giá trị **khác rỗng** nào cũng làm recall trở thành chỉ-đọc: không tăng `recalled_count` và `last_recalled_at` nữa. Điều kiện là **rỗng hay không**, không phải đúng/sai — nên **`LOCALMEM_NO_TRACKING=0` cũng tắt tracking**. Cái giá phải trả: mục "dòng chết" và "ứng viên thăng hạng" của `audit` không còn phân biệt được memory chưa ai dùng với memory ngày nào cũng recall |
+
+---
+
+## Kiến trúc
+
+Hai bề mặt vào — `localmem` CLI và MCP server chạy trên stdio — cùng đổ vào một service, và
+mọi thứ hạ cánh trong đúng một file SQLite. Nhãn trong hai sơ đồ để nguyên tiếng Anh vì đó là
+tên thật của bảng, cột và tham số trong code; dịch chúng ra sẽ khiến sơ đồ không còn tra cứu
+được.
+
+```mermaid
+flowchart LR
+  YOU["you, at a shell"] --> CLI["localmem CLI"]
+  AGENT["AI coding agent"] --> MCP["MCP server, stdio"]
+  CLI --> SVC["Memory service"]
+  MCP --> SVC
+  SVC -->|workspace filter| FTS["FTS5 index"]
+  SVC --> GRAPH["Entity graph, regex"]
+  SVC --> QUEUE["Dedup queue"]
+  FTS --> DB[("SQLite ~/.localmem/memory.db")]
+  GRAPH --> DB
+  QUEUE --> DB
+```
+
+Làn ghi và làn đọc, đầy đủ. Mọi con số trong hộp là con số code thật sự dùng — ngưỡng Jaccard
+0.7, trọng số fuse 0.6/0.4, nửa đời 30 ngày, trần ~400 token của core memory:
+
+```mermaid
+flowchart TD
+  subgraph WRITE["Write lane"]
+    direction TB
+    WIN["localmem add / import / memory_add"] --> NORM["normalize: case, whitespace runs, bullet prefixes"]
+    NORM --> HASH["tier-1: sha256 of normalized text, per workspace"]
+    HASH --> DUP{"hash already in this workspace?"}
+    DUP -->|duplicate| MERGE["merge, bump seen_count"]
+    DUP -->|new| INS["insert memory row"]
+    INS --> FTSIDX["FTS5 index, kept in sync by triggers"]
+    INS --> ENT["entity graph: regex extraction into entities / memory_entities"]
+    INS --> T2["tier-2: FTS5 candidates, Jaccard ≥ 0.7"]
+    T2 --> QUEUE["dedup_queue, never auto-merged"]
+  end
+  subgraph READ["Read lane"]
+    direction TB
+    RIN["localmem search / memory_recall"] --> VA["view A, lexical: FTS5 bm25, workspace-filtered plus the global tier, top 20"]
+    RIN --> VB["view B, relational: entity graph, Σ link weight"]
+    VA --> FUSE["fuse: min-max each view, 0.6/0.4 lexical/relational, flipped to 0.4/0.6 when view B fired"]
+    VB --> FUSE
+    FUSE --> BOOST["boosts: recency half-life 30 days + log seen_count"]
+    BOOST --> EVID["evidence closure: up to 2 supporting neighbours per result"]
+    EVID --> CORE["append core memory: kind='core', capped at ~400 estimated tokens"]
+    CORE --> OUT["results"]
+  end
+```
+
+Không bước nào trong hai làn đó gọi model. Luồng dữ liệu và schema đầy đủ nằm ở
+[`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -477,30 +559,6 @@ hai bên.
 
 ---
 
-## Bảo mật
-
-Bề mặt nhỏ, nói thẳng.
-
-- **Quyền file.** Database do localmem tạo là `0600`, thư mục do localmem tạo — mặc định
-  `~/.localmem/` — là `0700`. Các file `-wal`/`-shm` thừa hưởng quyền đó, vì mode được đặt
-  *trước* lần ghi đầu tiên của SQLite chứ không phải sau. File hoặc thư mục **đã tồn tại sẵn**
-  thì không bị đụng tới, kể cả đường dẫn `$LOCALMEM_DB` tuỳ chỉnh: lệnh `chmod` của bạn là một
-  quyết định, không phải một lỗi cần sửa hộ.
-- **Mã hoá lúc nghỉ là việc của ổ đĩa.** FileVault trên macOS, LUKS trên Linux, BitLocker trên
-  Windows. localmem không tự viết crypto và không đóng gói SQLCipher — một công cụ bộ nhớ tự
-  quản lý khoá là ván cược tệ hơn so với mã hoá toàn ổ mà bạn đã có sẵn.
-- **Mã hoá bản backup bằng công cụ chuyên mã hoá.** `export` in ra JSON thuần, nên hãy pipe nó:
-  `localmem export | age -r age1… > backup.age`.
-- **Không có gì rời khỏi máy.** Không gọi mạng, không telemetry, không gọi model, chỉ stdio.
-- **Bộ nhớ recall về là đầu vào không đáng tin.** Pointer snippet nói điều đó với agent, và
-  `memory_add` qua MCP từ chối `kind="core"` để một mệnh lệnh bị chèn vào không thể tự ghi mình
-  vào mọi lần recall về sau.
-- **Recall có ghi, trừ khi bạn bảo đừng.** Đặt `LOCALMEM_NO_TRACKING=1` (bất kỳ giá trị khác
-  rỗng nào) thì recall thành chỉ-đọc — đổi lại `audit` không còn gì để đếm cho mục dòng chết và
-  ứng viên thăng hạng.
-
----
-
 ## Bốn lưu ý riêng cho tiếng Việt
 
 1. **`đ`/`Đ` không được quy về `d`.** FTS5 (`remove_diacritics 2`) bỏ dấu thanh nên gõ `dung`
@@ -556,14 +614,78 @@ Hãy đọc mục **Limitations** đầy đủ trong [README.md](README.md) trư
 
 ---
 
+## Bảo mật
+
+Bề mặt nhỏ, nói thẳng.
+
+- **Quyền file.** Database do localmem tạo là `0600`, thư mục do localmem tạo — mặc định
+  `~/.localmem/` — là `0700`. Các file `-wal`/`-shm` thừa hưởng quyền đó, vì mode được đặt
+  *trước* lần ghi đầu tiên của SQLite chứ không phải sau. File hoặc thư mục **đã tồn tại sẵn**
+  thì không bị đụng tới, kể cả đường dẫn `$LOCALMEM_DB` tuỳ chỉnh: lệnh `chmod` của bạn là một
+  quyết định, không phải một lỗi cần sửa hộ.
+- **Mã hoá lúc nghỉ là việc của ổ đĩa.** FileVault trên macOS, LUKS trên Linux, BitLocker trên
+  Windows. localmem không tự viết crypto và không đóng gói SQLCipher — một công cụ bộ nhớ tự
+  quản lý khoá là ván cược tệ hơn so với mã hoá toàn ổ mà bạn đã có sẵn.
+- **Mã hoá bản backup bằng công cụ chuyên mã hoá.** `export` in ra JSON thuần, nên hãy pipe nó:
+  `localmem export | age -r age1… > backup.age`.
+- **Không có gì rời khỏi máy.** Không gọi mạng, không telemetry, không gọi model, chỉ stdio.
+- **Bộ nhớ recall về là đầu vào không đáng tin.** Pointer snippet nói điều đó với agent, và
+  `memory_add` qua MCP từ chối `kind="core"` để một mệnh lệnh bị chèn vào không thể tự ghi mình
+  vào mọi lần recall về sau.
+- **Recall có ghi, trừ khi bạn bảo đừng.** Đặt `LOCALMEM_NO_TRACKING=1` (bất kỳ giá trị khác
+  rỗng nào) thì recall thành chỉ-đọc — đổi lại `audit` không còn gì để đếm cho mục dòng chết và
+  ứng viên thăng hạng.
+
+---
+
+## API — công cụ MCP
+
+Đúng hai tool, và hợp đồng của chúng đã đóng băng:
+
+- **`memory_recall(query, workspace?, k?)`** — **chỉ đọc**. Trả `results`, `core_memory` và
+  `message`. Database rỗng **không phải là lỗi**: nó trả `results: []` kèm một câu thông báo.
+- **`memory_add(content, workspace?, kind?, source?)`** — tool **duy nhất** ghi nội dung.
+  `kind` chỉ nhận `note` và `trace`; `core` và `imported` đều bị **từ chối**.
+
+Hợp đồng đầy đủ — kể cả chỗ hai tool **không** đối xứng với `workspace: "all"`, và cách chia
+đọc/ghi để client cấp quyền theo từng tool — ở [README.md#api](README.md#api).
+
+---
+
 ## Còn gì ở bản tiếng Anh
 
-[README.md](README.md) có thêm: sơ đồ luồng dữ liệu của "How it works", hợp đồng MCP đầy đủ,
-phương pháp và ví dụ tái lập được của `localmem benchmark` (kèm điểm hoà vốn), hướng dẫn di cư
-khỏi file chỉ dẫn, đủ 19 giới hạn, roadmap và citation. Tài liệu sâu hơn nằm ở
+[README.md](README.md) có thêm: phần "Architecture" với hai sơ đồ luồng dữ liệu, hợp đồng MCP
+đầy đủ, phương pháp và ví dụ tái lập được của `localmem benchmark` (kèm điểm hoà vốn), hướng
+dẫn di cư khỏi file chỉ dẫn, đủ 19 giới hạn, roadmap và citation. Tài liệu sâu hơn nằm ở
 [`docs/architecture.md`](docs/architecture.md),
 [`docs/design_decisions.md`](docs/design_decisions.md) và
 [`docs/migrating_from_instruction_files.md`](docs/migrating_from_instruction_files.md).
+
+---
+
+## Người duy trì
+
+[@dangchison](https://github.com/dangchison)
+
+---
+
+## Đóng góp
+
+Issue và pull request đều hoan nghênh tại
+[github.com/dangchison/localmem/issues](https://github.com/dangchison/localmem/issues).
+
+Trước khi mở PR, chạy đúng bốn lệnh kiểm mà project tự áp lên chính nó, từ một bản cài `[dev]`:
+
+```bash
+pytest tests/ -q
+ruff check .
+ruff format --check .
+mypy localmem
+```
+
+Một luật đứng riêng: **`localmem` không bao giờ nhận thêm một phụ thuộc runtime bắt buộc mà
+chưa bàn.** Hôm nay danh sách đó có ba package, cái nào cũng đã phải biện hộ, và cái thứ tư sẽ
+là một quyết định chứ không phải một tiện tay — năng lực mới đến bằng optional extra.
 
 ---
 

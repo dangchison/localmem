@@ -2,8 +2,10 @@
 
 *[Tiếng Việt → README_VI.md](README_VI.md)*
 
-**Local-first, zero-token memory for AI coding agents.** One SQLite database, raw traces,
-structured retrieval — no LLM call anywhere in the memory path.
+**Local-first, zero-token memory for AI coding agents.**
+
+One SQLite database, raw traces, structured retrieval — no LLM call anywhere in the
+memory path.
 
 Coding agents keep their long-term memory in instruction files: `CLAUDE.md`, `AGENTS.md`,
 Kiro steering files. Those are **push-based** — the whole file enters context at the start
@@ -26,6 +28,55 @@ asked for.
   checklist — goes in the `global` workspace once and every repo recalls it.
 
 Status: **v0.2.2**. Python ≥ 3.10. MIT licensed.
+
+---
+
+## Table of Contents
+
+- [Background](#background)
+- [Install](#install)
+  - [1. Fastest — one global command, with `uv`](#1-fastest--one-global-command-with-uv)
+  - [2. Try it without installing anything](#2-try-it-without-installing-anything)
+  - [3. From source, to change it](#3-from-source-to-change-it)
+  - [Upgrading from v0.1](#upgrading-from-v01)
+- [Usage](#usage)
+  - [1. Set up](#1-set-up)
+  - [2. Store and recall](#2-store-and-recall)
+  - [3. Register localmem with your agent](#3-register-localmem-with-your-agent)
+  - [4. Tell the agent to use it](#4-tell-the-agent-to-use-it)
+  - [The full command set](#the-full-command-set)
+  - [Environment variables](#environment-variables)
+- [Architecture](#architecture)
+- [Sharing knowledge across repos](#sharing-knowledge-across-repos)
+  - [Where should your rules live?](#where-should-your-rules-live)
+  - [1. A bug you fixed in one repo, recalled in another](#1-a-bug-you-fixed-in-one-repo-recalled-in-another)
+  - [2. The diagnosis that was wrong](#2-the-diagnosis-that-was-wrong)
+  - [3. A skill you can apply anywhere](#3-a-skill-you-can-apply-anywhere)
+  - [Keeping it clean](#keeping-it-clean)
+  - [Backup and a second machine](#backup-and-a-second-machine)
+- [Hooks](#hooks)
+  - [Capturing traces automatically](#capturing-traces-automatically)
+  - [Recalling automatically](#recalling-automatically)
+- [Benchmark](#benchmark)
+- [Migrating from instruction files](#migrating-from-instruction-files)
+- [Limitations](#limitations)
+- [Security](#security)
+- [Roadmap](#roadmap)
+- [API](#api)
+  - [Permission-granular access](#permission-granular-access)
+- [Maintainers](#maintainers)
+- [Citation](#citation)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## Background
+
+Inspired by *Zero-Mem: Zero-Token Memory Operations for LLM Agents* (arXiv:2607.29377). The
+paper's finding — that agent memory does not need LLM-generated summaries, and that keeping
+raw traces under non-generative retrieval structures beats summarize-and-store on both quality
+and cost — is the design principle this package is built on.
 
 ---
 
@@ -101,7 +152,7 @@ says so on every run rather than letting the number read as history.
 
 ---
 
-## Quickstart
+## Usage
 
 ### 1. Set up
 
@@ -387,148 +438,56 @@ Two, and no others.
 
 ---
 
-## How it works
+## Architecture
 
+Two entry surfaces, one service, one SQLite file. Nothing in the picture is a model call.
+
+```mermaid
+flowchart LR
+  YOU["you, at a shell"] --> CLI["localmem CLI"]
+  AGENT["AI coding agent"] --> MCP["MCP server, stdio"]
+  CLI --> SVC["Memory service"]
+  MCP --> SVC
+  SVC -->|workspace filter| FTS["FTS5 index"]
+  SVC --> GRAPH["Entity graph, regex"]
+  SVC --> QUEUE["Dedup queue"]
+  FTS --> DB[("SQLite ~/.localmem/memory.db")]
+  GRAPH --> DB
+  QUEUE --> DB
 ```
-localmem add / import / memory_add
-        │
-        ├─ tier-1 dedup ── sha256 of normalized text, per workspace ── merge or insert
-        ├─ FTS5 index ──── kept in sync by triggers
-        ├─ entity index ── regex extraction → entities / memory_entities
-        └─ tier-2 dedup ── FTS5 finds candidates, Jaccard ≥ 0.7 queues a pair for review
-                                        │
-localmem search / memory_recall         ▼
-        │                          dedup_queue (never auto-merged)
-        ├─ view A, lexical ──── FTS5 bm25, workspace-filtered, top 20
-        │                       (a named workspace also reads the shared `global` tier)
-        ├─ view B, relational ─ memories sharing an entity with the query, Σ link weight
-        ├─ fuse ─────────────── each view min-max normalized, 0.6/0.4 lexical/relational
-        │                       (flipped to 0.4/0.6 when view B found anything)
-        ├─ boosts ──────────── recency decay (half-life 30 days) + log(seen_count)
-        ├─ evidence closure ── up to 2 supporting neighbours per result
-        └─ core memory ─────── kind='core' rows, capped at ~400 estimated tokens
+
+The write lane and the read lane in full. Every number in these boxes is the number the
+code actually uses:
+
+```mermaid
+flowchart TD
+  subgraph WRITE["Write lane"]
+    direction TB
+    WIN["localmem add / import / memory_add"] --> NORM["normalize: case, whitespace runs, bullet prefixes"]
+    NORM --> HASH["tier-1: sha256 of normalized text, per workspace"]
+    HASH --> DUP{"hash already in this workspace?"}
+    DUP -->|duplicate| MERGE["merge, bump seen_count"]
+    DUP -->|new| INS["insert memory row"]
+    INS --> FTSIDX["FTS5 index, kept in sync by triggers"]
+    INS --> ENT["entity graph: regex extraction into entities / memory_entities"]
+    INS --> T2["tier-2: FTS5 candidates, Jaccard ≥ 0.7"]
+    T2 --> QUEUE["dedup_queue, never auto-merged"]
+  end
+  subgraph READ["Read lane"]
+    direction TB
+    RIN["localmem search / memory_recall"] --> VA["view A, lexical: FTS5 bm25, workspace-filtered plus the global tier, top 20"]
+    RIN --> VB["view B, relational: entity graph, Σ link weight"]
+    VA --> FUSE["fuse: min-max each view, 0.6/0.4 lexical/relational, flipped to 0.4/0.6 when view B fired"]
+    VB --> FUSE
+    FUSE --> BOOST["boosts: recency half-life 30 days + log seen_count"]
+    BOOST --> EVID["evidence closure: up to 2 supporting neighbours per result"]
+    EVID --> CORE["append core memory: kind='core', capped at ~400 estimated tokens"]
+    CORE --> OUT["results"]
+  end
 ```
 
 Nothing in that path calls a model. `docs/architecture.md` has the data flow and the schema;
 `docs/design_decisions.md` records every deviation from the plan and why it was made.
-
-The MCP surface is two tools and is frozen:
-
-- **`memory_recall(query, workspace?, k?)`** → `{"results": [...], "core_memory": str,
-  "message": str|null}`. Each result carries `id`, `content`, `workspace`, `kind`, `source`,
-  `created_at`, `score`, `neighbors`. An empty database is **never an error** — it returns
-  `results: []` and a friendly message.
-- **`memory_add(content, workspace?, kind?, source?)`** → `{"status": "added" |
-  "duplicate_merged", "id": int, "seen_count": int}`. `kind` accepts `note` and `trace`.
-  **`core` is refused** — core memory is loaded into every recall, so it stays
-  human-curated; write one with `localmem add --kind core` from the CLI. `imported` is
-  refused for the same category of reason: it belongs to `localmem import`, not to the tool
-  surface.
-
-The two tools are **not symmetric about `workspace: "all"`**, and the pointer snippet
-deliberately teaches `"all"` for recall. On `memory_recall` it means "every workspace" and is
-the documented retry when nothing comes back. On `memory_add` it is **rejected** — storing a
-memory in a workspace literally named `all` would make it unreachable by every ordinary
-recall, so the tool asks you to name the workspace the memory belongs to instead. An agent
-that copies `"all"` from a recall into a write gets a clear error, not a lost memory.
-
-Transport is stdio. That is the only transport v1 ships.
-
-### Permission-granular access
-
-The split into exactly two tools is along read/write lines, which is what lets any
-permission-granular MCP client allow one and gate the other:
-
-- `memory_recall` — **read only**. Runs a query, never writes. (It does bump
-  `recalled_count` unless `LOCALMEM_NO_TRACKING` is set; that is bookkeeping, not content.)
-- `memory_add` — the **only** tool that writes content.
-
-Allowing recall while gating adds is a reasonable posture: the agent can use everything you
-have taught it, and every new memory passes under your eyes first. The exact syntax is your
-client's — Claude Code spells the pair `mcp__localmem__memory_recall` and
-`mcp__localmem__memory_add` in its permission rules; other clients differ.
-
----
-
-## Benchmark
-
-`localmem benchmark` estimates what your instruction files cost you every session, against
-localmem's fixed per-session cost: the pointer snippet, the two MCP tool descriptions, and
-your workspace's core memory. The "after" figure is charged **once per session**, not per file.
-
-A worked example you can reproduce exactly — run from `tests/fixtures/` in a checkout, with a
-sandboxed `HOME` so that nothing on the measuring machine is in scope. Real output, with only
-the absolute path prefix elided:
-
-```
-$ localmem benchmark
-workspace: localmem
-  <repo>/tests/fixtures/CLAUDE.md  ~133 estimated tokens
-  <repo>/tests/fixtures/AGENTS.md  ~46 estimated tokens
-
-before (pushed every session): ~179 estimated tokens
-after  (pulled on demand):     ~167 estimated tokens
-    pointer snippet:   ~97
-    tool descriptions: ~71
-    core memory:       ~0
-saved: ~12 estimated tokens (6.7%)
-
-Estimates use a character-based approximation (±15%). Verify real numbers with `/context` in Claude Code before and after migrating.
-```
-
-**That margin is 12 tokens, and it is left standing.** Two fixtures worth 179 tokens are
-almost exactly what localmem's fixed overhead costs, so on them the whole exercise is a wash.
-In v0.2.0 this same run reported **−55.9%** — a net loss — because the pointer snippet was
-~209 tokens; v0.2.1 compressed it to ~97 without dropping any of the five things it teaches,
-which is the entire difference between the two numbers. Both were printed rather than hidden.
-
-Run the identical command with a real `~/.claude/CLAUDE.md` in scope — 509 estimated tokens on
-the machine this was written on — and it reports `before_tokens 509 → after_tokens 167`,
-**67.2%** saved. Same command, same fixed "after" cost, an opposite headline, because the only
-thing that moved was how much instruction file the scan happened to find. The savings are a
-function of *your* files, and of nothing else.
-
-**Break-even, in one line:** localmem saves tokens once the instruction files you push every
-session cost more than the `after` figure above — **~167 estimated tokens** with an empty core
-memory, plus whatever your core memory adds. Below that line you are paying for the ability to
-store more without paying more later; above it you start saving on the first session.
-
-Take that 167 from the `after` line the command prints rather than adding the parts up: the
-estimator rounds the whole block once, so `97 + 71` is 168 by hand and 167 as measured.
-
-So: run `localmem benchmark` yourself, and read the caveat line it prints. Use `--json` for
-machine-readable output — `before_tokens`, `after_tokens`, `saved_tokens`, `saved_pct`,
-`after_breakdown` and the caveat, in one object.
-
----
-
-## Migrating from instruction files
-
-Short version:
-
-```bash
-localmem import ./CLAUDE.md --dry-run   # see what it would create, write nothing
-localmem import ./CLAUDE.md             # import for real
-localmem search "pnpm"                  # check you can get it back before trimming anything
-```
-
-Then trim the imported sections out of `CLAUDE.md` by hand and leave the pointer snippet in
-their place. Static directives that must always apply — build commands, style rules the model
-has to obey unconditionally — should **stay** in the instruction file. It is the accumulated,
-occasionally-relevant knowledge that belongs in localmem.
-
-Re-importing an unchanged file adds no rows: every record hashes to what it hashed to last
-time, merges, and bumps `seen_count`.
-
-**Imported rows carry `kind='imported'`.** That is a fifth kind alongside `note`, `trace` and
-`core` — you will see it in `localmem stats` under `by kind` and in `localmem audit`'s
-distribution section, and it is how you tell what came out of a file from what you or an agent
-wrote by hand. It is not writable through MCP and it is not a flag on `localmem add`; only
-`localmem import` produces it. Retrieval treats it exactly like a `note`.
-
-**localmem never edits your instruction files.** Not on import, not on `init`, not ever. The
-trimming is yours to do. Full guide, including what to keep and what to move:
-[`docs/migrating_from_instruction_files.md`](docs/migrating_from_instruction_files.md).
 
 ---
 
@@ -624,6 +583,14 @@ the near-duplicate queue is local, transient state. On a conflict the row alread
 target keeps its `created_at`, `kind` and `source` — only `seen_count` rises to the larger of
 the two.
 
+---
+
+## Hooks
+
+Pull-based memory has exactly one weak point: the agent has to remember to ask. The two hooks
+below close it from either end. Both are opt-in examples — localmem installs neither, and it
+never edits an agent's hooks.
+
 ### Capturing traces automatically
 
 If the problem is that the agent forgets to call `memory_add`, a hook does not forget. There
@@ -678,6 +645,88 @@ matching…" line would become permanent noise. Each hit is one line, collapsed 
 400 characters with `… (memory_recall id N for full text)`, so a whole-file skill cannot paste
 itself into every prompt. Core memory is deliberately **not** injected: it comes back through
 an ordinary recall, where it is charged once per session instead of once per prompt.
+
+---
+
+## Benchmark
+
+`localmem benchmark` estimates what your instruction files cost you every session, against
+localmem's fixed per-session cost: the pointer snippet, the two MCP tool descriptions, and
+your workspace's core memory. The "after" figure is charged **once per session**, not per file.
+
+A worked example you can reproduce exactly — run from `tests/fixtures/` in a checkout, with a
+sandboxed `HOME` so that nothing on the measuring machine is in scope. Real output, with only
+the absolute path prefix elided:
+
+```
+$ localmem benchmark
+workspace: localmem
+  <repo>/tests/fixtures/CLAUDE.md  ~133 estimated tokens
+  <repo>/tests/fixtures/AGENTS.md  ~46 estimated tokens
+
+before (pushed every session): ~179 estimated tokens
+after  (pulled on demand):     ~167 estimated tokens
+    pointer snippet:   ~97
+    tool descriptions: ~71
+    core memory:       ~0
+saved: ~12 estimated tokens (6.7%)
+
+Estimates use a character-based approximation (±15%). Verify real numbers with `/context` in Claude Code before and after migrating.
+```
+
+**That margin is 12 tokens, and it is left standing.** Two fixtures worth 179 tokens are
+almost exactly what localmem's fixed overhead costs, so on them the whole exercise is a wash.
+In v0.2.0 this same run reported **−55.9%** — a net loss — because the pointer snippet was
+~209 tokens; v0.2.1 compressed it to ~97 without dropping any of the five things it teaches,
+which is the entire difference between the two numbers. Both were printed rather than hidden.
+
+Run the identical command with a real `~/.claude/CLAUDE.md` in scope — 509 estimated tokens on
+the machine this was written on — and it reports `before_tokens 509 → after_tokens 167`,
+**67.2%** saved. Same command, same fixed "after" cost, an opposite headline, because the only
+thing that moved was how much instruction file the scan happened to find. The savings are a
+function of *your* files, and of nothing else.
+
+**Break-even, in one line:** localmem saves tokens once the instruction files you push every
+session cost more than the `after` figure above — **~167 estimated tokens** with an empty core
+memory, plus whatever your core memory adds. Below that line you are paying for the ability to
+store more without paying more later; above it you start saving on the first session.
+
+Take that 167 from the `after` line the command prints rather than adding the parts up: the
+estimator rounds the whole block once, so `97 + 71` is 168 by hand and 167 as measured.
+
+So: run `localmem benchmark` yourself, and read the caveat line it prints. Use `--json` for
+machine-readable output — `before_tokens`, `after_tokens`, `saved_tokens`, `saved_pct`,
+`after_breakdown` and the caveat, in one object.
+
+---
+
+## Migrating from instruction files
+
+Short version:
+
+```bash
+localmem import ./CLAUDE.md --dry-run   # see what it would create, write nothing
+localmem import ./CLAUDE.md             # import for real
+localmem search "pnpm"                  # check you can get it back before trimming anything
+```
+
+Then trim the imported sections out of `CLAUDE.md` by hand and leave the pointer snippet in
+their place. Static directives that must always apply — build commands, style rules the model
+has to obey unconditionally — should **stay** in the instruction file. It is the accumulated,
+occasionally-relevant knowledge that belongs in localmem.
+
+Re-importing an unchanged file adds no rows: every record hashes to what it hashed to last
+time, merges, and bumps `seen_count`.
+
+**Imported rows carry `kind='imported'`.** That is a fifth kind alongside `note`, `trace` and
+`core` — you will see it in `localmem stats` under `by kind` and in `localmem audit`'s
+distribution section, and it is how you tell what came out of a file from what you or an agent
+wrote by hand. It is not writable through MCP and it is not a flag on `localmem add`; only
+`localmem import` produces it. Retrieval treats it exactly like a `note`.
+
+**localmem never edits your instruction files.** Not on import, not on `init`, not ever. The
+trimming is yours to do. Full guide, including what to keep and what to move:
+[`docs/migrating_from_instruction_files.md`](docs/migrating_from_instruction_files.md).
 
 ---
 
@@ -822,15 +871,58 @@ Recorded, not implemented.
 
 ---
 
-## Citation
+## API
 
-Inspired by *Zero-Mem: Zero-Token Memory Operations for LLM Agents* (arXiv:2607.29377). The
-paper's finding — that agent memory does not need LLM-generated summaries, and that keeping
-raw traces under non-generative retrieval structures beats summarize-and-store on both quality
-and cost — is the design principle this package is built on.
+The MCP surface is two tools and is frozen:
+
+- **`memory_recall(query, workspace?, k?)`** → `{"results": [...], "core_memory": str,
+  "message": str|null}`. Each result carries `id`, `content`, `workspace`, `kind`, `source`,
+  `created_at`, `score`, `neighbors`. An empty database is **never an error** — it returns
+  `results: []` and a friendly message.
+- **`memory_add(content, workspace?, kind?, source?)`** → `{"status": "added" |
+  "duplicate_merged", "id": int, "seen_count": int}`. `kind` accepts `note` and `trace`.
+  **`core` is refused** — core memory is loaded into every recall, so it stays
+  human-curated; write one with `localmem add --kind core` from the CLI. `imported` is
+  refused for the same category of reason: it belongs to `localmem import`, not to the tool
+  surface.
+
+The two tools are **not symmetric about `workspace: "all"`**, and the pointer snippet
+deliberately teaches `"all"` for recall. On `memory_recall` it means "every workspace" and is
+the documented retry when nothing comes back. On `memory_add` it is **rejected** — storing a
+memory in a workspace literally named `all` would make it unreachable by every ordinary
+recall, so the tool asks you to name the workspace the memory belongs to instead. An agent
+that copies `"all"` from a recall into a write gets a clear error, not a lost memory.
+
+Transport is stdio. That is the only transport v1 ships.
+
+### Permission-granular access
+
+The split into exactly two tools is along read/write lines, which is what lets any
+permission-granular MCP client allow one and gate the other:
+
+- `memory_recall` — **read only**. Runs a query, never writes. (It does bump
+  `recalled_count` unless `LOCALMEM_NO_TRACKING` is set; that is bookkeeping, not content.)
+- `memory_add` — the **only** tool that writes content.
+
+Allowing recall while gating adds is a reasonable posture: the agent can use everything you
+have taught it, and every new memory passes under your eyes first. The exact syntax is your
+client's — Claude Code spells the pair `mcp__localmem__memory_recall` and
+`mcp__localmem__memory_add` in its permission rules; other clients differ.
+
+---
+
+## Maintainers
+
+[@dangchison](https://github.com/dangchison)
+
+---
+
+## Citation
 
 "Zero-Mem" is the paper's name and belongs to its authors. This package is `localmem` and is
 not affiliated with them.
+
+The paper is introduced under [Background](#background); cite it as:
 
 ```bibtex
 @article{zeromem2026,
@@ -844,7 +936,27 @@ not affiliated with them.
 
 ---
 
+## Contributing
+
+Issues and pull requests are welcome at
+[github.com/dangchison/localmem/issues](https://github.com/dangchison/localmem/issues).
+
+Before opening a PR, run the four checks the project runs on itself, from a `[dev]` install:
+
+```bash
+pytest tests/ -q
+ruff check .
+ruff format --check .
+mypy localmem
+```
+
+One standing rule beyond the usual: **`localmem` never gains a mandatory runtime dependency
+without discussion first.** The list is three packages today, every one of them argued for,
+and a fourth is a decision rather than a convenience — optional extras are how new capability
+arrives instead.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
