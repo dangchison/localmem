@@ -135,7 +135,7 @@ backup and transfer, and the security hardening that had to land before any of i
   is loaded into every recall, so an agent acting on injected instructions must not be able to
   write one — and with the shared tier, one poisoned core row would reach every repository.
   The refusal is the standard DD-8 payload (`is_error` stays `False`) and names the command
-  that does work: `localmem add --kind core`. The CLI is unchanged. `PLAN.md` §4's payload
+  that does work: `localmem add --kind core`. The CLI is unchanged. The original spec §4's payload
   shapes, tool names and tool descriptions are untouched; this is input validation, the same
   category as the existing rejections of `kind="imported"` and `workspace="all"`.
 - **The pointer snippet teaches the conventions** the shared tier needs — project-only facts to
@@ -206,7 +206,7 @@ traces, structured retrieval, no LLM call anywhere in the memory path.
   queued for review and **never merged automatically**. `localmem dedupe` lists, reviews,
   merges or keeps both; `localmem gc` prunes resolved rows and reclaims disk space.
 - **MCP server** on stdio exposing exactly two tools, `memory_recall` and `memory_add`, with
-  the payloads frozen at `PLAN.md` §4. Recall on an empty database returns a friendly message
+  the payloads frozen at the original spec §4. Recall on an empty database returns a friendly message
   and is never an error. One SQLite connection per tool call, so no `-wal` sidecar accumulates.
 - **Guided `localmem init`** in five steps: create the database, ask about each detected agent
   individually, offer to import instruction files as a separate question, print the pointer

@@ -1,6 +1,6 @@
 """Dual-view retrieval: FTS5 lexical + entity relational, fused, closed over evidence.
 
-Implements ``PLAN.md`` §5. The pipeline is pure code — no model, no network, no LLM:
+Implements the original spec §5. The pipeline is pure code — no model, no network, no LLM:
 
 1. query profile — the FTS5 ``MATCH`` expression, the query's entities, its recency cue;
 2. **view A**, lexical: bm25 over ``memories_fts``, workspace-filtered, top 20;
@@ -37,7 +37,7 @@ NO_TRACKING_ENV_VAR = "LOCALMEM_NO_TRACKING"
 CANDIDATE_LIMIT = 20
 MAX_NEIGHBORS = 2
 
-# PLAN.md §5 step 4: the relational view leads once the query itself yields an entity
+# The original spec §5 step 4: the relational view leads once the query itself yields an entity
 # that some memory actually carries.
 LEXICAL_WEIGHT = 0.6
 RELATIONAL_WEIGHT = 0.4
@@ -45,7 +45,7 @@ LEXICAL_WEIGHT_ON_ENTITY_HIT = 0.4
 RELATIONAL_WEIGHT_ON_ENTITY_HIT = 0.6
 
 RECENCY_WEIGHT = 0.05
-# PLAN.md §5 step 1: a query that asks for recent things gets a much heavier recency term.
+# The original spec §5 step 1: a query that asks for recent things gets a much heavier recency term.
 # The decay curve itself is unchanged — only how much of it is added to the fused score.
 RECENCY_CUE_WEIGHT = 0.25
 RECENCY_HALF_LIFE_DAYS = 30.0
@@ -196,7 +196,7 @@ _ENTITY_NEIGHBOR_ORDER_BY = " GROUP BY m.id ORDER BY shared DESC, m.id ASC LIMIT
 _WORKSPACE_EXACT = "m.workspace = ?"
 _WORKSPACE_WITH_SHARED = "m.workspace IN (?, ?)"
 
-# PLAN.md §4's `workspace` is on every result, so an agent can see which tier answered.
+# The original spec §4's `workspace` is on every result, so an agent can see which tier answered.
 # Tracking is best-effort and deliberately writes nothing else; see `_record_recall`.
 _RECORD_RECALL_SQL = """
 UPDATE memories
@@ -241,7 +241,7 @@ class RetrievedMemory:
 
 @dataclass(frozen=True)
 class RetrievalResult:
-    """Everything one recall returns; shaped to satisfy ``PLAN.md`` §4 without rework.
+    """Everything one recall returns; shaped to satisfy the original spec §4 without rework.
 
     Attributes:
         results: the ranked memories, best first.

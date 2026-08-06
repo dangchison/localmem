@@ -3,7 +3,7 @@
 How a memory gets in, how it comes back out, and what the database looks like in between.
 
 This document describes **what v0.2.0 does**. `design_decisions.md` is the companion record of
-**why** — every deviation from `PLAN.md` and every accepted limitation, with its measurement.
+**why** — every deviation from the original spec and every accepted limitation, with its measurement.
 Where the two touch, this file links rather than repeats.
 
 ## Modules
@@ -185,7 +185,7 @@ property), `busy_timeout=5000`, `foreign_keys=ON`.
 
 ### Column notes
 
-**`UNIQUE (workspace, content_hash)`, not a global unique on `content_hash`.** `PLAN.md` §3
+**`UNIQUE (workspace, content_hash)`, not a global unique on `content_hash`.** the original spec §3
 declared the constraint globally, which would make the same fact learned in two projects
 collide and leak one project's memory into another's recall. Deduplication is per workspace by
 design; workspaces are the privacy and relevance boundary of the product.

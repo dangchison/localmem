@@ -759,7 +759,7 @@ def _init_import(
         click.echo(f"  found {path}")
     chosen = _choose_import_files(found, import_all=import_all, interactive=interactive)
     if not chosen:
-        # PLAN.md §8 step 3, verbatim and unindented so the line is exactly the message.
+        # The original spec §8 step 3, verbatim and unindented so the line is exactly the message.
         click.echo(importer.SKIP_MESSAGE)
         return
     for path in chosen:
@@ -891,7 +891,7 @@ def _echo_benchmark(report: benchmark.Benchmark, workspace: str) -> None:
     click.echo(f"    tool descriptions: ~{report.tool_description_tokens}")
     click.echo(f"    core memory:       ~{report.core_memory_tokens}")
     click.echo(f"saved: ~{report.saved_tokens} estimated tokens ({report.saved_pct}%)\n")
-    # PLAN.md §10 step 4, verbatim and unindented.
+    # The original spec §10 step 4, verbatim and unindented.
     click.echo(benchmark.CAVEAT)
 
 

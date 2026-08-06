@@ -1,12 +1,16 @@
 # Design decisions
 
-Deliberate deviations from `PLAN.md` and known limitations, recorded as they are made.
+Deliberate deviations from the original spec and known limitations, recorded as they are made.
+
+"The original spec" is the implementation plan localmem was built from. It is not published, so
+the `§N` citations below are traceable numbering rather than links — each entry states the
+constraint it deviates from, so it stands on its own without the source document.
 
 ## 1. `UNIQUE(workspace, content_hash)` instead of a global `UNIQUE` on `content_hash`
 
 **Milestone:** M1
 
-`PLAN.md` §3 declares `content_hash TEXT NOT NULL UNIQUE`. That constraint is global, which
+The original spec §3 declares `content_hash TEXT NOT NULL UNIQUE`. That constraint is global, which
 conflicts with the workspace partitioning that the rest of the design depends on: the same
 fact learned in two projects (`use pnpm not npm`) would collide, and the second workspace
 would silently receive a `duplicate_merged` pointing at another workspace's row — leaking
@@ -191,7 +195,7 @@ above that is 1, not 2.
 
 **Milestone:** M3
 
-`PLAN.md` §6 specifies tier-2 as "any existing row with bm25 score above threshold **and**
+The original spec §6 specifies tier-2 as "any existing row with bm25 score above threshold **and**
 normalized Jaccard token overlap ≥ 0.7". The conjunction cannot be implemented as written,
 because there is no bm25 threshold that means anything on a personal-sized corpus.
 
@@ -242,7 +246,7 @@ likely.
 
 **Milestone:** M3
 
-`PLAN.md` §1 fixes two divisors — `ceil(chars/4)` for English, `ceil(chars/2.5)` for
+The original spec §1 fixes two divisors — `ceil(chars/4)` for English, `ceil(chars/2.5)` for
 "CJK/Vietnamese-heavy" text — but never says where one ends and the other begins.
 
 **Decision:** `tokens.NON_ASCII_RATIO_CUTOFF = 0.15`. Above that fraction of non-ASCII
@@ -267,7 +271,7 @@ estimate, or every European name inflates the number. A genuinely Vietnamese sen
 
 **Milestone:** M3
 
-`PLAN.md` §5 step 7 caps core memory at 400 estimated tokens and says to "truncate oldest-first".
+The original spec §5 step 7 caps core memory at 400 estimated tokens and says to "truncate oldest-first".
 Truncation could mean cutting the character stream, which would leave a half-sentence at the top
 of every recall.
 
@@ -294,7 +298,7 @@ first" would be arbitrary.
 
 **Milestone:** M3
 
-`PLAN.md` §12 forbids "automatic deletion of near-duplicates". `--merge` is not that: it acts on
+The original spec §12 forbids "automatic deletion of near-duplicates". `--merge` is not that: it acts on
 one pair, on an explicit user instruction, after the pair has been shown side by side. It keeps
 the **newer** row, adds the older row's `seen_count` to it, and deletes the older row.
 
@@ -337,7 +341,7 @@ v1** — the schema is frozen at version 1 for this release.
 
 **Milestone:** M3 (fix round 1)
 
-`PLAN.md` §5 step 1 puts a "recency cue" in the query profile — a regex for `recent`,
+The original spec §5 step 1 puts a "recency cue" in the query profile — a regex for `recent`,
 `last week`, `hôm qua`, `tuần trước` — that "adds an `ORDER BY created_at` boost". It names no
 magnitude, and §5 step 5 already fixes the recency contribution at `0.05 · decay`. A literal
 second `ORDER BY` term would have competed with that formula.
@@ -394,7 +398,7 @@ Two consequences follow, both deliberate:
 1. **Literal matching on cue words is given up.** `search "today"` no longer finds rows because
    they contain the word "today". This is the intended trade: in a memory system that query
    almost certainly means *"what did I record today"*, not *"grep for the string today"*, and
-   that is what `PLAN.md` §5 step 1 is reaching for when it says a cue "adds `ORDER BY
+   that is what the original spec §5 step 1 is reaching for when it says a cue "adds `ORDER BY
    created_at` boost". A user who genuinely wants the literal word can still reach it through
    any other term in the same query — only the cue span is removed, never the rest.
 2. **A query that is nothing but cues enters pure recency mode.** `today`, `tuần trước`,
@@ -416,7 +420,7 @@ Two consequences follow, both deliberate:
 - Verified end to end: `search "recent pnpm"` now returns the same two rows as `search "pnpm"`,
   scored 0.85/0.25 instead of 0.65/0.05 — same rows, heavier recency term.
 
-## 14. The `PLAN.md` §4 payloads are frozen, and the internal dataclasses carry more than they emit
+## 14. The §4 payloads are frozen, and the internal dataclasses carry more than they emit
 
 **Milestone:** M4
 
@@ -474,7 +478,7 @@ Fused scores land in that neighbourhood because each view is min-max normalized 
 
 **Milestone:** M4
 
-`PLAN.md` §4 says a recall on an empty database is "**Never an error**". That promise cannot be
+The original spec §4 says a recall on an empty database is "**Never an error**". That promise cannot be
 kept by an unguarded handler: a corrupt database, an unreadable file, a `ValueError` from
 workspace validation would all become an MCP protocol error, and a traceback rendered into the
 protocol stream is worse than a degraded payload — it costs the agent the answer *and* the
@@ -550,7 +554,7 @@ would add a thread hop and a concurrency model to reason about in exchange for l
 not currently observable.
 
 **Revisit when** either becomes true: the corpus grows to where a recall is measurable in tens of
-milliseconds, or the streamable-HTTP transport (§12 of `PLAN.md`, v2) lands and one server starts
+milliseconds, or the streamable-HTTP transport (§12 of the original spec, v2) lands and one server starts
 fielding genuinely concurrent clients. The change is contained — the handlers already delegate to
 `_recall` / `_add`, so making them `async def` and moving those two calls onto a worker thread
 touches nothing else.
@@ -589,7 +593,7 @@ on `msg["result"]["isError"]` when parsing raw JSON off the pipe.
 
 **Milestone:** M5 (rewritten in fix round 3, after three blockers)
 
-`PLAN.md` §8 step 2 says to "append `[mcp_servers.localmem]` block to `~/.codex/config.toml`". Doing
+The original spec §8 step 2 says to "append `[mcp_servers.localmem]` block to `~/.codex/config.toml`". Doing
 that safely needs one decision: *is localmem already registered?*
 
 **Decision, current:** parse the file and look up the key.
@@ -759,7 +763,7 @@ that is not an object, and an `mcpServers` value that is not an object.
 
 **Milestone:** M5
 
-`PLAN.md` §8 step 2 says of Claude Code: "prefer printing the exact command over editing global
+The original spec §8 step 2 says of Claude Code: "prefer printing the exact command over editing global
 files". Measured on this machine, `~/.claude.json` is **~60 KB across 64 top-level keys** — project
 history, session state, onboarding flags — of which `mcpServers` is one.
 
@@ -841,7 +845,7 @@ is written by a person, not by an agent. Use `localmem add --kind core` from the
 
 **Why this is not a change to the frozen §4 contract**
 
-`PLAN.md` §4 freezes the *payload shapes* and the tool names and descriptions. None of those
+The original spec §4 freezes the *payload shapes* and the tool names and descriptions. None of those
 move: `memory_add` still returns `{status, id, seen_count}` on success and the DD-8 error shape
 on failure, and both tool descriptions are byte-identical. What changed is **input
 validation** — the same category as the existing rejections of `kind="imported"`, of
@@ -938,7 +942,7 @@ judgement. localmem makes no model calls, so it cannot make that judgement — a
 introduced in §24 is worthless if nothing ever writes to it.
 
 The available levers were the MCP tool descriptions and the pointer snippet. The tool
-descriptions are frozen by `PLAN.md` §4 and are paid for by every session of every agent. The
+descriptions are frozen by the original spec §4 and are paid for by every session of every agent. The
 snippet is one constant (`agents.POINTER_SNIPPET`), is printed by `init`, is what `benchmark`
 charges as the "after" cost, and is pasted by the user into a file they control.
 
@@ -1017,7 +1021,7 @@ make it acceptable.
   statement at a table that does not exist and asserts the results still come back.
 - **It is cheap.** One statement, one connection per MCP call, WAL journaling. The `memories`
   FTS triggers fire on `UPDATE OF content`, so this write costs no index maintenance.
-- **It is invisible on the wire.** No `PLAN.md` §4 payload gained a field. `stats` and `audit`
+- **It is invisible on the wire.** No §4 payload gained a field. `stats` and `audit`
   are the only readers.
 
 Neighbours are **not** counted. They were attached as evidence, not asked for; counting them
@@ -1119,7 +1123,7 @@ at a terminal, and the ordinary `search` output is wrong for it in two specific 
 
 **Consequences**
 
-- The MCP surface is untouched. `PLAN.md` §4 is frozen, and `--context` is a rendering choice
+- The MCP surface is untouched. The original spec §4 is frozen, and `--context` is a rendering choice
   for a shell hook, not a change to what an agent can ask for. `mcp_server.py` is byte-identical
   to v0.2.0.
 - `retriever.retrieve` is reused exactly as-is: same ranking, same shared-`global` tier, same

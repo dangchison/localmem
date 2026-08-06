@@ -28,7 +28,7 @@ _BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 _TOKEN_SEPARATOR_RE = re.compile(r"\W+", re.UNICODE)
 
-# Tier 2. The Jaccard threshold is the one hard number PLAN.md §6 specifies and the only
+# Tier 2. The Jaccard threshold is the one hard number the original spec §6 specifies and the only
 # scale-invariant signal available: bm25 magnitudes on a personal-sized corpus are around
 # 1e-06, so no bm25 gate can be set meaningfully. FTS5 therefore only narrows the field.
 TIER2_JACCARD_THRESHOLD = 0.7
@@ -278,7 +278,7 @@ def resolve_merge(conn: sqlite3.Connection, queue_id: int) -> Resolution:
     """Keep the newer memory of pair ``queue_id``, fold ``seen_count``, drop the older.
 
     This is the only path in localmem that deletes a memory, and it runs only on a pair a
-    human has just reviewed — it is not the automatic near-duplicate deletion PLAN.md §12
+    human has just reviewed — it is not the automatic near-duplicate deletion the original spec §12
     forbids.
 
     Deleting the older row also removes, by the schema's ``ON DELETE CASCADE``, its

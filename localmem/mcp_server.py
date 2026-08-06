@@ -3,7 +3,7 @@
 This module is a **serialization layer**, nothing more. Retrieval lives in
 :mod:`localmem.retriever`, writes and tier-1/2 dedup live in :mod:`localmem.store`; the
 job here is to resolve inputs, call one of those two, and shape the answer into the JSON
-that ``PLAN.md`` §4 froze.
+that the original spec §4 froze.
 
 Three rules govern everything below:
 
@@ -36,7 +36,7 @@ SERVER_NAME = "localmem"
 Transport = Literal["stdio", "sse", "streamable-http"]
 DEFAULT_TRANSPORT: Transport = "stdio"
 
-# PLAN.md §4, verbatim. These strings are part of the frozen API: every agent session pays
+# The original spec §4, verbatim. These strings are part of the frozen API: every agent session pays
 # for them in context, and clients cache them. Split across lines only to fit the line
 # limit — the concatenated value is byte-identical to §4.
 RECALL_DESCRIPTION = (
@@ -96,7 +96,7 @@ def build_server() -> MCPServer:
 def serve(transport: Transport = DEFAULT_TRANSPORT) -> None:
     """Run the MCP server until the client disconnects.
 
-    ``transport`` stays a parameter because ``PLAN.md`` §1 requires streamable HTTP to be
+    ``transport`` stays a parameter because the original spec §1 requires streamable HTTP to be
     "a flag later, not a rewrite". v1 ships stdio only (§12), so nothing exposes any other
     value; the seam costs one argument and saves the rewrite.
     """

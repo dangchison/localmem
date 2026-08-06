@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# localmem end-to-end acceptance script (PLAN.md §11, "Final acceptance").
+# localmem end-to-end acceptance script (the original spec §11, "Final acceptance").
 #
 #   fresh venv -> pip install -e . -> localmem init (sandboxed HOME, decline agents and
 #   import) -> add x3 (one duplicate) -> search shows ranked results and the merge ->

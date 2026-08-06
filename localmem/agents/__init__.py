@@ -26,7 +26,7 @@ WRITERS: tuple[AgentWriter, ...] = (
 )
 
 #: The block ``init`` step 4 prints and ``benchmark`` charges as the "after" cost
-#: (``PLAN.md`` §8 step 4 and §10 step 3). One definition, so the advice the user is
+#: (the original spec §8 step 4 and §10 step 3). One definition, so the advice the user is
 #: given and the savings they are quoted can never drift apart.
 #:
 #: It carries five ideas and nothing else, because every token here is paid on every
@@ -54,7 +54,7 @@ POINTER_SNIPPET = (
 #: The ceiling ``POINTER_SNIPPET`` is measured against, in estimated tokens.
 POINTER_SNIPPET_TOKEN_BUDGET = 100
 
-#: ``PLAN.md`` §8 step 3's scan set, relative to ``home`` and ``cwd``.
+#: the original spec §8 step 3's scan set, relative to ``home`` and ``cwd``.
 HOME_INSTRUCTION_FILES = (Path(".claude") / "CLAUDE.md",)
 CWD_INSTRUCTION_FILES = (Path("CLAUDE.md"), Path("AGENTS.md"))
 CWD_INSTRUCTION_GLOB = ".kiro/steering/*.md"

@@ -1,4 +1,4 @@
-"""Character-based token estimation (``PLAN.md`` §1).
+"""Character-based token estimation (the original spec §1).
 
 Deliberately dependency-free: this module imports nothing from :mod:`localmem`, so
 both the retriever's core-memory cap and the future ``benchmark`` command can rely on
@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 
 # Above this fraction of non-ASCII characters the text is treated as CJK/Vietnamese-heavy.
-# PLAN.md §1 names the two regimes but not the boundary; 0.15 is chosen so that a mostly
+# The original spec §1 names the two regimes but not the boundary; 0.15 is chosen so that a mostly
 # English sentence carrying a few accented words stays on the 4-chars-per-token estimate,
 # while a genuinely Vietnamese sentence — which crosses 0.15 after only a handful of
 # diacritics — moves to the denser one.

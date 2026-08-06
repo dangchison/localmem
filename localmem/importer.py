@@ -1,4 +1,4 @@
-"""Markdown instruction files → memory records (``PLAN.md`` §9).
+"""Markdown instruction files → memory records (the original spec §9).
 
 The splitter is a deterministic line-oriented state machine: the same bytes always
 produce the same records in the same order, which is what makes a re-import a no-op
@@ -24,11 +24,11 @@ from pathlib import Path
 
 from localmem import store
 
-#: ``PLAN.md`` §8 step 3, verbatim. One definition so ``init`` cannot paraphrase it.
+#: the original spec §8 step 3, verbatim. One definition so ``init`` cannot paraphrase it.
 SKIP_MESSAGE = "You can import anytime later with `localmem import` — skipping now loses nothing."
 
-#: ``PLAN.md`` §9's post-import suggestion. A suggestion only: localmem never edits an
-#: instruction file (``PLAN.md`` §12).
+#: the original spec §9's post-import suggestion. A suggestion only: localmem never edits an
+#: instruction file (the original spec §12).
 TRIM_SUGGESTION_TEMPLATE = (
     "Consider trimming the imported sections from {path} and replacing them with the "
     "pointer snippet (`localmem init` prints it, or see "
@@ -38,7 +38,7 @@ TRIM_SUGGESTION_TEMPLATE = (
 IMPORT_KIND = "imported"
 SOURCE_PREFIX = "import:"
 
-#: How many rendered records ``--dry-run`` shows (``PLAN.md`` §9).
+#: How many rendered records ``--dry-run`` shows (the original spec §9).
 DRY_RUN_PREVIEW = 5
 
 _HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*)$")

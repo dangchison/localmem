@@ -25,7 +25,7 @@ CORE_KIND = "core"
 #: audit report and the CLI all import it from here rather than keeping a copy.
 GLOBAL_WORKSPACE = FALLBACK_WORKSPACE
 
-# PLAN.md §5 step 7: hard cap, expressed in estimated tokens.
+# the original spec §5 step 7: hard cap, expressed in estimated tokens.
 CORE_MEMORY_TOKEN_CAP = 400
 
 CORE_MEMORY_JOINER = "\n"

@@ -1,6 +1,6 @@
-"""Token cost of instruction files versus the pull-based alternative (``PLAN.md`` §10).
+"""Token cost of instruction files versus the pull-based alternative (the original spec §10).
 
-Every number here is the character-based approximation from ``PLAN.md`` §1, reused from
+Every number here is the character-based approximation from the original spec §1, reused from
 :mod:`localmem.tokens`. The "after" cost is a **single fixed overhead** — pointer
 snippet plus the two MCP tool descriptions plus the workspace's core memory — not a
 per-file charge, because an agent pays it once per session no matter how many files it
@@ -16,7 +16,7 @@ from pathlib import Path
 from localmem.agents import POINTER_SNIPPET
 from localmem.tokens import estimate_tokens
 
-#: ``PLAN.md`` §10 step 4, verbatim. Printed on every run and carried in ``--json``.
+#: the original spec §10 step 4, verbatim. Printed on every run and carried in ``--json``.
 CAVEAT = (
     "Estimates use a character-based approximation (±15%). Verify real numbers with "
     "`/context` in Claude Code before and after migrating."
@@ -56,7 +56,7 @@ class Benchmark:
 
 
 def tool_descriptions() -> str:
-    """Return the two ``PLAN.md`` §4 tool descriptions an agent loads every session.
+    """Return the two the original spec §4 tool descriptions an agent loads every session.
 
     Imported lazily: :mod:`localmem.mcp_server` pulls in the MCP SDK, and reading two
     frozen constants is not worth that cost on every ``localmem --help``. Reading them
