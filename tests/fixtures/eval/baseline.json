@@ -4,11 +4,11 @@
   "positive_queries": 45,
   "negative_queries": 20,
   "recall": {
-    "@1": 0.6889,
-    "@3": 0.8444,
-    "@5": 0.9111
+    "@1": 0.7556,
+    "@3": 0.8889,
+    "@5": 0.9333
   },
-  "mrr": 0.7737,
+  "mrr": 0.8163,
   "off_corpus_silent": 1,
   "answered_by": {
     "both": 9,
@@ -30,15 +30,15 @@
       ]
     },
     "q-deploy-slow": {
-      "first_gold_rank": null,
+      "first_gold_rank": 3,
       "silent": false,
       "answered_by": "fallback",
       "returned": [
         "doc-migration",
         "doc-deploy-new",
+        "doc-ci-cache",
         "doc-email-queue",
-        "doc-cors",
-        "doc-oauth-refresh"
+        "doc-cors"
       ]
     },
     "q-migration-prod": {
@@ -72,8 +72,8 @@
       "returned": [
         "doc-db-pool",
         "doc-email-queue",
-        "doc-fts-tokenizer",
         "doc-core-cap",
+        "doc-fts-tokenizer",
         "doc-deploy-new"
       ]
     },
@@ -123,26 +123,26 @@
       ]
     },
     "q-realtime": {
-      "first_gold_rank": 2,
+      "first_gold_rank": 1,
       "silent": false,
       "answered_by": "fallback",
       "returned": [
-        "doc-db-pool",
         "doc-websocket",
+        "doc-db-pool",
         "doc-worker-leak",
         "doc-write-tx",
         "doc-match-empty"
       ]
     },
     "q-secret": {
-      "first_gold_rank": 4,
+      "first_gold_rank": 3,
       "silent": false,
       "answered_by": "fallback",
       "returned": [
         "doc-open-database",
         "doc-idempotency",
-        "doc-match-empty",
         "doc-env-secret",
+        "doc-match-empty",
         "doc-n1-query"
       ]
     },
@@ -295,9 +295,9 @@
       "returned": [
         "doc-naming",
         "doc-oauth-refresh",
-        "doc-schema-version",
         "doc-cors",
-        "doc-migration"
+        "doc-migration",
+        "doc-schema-version"
       ]
     },
     "q-off-email": {
@@ -353,11 +353,11 @@
       "silent": false,
       "answered_by": "fallback",
       "returned": [
-        "doc-resolve-db-path",
         "doc-n1-query",
-        "doc-validate-workspace",
+        "doc-resolve-db-path",
         "doc-cache-invalidate",
-        "doc-normalize-hash"
+        "doc-validate-workspace",
+        "doc-deploy-new"
       ]
     },
     "q-off-grafana": {
@@ -387,7 +387,7 @@
         "doc-cache-invalidate",
         "doc-upload-s3",
         "doc-normalize-hash",
-        "doc-validate-workspace"
+        "doc-email-queue"
       ]
     },
     "q-double-count": {
@@ -444,8 +444,8 @@
         "doc-upload-s3",
         "doc-i18n",
         "doc-api-500",
-        "doc-dir-perm",
-        "doc-fts-about"
+        "doc-fts-about",
+        "doc-email-queue"
       ]
     },
     "q-log-privacy": {
@@ -484,8 +484,8 @@
         "doc-i18n",
         "doc-fts-tokenizer",
         "doc-timezone",
-        "doc-index-about",
-        "doc-db-path"
+        "doc-db-path",
+        "doc-index-about"
       ]
     },
     "q-money-type": {
@@ -496,8 +496,8 @@
         "doc-money-decimal",
         "doc-timezone",
         "doc-staging-data",
-        "doc-index-cap",
-        "doc-normalize-hash"
+        "doc-normalize-hash",
+        "doc-index-cap"
       ]
     },
     "q-api-hang-mail": {
@@ -591,21 +591,21 @@
       ]
     },
     "q-disagree-perm": {
-      "first_gold_rank": 2,
+      "first_gold_rank": 1,
       "silent": false,
       "answered_by": "both",
       "returned": [
-        "doc-open-database",
-        "doc-dir-perm"
+        "doc-dir-perm",
+        "doc-open-database"
       ]
     },
     "q-disagree-fts": {
-      "first_gold_rank": 2,
+      "first_gold_rank": 1,
       "silent": false,
       "answered_by": "both",
       "returned": [
-        "doc-fts-tokenizer",
         "doc-fts-rebuild",
+        "doc-fts-tokenizer",
         "doc-fts-about"
       ]
     },
@@ -628,7 +628,7 @@
         "doc-deploy-new",
         "doc-node-new",
         "doc-staging-data",
-        "doc-migration"
+        "doc-fts-rebuild"
       ]
     },
     "q-off-dns": {
@@ -662,8 +662,8 @@
       "returned": [
         "doc-sentry-scope",
         "doc-api-500",
-        "doc-open-database",
         "doc-mobile-viewport",
+        "doc-open-database",
         "doc-timezone"
       ]
     },

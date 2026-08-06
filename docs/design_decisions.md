@@ -2235,12 +2235,13 @@ itself, i.e. a redesign of the ranking rather than a term added to it, justified
 **What would change the answer.** A fixture large enough that one query is not 5% of the sample, or
 a query band built specifically to isolate the fallback's ordering. Not a bigger weight.
 
-> **Superseded evidence, verdict not yet re-derived.** Every number above was measured on the
-> 30-document corpus. §55 widened it to 59 documents and 45 positive queries, which is precisely the
-> "large enough" condition this section names — so this rejection now rests on a fixture that no
-> longer exists, and the sweep should be re-run before anyone cites it. It is left standing rather
-> than deleted because the two structural findings — Jaccard's zero spread, and coverage being blind
-> without the keywords column — do not depend on the corpus size.
+> **Verdict overturned — see §58.** Every number above was measured on the 30-document corpus. §55
+> widened it to 59 documents and 45 positive queries, which is exactly the "large enough" condition
+> this section names; re-measured there, the same term moves five queries and worsens none, and it
+> shipped at `COVERAGE_WEIGHT = 0.4`. This entry is left standing rather than rewritten because the
+> refusal was correct **on the evidence available at the time**, and because its two structural
+> findings — Jaccard's zero spread, and coverage being blind without the keywords column — do not
+> depend on the corpus size and are what made the second attempt work.
 
 ### One *apparent* defect found on the way — measured in §56, and it is not one
 
@@ -2455,3 +2456,97 @@ The hop reorders *within* the relational view; it does not make the relational v
 that had no entity to begin with. Two thirds of all recall still runs through the disjunctive
 fallback, and off-corpus silence at 1 in 20 remains this system's worst measured property. Neither
 of those is addressed here.
+
+## 58. The coverage rerank, refused in §54 and landed here — and what its control exposed
+
+§54 refused a query-coverage term because it moved one query on a 20-query corpus, and named the
+condition that would change the answer: *"a fixture large enough that one query is not 5% of the
+sample."* §55 built that fixture. Re-measured on it, the same term moves five queries and worsens
+none. It ships at `COVERAGE_WEIGHT = 0.4`.
+
+This is the harness doing the job it was built for, in both directions: it refused this change when
+the evidence was thin and approved it when the evidence improved. Neither verdict was an opinion.
+
+### The measurement
+
+All constants as shipped, coverage added on top of the entity hop (§57):
+
+| | recall@1 | recall@3 | recall@5 | MRR | off-corpus silent | better / worse |
+|---|---|---|---|---|---|---|
+| baseline | 0.6889 | 0.8444 | 0.9111 | 0.7737 | 1/20 | — |
+| coverage 0.2 | 0.6889 | 0.8667 | 0.9333 | 0.7811 | 1/20 | +2 / −0 |
+| **coverage 0.4** | **0.7556** | **0.8889** | **0.9333** | **0.8163** | **1/20** | **+5 / −0** |
+| coverage 1.0 | 0.7778 | 0.8889 | 0.9556 | 0.8404 | 1/20 | +8 / −0 |
+
+One of the five it fixes is `open_database 0700`, the single query §57's entity hop regressed. The
+two changes repair each other, which is not something either sweep could have predicted alone.
+
+### The control, which is the important part of this entry
+
+Coverage reads **both** indexed columns. That is the correct design — a memory found only through
+its keywords must not be scored as covering nothing, which is the entire point of §34 — but it
+creates a validity problem the numbers above cannot see: **the fixture's keywords and the fixture's
+queries were written by the same person.** A keyword-driven win may be measuring nothing more than
+that.
+
+So the same sweep was run with coverage unable to see keywords at all:
+
+| | recall@1 | recall@3 | MRR | better / worse |
+|---|---|---|---|---|
+| baseline | 0.6889 | 0.8444 | 0.7737 | — |
+| content-only coverage 0.4 | **0.7333** | 0.8444 | 0.7959 | **+2 / −0** |
+| content-only coverage 1.0 | 0.7333 | 0.8222 | 0.7930 | +2 / −0 |
+
+The gain survives the control, at half the size, and peaks at the same 0.4 — so **0.4 is chosen from
+the control, not from the headline**, and everything the shipped configuration adds beyond +2
+queries is recorded as an upper bound rather than a result. (On the 30-document corpus the
+content-only variant did nothing at all; the widened corpus is what made it visible.)
+
+### The number that should worry the next person
+
+With both view weights zeroed — bm25 and the entity graph contributing **nothing** to the ranking,
+serving only as candidate generation — coverage alone scores:
+
+| | recall@1 | recall@3 | MRR |
+|---|---|---|---|
+| shipped fusion | 0.6889 | 0.8444 | 0.7737 |
+| **coverage alone, content + keywords** | **0.9111** | **0.9333** | **0.9267** |
+| coverage alone, content only | 0.7111 | 0.7556 | 0.7544 |
+
+A single set intersection, ranking the candidates the views retrieve, outscores the entire two-view
+fusion by twenty-two points of recall@1 — **and two thirds of that collapses when it cannot read
+keywords.** Both halves of that sentence matter:
+
+* the views are demonstrably better at *finding* candidates than at *ordering* them, and the
+  ordering half of the design has never been measured against a trivial baseline until now;
+* but the headline figure is inflated by exactly the circularity the control was built to expose,
+  so it is **not** evidence that the fusion should be replaced.
+
+What it does justify is refusing to read any keyword-inclusive result off this fixture again. A
+corpus whose keywords were written without sight of the queries — ideally from real memories — is
+now the highest-value thing that could be added to `localmem eval`, because until it exists, §34's
+own 0.35 column weight rests on the same circularity this entry just found.
+
+### Weight, and why it is below `LEXICAL_WEIGHT`
+
+§54's structural objection was that making the term decisive required a weight above
+`LEXICAL_WEIGHT`, i.e. a redesign rather than an addition. At 0.4 that objection is answered on its
+own terms: coverage contributes less than the lexical view it sits beside, and the sweep shows it
+does not need more to deliver everything the control can vouch for.
+
+### One invariant it improved, recorded because the test changed
+
+`test_the_cap_holds_when_the_correction_itself_scores_zero` pinned the degenerate corner §43
+describes: a correction that is the weakest lexical candidate normalizes to 0.0, its recency term
+underflows, the supersede cap lands on 0.0, and the correction ranks first only because `_fuse`'s
+sort key breaks the tie by id. Coverage is computed from the row's own text rather than from its
+rank within a view, so it survives being weakest — the correction now carries 0.4 and the retracted
+row a tenth of that. **The correction wins on score, by an order of magnitude, instead of on a
+tiebreak.** The test now pins the separation; the ordering assertion that guards the sort key is
+unchanged.
+
+`MILESTONE_B_RANKING` was re-recorded for the same reason. Every id, neighbour list and ordering in
+it is what milestone B produced; only the absolute scores moved, each by exactly
+`COVERAGE_WEIGHT × coverage`. That was verified before the snapshot was rewritten, because the
+guarantee the table exists for is the ranking, and updating it without checking would have
+discarded that silently.

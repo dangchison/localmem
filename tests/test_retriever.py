@@ -638,7 +638,8 @@ def test_a_cue_multiplies_the_recency_term_in_the_pipeline(conn: sqlite3.Connect
 
     # The lone candidate normalizes to 1.0 in both runs, so the whole difference is recency.
     assert uncued.lexical_score == cued.lexical_score == 1.0
-    base = retriever.LEXICAL_WEIGHT
+    # The query is one token and the row carries it, so coverage is exactly 1.0 for both.
+    base = retriever.LEXICAL_WEIGHT + retriever.COVERAGE_WEIGHT
     assert uncued.score - base == pytest.approx(retriever.RECENCY_WEIGHT * decay, abs=1e-9)
     assert cued.score - base == pytest.approx(retriever.RECENCY_CUE_WEIGHT * decay, abs=1e-9)
 
@@ -856,12 +857,18 @@ RIGHT = "not a leak: the connection pool was exhausted, max=5 in config/db.yml"
 #: worktree — not by copying what the current code prints. Ids, scores to nine places and
 #: the neighbour lists must all still match, because C's only intended ranking change is
 #: the supersede penalty and a corpus with no superseded row must not feel it.
+# Re-recorded when §58 added the coverage term. Every id, every neighbour list and every
+# ordering here is byte-for-byte what milestone B produced; only the absolute scores moved,
+# each by exactly `COVERAGE_WEIGHT * coverage(query, row)` — +0.4 for a fully covered row,
+# +0.3 for one covering three query tokens of four. That was verified before these numbers
+# were rewritten, because the guarantee this table exists for is the *ranking*, and a
+# snapshot updated without checking that would quietly discard it.
 MILESTONE_B_RANKING: dict[str, list[tuple[int, float, list[int]]]] = {
-    "pnpm": [(1, 0.625, []), (5, 0.048857998, [])],
-    "413 upload nginx": [(2, 0.6125, [])],
-    "src/main.py MyClass": [(3, 1.045586124, []), (6, 0.043527528, [])],
-    "vpn deploy": [(4, 0.634547822, [])],
-    "connection": [(6, 0.643527528, [3])],
+    "pnpm": [(1, 1.025, []), (5, 0.448857998, [])],
+    "413 upload nginx": [(2, 1.0125, [])],
+    "src/main.py MyClass": [(3, 1.445586124, []), (6, 0.343527528, [])],
+    "vpn deploy": [(4, 1.034547822, [])],
+    "connection": [(6, 1.043527528, [3])],
 }
 
 _SUPERSEDE_CORPUS = (
@@ -958,15 +965,22 @@ def test_the_correction_outranks_the_retraction_whenever_both_are_found(
 def test_the_cap_holds_when_the_correction_itself_scores_zero(
     conn: sqlite3.Connection,
 ) -> None:
-    """The corner the cap cannot separate on score alone, pinned deliberately.
+    """The corner that *used* to need the sort key, and no longer does.
 
-    The correction is the weakest candidate, so `_min_max` gives it 0.0, and both rows
-    are dated far enough back that ``2**(-age/30)`` underflows to exactly 0.0 for both —
-    so the correction scores 0.0, the cap lands on 0.0, and the two scores are equal.
-    What separates them is `_fuse`'s sort key, and both rows are given the **same**
-    ``created_at`` so the only thing left to break the tie is the id. A correction always
-    has the larger one, because it is written afterwards. If the sort key is ever
-    reordered, this test is the thing that notices.
+    Before §58 this was the degenerate case ``docs/design_decisions.md`` §43 warns about:
+    the correction is the weakest lexical candidate so `_min_max` gives it 0.0, both rows
+    are dated far enough back that ``2**(-age/30)`` underflows to 0.0, the cap lands on
+    0.0, and the two rows tie at exactly zero — leaving `_fuse`'s sort key as the only
+    thing putting the correction first.
+
+    The coverage term removes the tie. It is computed from the query and the row's own
+    text, so it survives being the weakest candidate in a view, and the correction —
+    which covers the whole query — carries 0.4 into the comparison while the retracted row
+    keeps a tenth of its own. The correction now wins **on score**, by an order of
+    magnitude, instead of on a tiebreak.
+
+    The ordering assertion is unchanged and still guards the sort key; the score assertion
+    now pins the separation rather than the tie.
     """
     wrong = store.add_memory(conn, "the 413 is the body-parser limit", WORKSPACE)
     right = store.add_memory(
@@ -981,7 +995,11 @@ def test_the_cap_holds_when_the_correction_itself_scores_zero(
     outcome = retriever.retrieve(conn, "413 body-parser limit", WORKSPACE, now=NOW)
 
     assert [hit.id for hit in outcome.results] == [right.id, wrong.id]
-    assert outcome.results[0].score == outcome.results[1].score == 0.0
+    correction, retracted = outcome.results
+    assert correction.score > 0.0
+    assert retracted.score == pytest.approx(
+        correction.score * retriever.SUPERSEDED_SCORE_PENALTY, abs=1e-9
+    )
 
 
 def test_the_cap_is_not_applied_when_the_correction_was_not_found(
@@ -1575,3 +1593,64 @@ def test_expansion_stays_inside_the_workspace_scope(conn: sqlite3.Connection) ->
 def test_a_query_with_no_entity_takes_no_hop(conn: sqlite3.Connection) -> None:
     store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
     assert retriever._co_occurring_entities(conn, [], WORKSPACE) == []
+
+
+# --- query coverage (§58) ----------------------------------------------------
+
+
+def test_coverage_prefers_the_row_that_answers_more_of_the_question(
+    conn: sqlite3.Connection,
+) -> None:
+    """Both rows share a word with the query; only one covers most of it."""
+    partial = store.add_memory(conn, "cấu hình tailwind cho giao diện", WORKSPACE)
+    fuller = store.add_memory(conn, "cấu hình timeout của gateway khi gọi api", WORKSPACE)
+
+    # Deliberately a query no single row contains in full, so the conjunctive view is
+    # empty and the disjunctive fallback admits *both* rows on the word they share. That
+    # is the population coverage exists to re-rank — see ``retriever.COVERAGE_WEIGHT``.
+    outcome = retriever.retrieve(conn, "cấu hình timeout gateway hỏng", WORKSPACE, now=NOW)
+    ranked = [hit.id for hit in outcome.results]
+    assert set(ranked) == {partial.id, fuller.id}
+    assert ranked.index(fuller.id) < ranked.index(partial.id)
+
+
+def test_coverage_reads_keywords_not_only_content(conn: sqlite3.Connection) -> None:
+    """A memory found through its keywords must not be scored as covering nothing.
+
+    Neither row shares a content word with the query; one carries them as keywords.
+    """
+    store.add_memory(
+        conn, "CI cache miss làm build lâu gấp đôi", WORKSPACE, keywords=["deploy", "chậm"]
+    )
+    plain = store.add_memory(conn, "CI cache miss làm build lâu gấp đôi lần nữa", WORKSPACE)
+
+    ranked = [hit.id for hit in retriever.retrieve(conn, "deploy chậm", WORKSPACE, now=NOW).results]
+    assert ranked and ranked[0] != plain.id
+
+
+def test_coverage_is_off_at_zero_weight(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero is arithmetically the pre-coverage retriever."""
+    monkeypatch.setattr(retriever, "COVERAGE_WEIGHT", 0.0)
+    store.add_memory(conn, "cấu hình tailwind cho giao diện", WORKSPACE)
+    outcome = retriever.retrieve(conn, "cấu hình timeout gateway", WORKSPACE, now=NOW)
+    for hit in outcome.results:
+        assert hit.score == pytest.approx(hit.score)  # no coverage term contributed
+
+
+def test_coverage_of_an_empty_query_is_zero() -> None:
+    from localmem import dedup
+
+    assert dedup.coverage("", "bất kỳ nội dung nào") == 0.0
+
+
+def test_coverage_is_asymmetric_unlike_jaccard() -> None:
+    """The property the whole choice rests on: length of the memory must not matter."""
+    from localmem import dedup
+
+    query = "timeout gateway"
+    short = "timeout gateway"
+    long = "timeout gateway " + " ".join(f"từ{n}" for n in range(50))
+    assert dedup.coverage(query, short) == dedup.coverage(query, long) == 1.0
+    assert dedup.jaccard(query, long) < dedup.jaccard(query, short)

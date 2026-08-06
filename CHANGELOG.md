@@ -20,10 +20,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `test_bundled_fixture_matches_the_recorded_baseline` fails on **any** movement, up or down;
   rewrite it with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`.
 
-  Corpus: 59 documents, 45 graded queries, 20 off-corpus. Baseline as first recorded: recall@1
-  **0.6667**, recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**, off-corpus silent
-  **1/20** — moved once since, by the entity hop below. `answered_by` is
-  `both 9, lexical 3, relational 8, fallback 44, none 1`.
+  Corpus: 59 documents, 45 graded queries, 20 off-corpus. First recorded at recall@1 **0.6667**,
+  MRR **0.7552**; **0.7556 / 0.8163** as of the two retrieval changes below, with off-corpus silence
+  unmoved at **1/20** throughout. `answered_by` is `both 9, lexical 3, relational 8, fallback 44,
+  none 1`.
 
   Two findings came straight out of it and are recorded in `docs/design_decisions.md` §53:
 
@@ -54,17 +54,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   This is the first change to the ranking that `localmem eval` has approved rather than rejected.
 
+- **A query-coverage term** — how much of the question a candidate actually covers, via the new
+  `dedup.coverage`, at `COVERAGE_WEIGHT = 0.4` (§58). Neither view asks this: bm25 ranks by term
+  rarity, and the disjunctive fallback admits a row on a *single* shared word, so among fallback
+  results — two thirds of everything returned — nothing separated "matched one word of five" from
+  "matched four of five".
+
+  **Refused once and landed on the second measurement**, which is the harness working in both
+  directions. On the original 30-document corpus it moved one query and §54 refused it as within
+  noise, naming the condition that would change the answer. §55 built that corpus; re-measured,
+  the same term moves **five queries and worsens none**: recall@1 **0.6889 → 0.7556**, recall@3
+  **0.8444 → 0.8889**, MRR **0.7737 → 0.8163**, off-corpus silence unchanged at 1/20. One of the
+  five is the query §57's entity hop had regressed — the two changes repair each other.
+
+  0.4 is chosen from a **control run in which coverage cannot see the `keywords` column**, because
+  the fixture's keywords and its queries were written by the same person and a keyword-driven win
+  would be partly circular. That control gains +2 queries and peaks at the same 0.4. Everything the
+  shipped configuration adds beyond it is recorded as an upper bound, not a result.
+
 ### Measured and not shipped
 
-- **A query-coverage rerank**, the first thing the new harness was pointed at. Built, swept and
-  reverted; `docs/design_decisions.md` §54 records the numbers so nobody repeats it.
-  `dedup.jaccard` turned out to be the wrong function — its spread across the whole corpus for a
-  real query is **0.0000**, because dividing by the union punishes a memory for every word the
-  question did not contain. The asymmetric version, reading `content` *and* `keywords`, does work:
-  recall@3 0.850 → **0.900**, MRR 0.7750 → 0.7875, nothing regressed, off-corpus silence unchanged.
-  It was still refused: that is **one** query moving on a 20-query fixture, which is the same
-  "within noise of zero" that Gate 0 refused the semantic view on. Making the term decisive needs a
-  weight above `LEXICAL_WEIGHT`, which is a redesign of the ranking, not a term added to it.
+- **Replacing the fusion with coverage alone.** With both view weights zeroed — bm25 and the entity
+  graph serving only as candidate generation — coverage alone scores recall@1 **0.9111** against the
+  shipped fusion's 0.6889. Two thirds of that collapses (to 0.7111) when it cannot read keywords, so
+  the figure is inflated by exactly the circularity described above and is **not** evidence that the
+  fusion should go. It does say the views are better at finding candidates than at ordering them,
+  and that the ordering half of the design had never been compared against a trivial baseline. §58
+  records why the next thing `localmem eval` needs is a corpus whose keywords were written without
+  sight of the queries — until that exists, §34's own keyword column weight rests on the same
+  circularity.
 
 ### Measured and found not to be a defect
 

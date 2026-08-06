@@ -236,6 +236,27 @@ def jaccard(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(union)
 
 
+def coverage(query: str, text: str) -> float:
+    """Return the share of ``query``'s tokens that ``text`` contains, in ``[0.0, 1.0]``.
+
+    Deliberately **asymmetric**, which is what separates it from :func:`jaccard`. Jaccard
+    divides by the union, so a long memory is penalized for every word the question did
+    not ask about — and a stored memory is typically several times the length of the
+    question, so that denominator swamps the signal. Measured on the eval fixture: across
+    all documents the Jaccard spread for a real query was **0.0000**, separating nothing.
+
+    The question this answers is "how much of what was asked does this row cover", which
+    the fused ranking cannot otherwise ask: bm25 ranks by term rarity, and the disjunctive
+    fallback admits a row on a *single* shared word.
+
+    An empty query covers nothing and returns 0.0 rather than dividing by zero.
+    """
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return 0.0
+    return len(query_tokens & tokenize(text)) / len(query_tokens)
+
+
 def top_terms(content: str, limit: int = TIER2_TOP_TERMS) -> list[str]:
     """Return the ``limit`` most frequent non-stopword tokens of ``content``.
 
