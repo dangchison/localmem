@@ -964,6 +964,37 @@ machine-readable output — `before_tokens`, `after_tokens`, `saved_tokens`, `sa
 
 ---
 
+## Measuring recall quality
+
+`localmem benchmark` measures what memory *costs*. `localmem eval` measures whether it *works*:
+
+```bash
+localmem eval          # a table
+localmem eval --json   # one object, for a script
+```
+
+It builds a throwaway database, writes a shipped bilingual fixture through the ordinary write
+path, asks every query through the ordinary recall path, and reports:
+
+- **recall@1/3/5** and **MRR** over queries whose answer is stored;
+- **off-corpus silent** — how many queries whose answer is *not* stored correctly returned
+  nothing. A retrieval change that lifts recall by getting noisier shows up here and nowhere
+  else;
+- **answered by** — which view produced each ranking. This states what the run is evidence
+  about. On the shipped fixture the answer is uncomfortable and worth knowing: 44 of 65 queries
+  are answered by the OR fallback, and only 3 by the conjunctive lexical view on its own.
+
+Your own database is never opened. The numbers are ranks, not bm25 scores, so they mean the same
+thing on another machine. `--fixture PATH` runs your own corpus in the same format.
+
+The current baseline is pinned in `tests/fixtures/eval/baseline.json` and the suite fails if it
+moves in *either* direction — an unexplained improvement is as much a hole in the record as a
+regression. Rewrite it deliberately with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`
+and put the diff in your changelog entry. Full rationale, including what the gate provably cannot
+catch: [`docs/design_decisions.md`](docs/design_decisions.md) §53.
+
+---
+
 ## Migrating from instruction files
 
 Short version:
@@ -1029,6 +1060,13 @@ behaviour of v0.5.0, not speculation.
 
    A query that shares no word with a memory *and* no keyword with it still will not find it.
    Embeddings were prototyped for this and rejected on measurement — see [Roadmap](#roadmap).
+
+   You can now re-run all of this yourself: `localmem eval` measures recall@1/3/5, MRR and
+   off-corpus silence against a shipped bilingual fixture, through the real read path. Its first
+   run says the quiet part out loud: of 65 queries, **44 are answered by the OR fallback**, and
+   the conjunctive lexical view answers only the short code-shaped ones. On natural-language
+   prose the primary path answers nothing at all — keywords and the fallback are not a mitigation
+   of the lexical limit so much as the thing actually doing the work.
 2. **Entity extraction is regex-based and language-naive.** No model, no dictionary. It
    recognizes URLs, @-mentions, file paths, quoted strings, CamelCase, snake_case and
    ALL-CAPS runs — and it cannot tell a real acronym from shouty prose, so `THIS IS URGENT`
@@ -1216,7 +1254,8 @@ Recorded, not implemented.
   The blocker was quality, not plumbing: across the same 14 pairs no similarity threshold
   separated signal from noise, so the model would have cost 1 GB and still needed a human to
   judge each hit. Keywords cost ~30 write-time tokens and beat it. Revisit only with a
-  measurement that clears that bar.
+  measurement that clears that bar — and there is finally an instrument for it: `localmem eval`,
+  whose off-corpus-silence column is exactly the number the semantic view failed on.
 - **v0.5** — **delivered**: the two capture gates, `gc --prune-traces N`, and `audit`'s
   seventh section. **v0.5.1** is the first release driven by installing the tool rather than
   testing it — both of its fixes are things a working suite could not have found. Agent
@@ -1227,6 +1266,13 @@ Recorded, not implemented.
   synthetic fixture, and the first real traces suggest the 80-character floor is the weaker
   of the two — a conversational reply that teaches nothing is easily longer than that. The
   similarity histogram in `audit` is there to re-derive both from real data.
+- **next** — **unreleased, on `main`**: `localmem eval`, an in-repo retrieval-quality harness with a
+  pinned baseline, so that every later change to ranking is measurable instead of argued. It
+  exists to unblock the rest of this list — nothing below should be attempted without a
+  before/after table from it. **Still open**: the fixture is synthetic and 30 documents wide,
+  so it under-samples the tail; and it does not yet exercise any query where *both* retrieval
+  views return candidates, which is the only condition under which the fusion weights change a
+  ranking at all. The report states that limitation itself rather than hiding it.
 - **v2** — streamable HTTP transport plus an auth token, which is what ChatGPT and other
   remote connectors need, shipped with explicit security documentation.
 - **CI** — a weekly job that would have caught the `mcp` 2.x API break early, plus the test

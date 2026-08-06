@@ -1,0 +1,714 @@
+{
+  "fixture": "bilingual-v1",
+  "fixture_version": 1,
+  "positive_queries": 45,
+  "negative_queries": 20,
+  "recall": {
+    "@1": 0.7556,
+    "@3": 0.8889,
+    "@5": 0.9333
+  },
+  "mrr": 0.8163,
+  "off_corpus_silent": 1,
+  "answered_by": {
+    "both": 9,
+    "lexical": 3,
+    "relational": 8,
+    "fallback": 44,
+    "none": 1
+  },
+  "queries": {
+    "q-upload": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-multipart",
+        "doc-sentry-scope",
+        "doc-api-500",
+        "doc-upload-s3"
+      ]
+    },
+    "q-deploy-slow": {
+      "first_gold_rank": 3,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-migration",
+        "doc-deploy-new",
+        "doc-ci-cache",
+        "doc-email-queue",
+        "doc-cors"
+      ]
+    },
+    "q-migration-prod": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-migration",
+        "doc-oauth-refresh",
+        "doc-pagination",
+        "doc-index-missing",
+        "doc-staging-data"
+      ]
+    },
+    "q-logout": {
+      "first_gold_rank": 5,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-build-or-match",
+        "doc-index-missing",
+        "doc-tailwind",
+        "doc-multipart",
+        "doc-jwt-expiry"
+      ]
+    },
+    "q-report-slow": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-db-pool",
+        "doc-email-queue",
+        "doc-core-cap",
+        "doc-fts-tokenizer",
+        "doc-deploy-new"
+      ]
+    },
+    "q-install": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-pnpm",
+        "doc-schema-version",
+        "doc-db-pool",
+        "doc-cors",
+        "doc-migration"
+      ]
+    },
+    "q-duplicate-order": {
+      "first_gold_rank": 3,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-dir-perm",
+        "doc-log-pii",
+        "doc-idempotency",
+        "doc-tailwind",
+        "doc-normalize-hash"
+      ]
+    },
+    "q-cors": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-email-queue",
+        "doc-rate-limit"
+      ]
+    },
+    "q-429": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-rate-limit",
+        "doc-validate-workspace",
+        "doc-build-or-match",
+        "doc-match-empty",
+        "doc-frozen-payload"
+      ]
+    },
+    "q-realtime": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-websocket",
+        "doc-db-pool",
+        "doc-worker-leak",
+        "doc-write-tx",
+        "doc-match-empty"
+      ]
+    },
+    "q-secret": {
+      "first_gold_rank": 3,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-open-database",
+        "doc-idempotency",
+        "doc-env-secret",
+        "doc-match-empty",
+        "doc-n1-query"
+      ]
+    },
+    "q-flaky": {
+      "first_gold_rank": 3,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-db-pool",
+        "doc-match-empty",
+        "doc-flaky-clock",
+        "doc-mobile-viewport"
+      ]
+    },
+    "q-mobile": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-mobile-viewport",
+        "doc-log-pii",
+        "doc-deploy-new",
+        "doc-node-new",
+        "doc-staging-data"
+      ]
+    },
+    "q-timezone": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-mobile-viewport",
+        "doc-timezone"
+      ]
+    },
+    "q-match-empty": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-match-empty"
+      ]
+    },
+    "q-tokenizer": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-fts-tokenizer",
+        "doc-fts-about",
+        "doc-fts-rebuild"
+      ]
+    },
+    "q-write-tx": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-write-tx",
+        "doc-index-about",
+        "doc-index-cap"
+      ]
+    },
+    "q-db-path": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-db-path",
+        "doc-timezone"
+      ]
+    },
+    "q-payload": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-frozen-payload"
+      ]
+    },
+    "q-schema-version": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-schema-version"
+      ]
+    },
+    "q-off-backup": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-prune-traces",
+        "doc-db-pool",
+        "doc-deploy-new",
+        "doc-jwt-expiry",
+        "doc-normalize-hash"
+      ]
+    },
+    "q-off-unknown-fn": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-sentry-scope",
+        "doc-api-500",
+        "doc-schema-version",
+        "doc-cors",
+        "doc-oauth-refresh"
+      ]
+    },
+    "q-off-unknown-file": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-timezone",
+        "doc-schema-version",
+        "doc-fts-rebuild",
+        "doc-index-cap",
+        "doc-db-path"
+      ]
+    },
+    "q-off-profile": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-api-500",
+        "doc-naming",
+        "doc-deploy-new",
+        "doc-git-rebase",
+        "doc-pagination"
+      ]
+    },
+    "q-off-k8s": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-tailwind",
+        "doc-match-empty"
+      ]
+    },
+    "q-off-mlversion": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-naming",
+        "doc-oauth-refresh",
+        "doc-cors",
+        "doc-migration",
+        "doc-schema-version"
+      ]
+    },
+    "q-off-email": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-email-queue",
+        "doc-log-pii",
+        "doc-index-about",
+        "doc-ci-cache",
+        "doc-core-cap"
+      ]
+    },
+    "q-off-redis": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-soft-delete",
+        "doc-cache-invalidate",
+        "doc-cron-overlap",
+        "doc-cors",
+        "doc-git-rebase"
+      ]
+    },
+    "q-off-aws-cost": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-upload-s3",
+        "doc-flaky-clock",
+        "doc-node-new",
+        "doc-pnpm",
+        "doc-fts-rebuild"
+      ]
+    },
+    "q-off-terraform": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-naming",
+        "doc-soft-delete",
+        "doc-index-missing",
+        "doc-queue-dlq",
+        "doc-normalize-hash"
+      ]
+    },
+    "q-off-seo": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-n1-query",
+        "doc-resolve-db-path",
+        "doc-cache-invalidate",
+        "doc-validate-workspace",
+        "doc-deploy-new"
+      ]
+    },
+    "q-off-grafana": {
+      "first_gold_rank": null,
+      "silent": true,
+      "answered_by": "none",
+      "returned": []
+    },
+    "q-refresh-401": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-oauth-refresh",
+        "doc-jwt-expiry",
+        "doc-i18n",
+        "doc-websocket",
+        "doc-write-tx"
+      ]
+    },
+    "q-pagination": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-index-cap",
+        "doc-cache-invalidate",
+        "doc-upload-s3",
+        "doc-normalize-hash",
+        "doc-email-queue"
+      ]
+    },
+    "q-double-count": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-soft-delete",
+        "doc-api-500",
+        "doc-pagination"
+      ]
+    },
+    "q-flag-leak": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-feature-flag",
+        "doc-cors",
+        "doc-sentry-scope",
+        "doc-migration",
+        "doc-oauth-refresh"
+      ]
+    },
+    "q-failed-job": {
+      "first_gold_rank": 5,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-open-database",
+        "doc-i18n",
+        "doc-sentry-scope",
+        "doc-api-500",
+        "doc-queue-dlq"
+      ]
+    },
+    "q-stale-price": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-cache-invalidate",
+        "doc-mobile-viewport",
+        "doc-fts-tokenizer",
+        "doc-core-cap",
+        "doc-sentry-scope"
+      ]
+    },
+    "q-big-upload": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-upload-s3",
+        "doc-i18n",
+        "doc-api-500",
+        "doc-fts-about",
+        "doc-email-queue"
+      ]
+    },
+    "q-log-privacy": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-log-pii",
+        "doc-fts-tokenizer",
+        "doc-email-queue",
+        "doc-fts-about",
+        "doc-db-path"
+      ]
+    },
+    "q-conn-refused": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "lexical",
+      "returned": [
+        "doc-db-pool"
+      ]
+    },
+    "q-cron-overlap": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "lexical",
+      "returned": [
+        "doc-cron-overlap"
+      ]
+    },
+    "q-hardcode-string": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-i18n",
+        "doc-fts-tokenizer",
+        "doc-timezone",
+        "doc-db-path",
+        "doc-index-about"
+      ]
+    },
+    "q-money-type": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-money-decimal",
+        "doc-timezone",
+        "doc-staging-data",
+        "doc-normalize-hash",
+        "doc-index-cap"
+      ]
+    },
+    "q-api-hang-mail": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational",
+      "returned": [
+        "doc-email-queue",
+        "doc-rate-limit"
+      ]
+    },
+    "q-resolve-path": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-resolve-db-path"
+      ]
+    },
+    "q-or-match": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-build-or-match"
+      ]
+    },
+    "q-open-db-perm": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-open-database",
+        "doc-dir-perm"
+      ]
+    },
+    "q-validate-ws": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-validate-workspace"
+      ]
+    },
+    "q-prune-entity": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-prune-traces"
+      ]
+    },
+    "q-core-token": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-core-cap"
+      ]
+    },
+    "q-normalize-hash": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "lexical",
+      "returned": [
+        "doc-normalize-hash"
+      ]
+    },
+    "q-node-version": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-node-new",
+        "doc-schema-version",
+        "doc-jwt-expiry",
+        "doc-index-about",
+        "doc-deploy-new"
+      ]
+    },
+    "q-deploy-how": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-deploy-new",
+        "doc-upload-s3",
+        "doc-cron-overlap",
+        "doc-schema-version",
+        "doc-worker-leak"
+      ]
+    },
+    "q-disagree-perm": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-dir-perm",
+        "doc-open-database"
+      ]
+    },
+    "q-disagree-fts": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-fts-rebuild",
+        "doc-fts-tokenizer",
+        "doc-fts-about"
+      ]
+    },
+    "q-disagree-entity-cap": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "both",
+      "returned": [
+        "doc-write-tx",
+        "doc-index-cap",
+        "doc-index-about"
+      ]
+    },
+    "q-off-rollback": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-schema-version",
+        "doc-deploy-new",
+        "doc-node-new",
+        "doc-staging-data",
+        "doc-fts-rebuild"
+      ]
+    },
+    "q-off-dns": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-staging-data",
+        "doc-api-500",
+        "doc-git-rebase",
+        "doc-pagination",
+        "doc-oauth-refresh"
+      ]
+    },
+    "q-off-apm-cost": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-log-pii",
+        "doc-core-cap",
+        "doc-validate-workspace",
+        "doc-build-or-match",
+        "doc-prune-traces"
+      ]
+    },
+    "q-off-unknown-report": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-sentry-scope",
+        "doc-api-500",
+        "doc-mobile-viewport",
+        "doc-open-database",
+        "doc-timezone"
+      ]
+    },
+    "q-off-kafka": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-api-500",
+        "doc-git-rebase",
+        "doc-pagination",
+        "doc-oauth-refresh",
+        "doc-dockerfile"
+      ]
+    },
+    "q-off-sso": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-tailwind",
+        "doc-dir-perm",
+        "doc-fts-rebuild",
+        "doc-match-empty"
+      ]
+    },
+    "q-off-mongo-shard": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-soft-delete",
+        "doc-index-missing",
+        "doc-queue-dlq",
+        "doc-normalize-hash"
+      ]
+    },
+    "q-off-bundle": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback",
+      "returned": [
+        "doc-resolve-db-path",
+        "doc-multipart"
+      ]
+    }
+  }
+}

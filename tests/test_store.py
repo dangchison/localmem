@@ -986,6 +986,7 @@ def test_cli_exposes_exactly_the_expected_commands() -> None:
         "backfill",
         "benchmark",
         "dedupe",
+        "eval",
         "export",
         "forget",
         "gc",

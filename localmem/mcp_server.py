@@ -64,6 +64,11 @@ ALL_WORKSPACES = "all"
 # itself rather than wait for a human to reclassify a note. It carries no extra
 # authority — a lesson is pulled by a recall like any other row, unlike `core`, which is
 # pushed into every session and therefore stays human-only.
+#
+# The CLI's counterpart is :data:`localmem.cli._KIND_CHOICES`, and the two are
+# deliberately *not* shared: this list is a security boundary and that one is a UI. They
+# differ by `core` only, for the reason stated just below. Adding a kind means editing
+# both — decide, for the new kind, whether an agent may write it.
 ADD_KINDS = ("note", "trace", "lesson")
 
 # Core memory is a *push* tier: every recall loads it, in every session. An agent acting on

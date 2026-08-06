@@ -6,9 +6,9 @@ Implements the original spec §5. The pipeline is pure code — no model, no net
 2. **view A**, lexical: bm25 over ``memories_fts``, workspace-filtered, top 20;
    a *named* workspace also reads the shared ``global`` tier (§24 of the design
    decisions); ``None`` ("every workspace") and ``"global"`` itself are unchanged;
-3. **view B**, relational: memories sharing an entity with the query, scored by Σweight;
-   with both views empty, view A is retried as a disjunction and its rows are marked
-   ``from_fallback``;
+3. **view B**, relational: memories sharing an entity with the query, scored by Σweight,
+   widened by one hop across the entity graph at a damped weight (§57); with both views
+   empty, view A is retried as a disjunction and its rows are marked ``from_fallback``;
 4. fuse — each view min-max normalized independently, then weighted;
 5. recency and ``seen_count`` boosts, then the supersede penalty;
 6. evidence closure — up to two neighbors per result, a superseded row's replacement
@@ -29,7 +29,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from localmem import core_memory, indexer, store
+from localmem import core_memory, dedup, indexer, store
 from localmem.config import validate_workspace
 
 #: Set this to any non-empty value and a recall performs no write at all. The check is
@@ -76,6 +76,62 @@ LEXICAL_WEIGHT = 0.6
 RELATIONAL_WEIGHT = 0.4
 LEXICAL_WEIGHT_ON_ENTITY_HIT = 0.4
 RELATIONAL_WEIGHT_ON_ENTITY_HIT = 0.6
+
+#: How much a memory reached only through a *co-occurring* entity is worth, relative to
+#: one carrying a query entity directly. Zero disables the hop entirely and
+#: :func:`_relational_view` is arithmetically what it was before it existed.
+#:
+#: The idea is the LLM-free answer to the gap Gate 0 was meant to close: a question about
+#: `build_match_expression` should reach the memory about `memories_fts` it always appears
+#: beside, without either text sharing a word with the question. It is also the highest
+#: leak risk of anything measured here — every hop widens the candidate set, and
+#: ``localmem eval``'s off-corpus-silence column is what stops that being paid for
+#: silently (``docs/design_decisions.md`` §57).
+#:
+#: Measured, not chosen: swept over 0.1 / 0.25 / 0.5 against limits 3 / 5 / 10, everything
+#: from 0.25 upward gives the identical result — recall@1 0.667 → 0.689, MRR 0.7552 →
+#: 0.7737, four queries better and one worse, and **not one** off-corpus query changing
+#: even its first result. A flat plateau two steps wide on both axes is a very different
+#: object from a peak, and 0.25 is the least aggressive point on it.
+ENTITY_EXPANSION_DAMPING = 0.25
+
+#: How many co-occurring entities one hop may add. The graph is dense — a memory may carry
+#: up to :data:`localmem.indexer.MAX_ENTITIES_PER_MEMORY` links — so an uncapped hop
+#: reaches most of a personal corpus and stops discriminating at all.
+ENTITY_EXPANSION_LIMIT = 5
+
+#: Weight of the query-coverage term: how much of the question a candidate actually
+#: covers, via :func:`localmem.dedup.coverage` over both FTS5-indexed columns.
+#:
+#: Neither view asks this. bm25 ranks by term rarity, and the disjunctive fallback (§35)
+#: admits a row on a **single** shared word — so among fallback results, which are two
+#: thirds of everything this system returns, nothing distinguishes "matched one word of
+#: five" from "matched four of five".
+#:
+#: **Refused once, at 0.0, and landed on the second measurement** — the history is §54
+#: and §58, and it is the clearest thing the eval harness has done. On the 30-document
+#: corpus this term moved one query and was refused for being within noise. On the widened
+#: corpus (§55) it moves five, worsens none, and leaves off-corpus silence at 1/20.
+#:
+#: **0.4 comes from the control, not from the headline.** Coverage reads ``keywords``,
+#: which is right — a memory found only through its keywords must not be scored as
+#: covering nothing — but those keywords were written by the same person as the fixture's
+#: queries, so a keyword-driven win is partly circular. The weight is therefore chosen
+#: from the run where coverage cannot see keywords at all: that control peaks at 0.4
+#: (recall@1 0.6889 → 0.7333, two queries better and none worse) and is flat-to-worse
+#: above it. What the
+#: shipped configuration then adds on top — recall@1 0.7556, +5 queries — is real but is
+#: an upper bound this fixture cannot fully validate.
+#:
+#: **Raw, deliberately not min-max normalized.** Every other signal here is a rank score
+#: with no absolute meaning and must be scaled against its own view. Coverage is already
+#: an absolute fraction; :func:`_min_max` would force the weakest candidate to 0.0 and a
+#: lone candidate to 1.0, turning "covers a fifth of the question" into "perfect match".
+#:
+#: Jaccard was the obvious primitive and is the wrong one: dividing by the union punishes
+#: a memory for every word the question did not contain, and its measured spread across
+#: the whole corpus for a real query was **0.0000** (§54).
+COVERAGE_WEIGHT = 0.4
 
 RECENCY_WEIGHT = 0.05
 # The original spec §5 step 1: a query that asks for recent things gets a much heavier recency term.
@@ -160,6 +216,7 @@ SELECT m.id         AS id,
        m.source     AS source,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
+       m.keywords   AS keywords,
        m.created_at AS created_at,
        m.superseded_by AS superseded_by,
        -bm25(memories_fts, ?, ?) AS score
@@ -179,6 +236,7 @@ SELECT m.id         AS id,
        m.source     AS source,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
+       m.keywords   AS keywords,
        m.created_at AS created_at,
        m.superseded_by AS superseded_by
   FROM memories AS m
@@ -195,6 +253,7 @@ SELECT m.id         AS id,
        m.source     AS source,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
+       m.keywords   AS keywords,
        m.created_at AS created_at,
        m.superseded_by AS superseded_by,
        SUM(me.weight) AS score
@@ -205,6 +264,22 @@ SELECT m.id         AS id,
 """
 
 _RELATIONAL_ORDER_BY = " GROUP BY m.id ORDER BY score DESC, m.id DESC LIMIT ?"
+
+# One hop across the entity graph: entities that share a memory with a query entity,
+# ranked by how strongly they co-occur. `{placeholders}` and `{excluded}` are filled with
+# one `?` per entity, never with a name.
+_CO_ENTITY_SQL = """
+SELECT e2.norm_name AS norm_name, SUM(me1.weight * me2.weight) AS affinity
+  FROM entities AS e1
+  JOIN memory_entities AS me1 ON me1.entity_id = e1.id
+  JOIN memory_entities AS me2 ON me2.memory_id = me1.memory_id
+  JOIN entities AS e2 ON e2.id = me2.entity_id
+  JOIN memories AS m ON m.id = me1.memory_id
+ WHERE e1.norm_name IN ({placeholders})
+   AND e2.norm_name NOT IN ({excluded})
+"""
+
+_CO_ENTITY_ORDER_BY = " GROUP BY e2.norm_name ORDER BY affinity DESC, e2.norm_name ASC LIMIT ?"
 
 _SESSION_NEIGHBOR_SQL = """
 SELECT m.id AS id, m.content AS content
@@ -320,6 +395,7 @@ class _Row:
     source: str | None
     seen_count: int
     session_id: str | None
+    keywords: str | None
     created_at: str
     superseded_by: int | None
 
@@ -395,7 +471,7 @@ def retrieve(
         relational = _relational_view(conn, query_entities(query), scope)
         if not lexical.memories and not relational.scores:
             lexical, fallback = _fallback_view(conn, lexical_text, scope)
-        top = _fuse(lexical, relational, moment, recency_weight, scope)[:k]
+        top = _fuse(lexical, relational, moment, recency_weight, scope, lexical_text)[:k]
 
     selected = {scored.row.id for scored in top}
     results = tuple(
@@ -565,7 +641,32 @@ def _fallback_view(
 def _relational_view(
     conn: sqlite3.Connection, entity_names: list[str], workspace: str | None
 ) -> _View:
-    """View B: memories sharing an entity with the query, scored by Σ of link weights."""
+    """View B: memories sharing an entity with the query, scored by Σ of link weights.
+
+    With :data:`ENTITY_EXPANSION_DAMPING` above zero the query's entities are first
+    widened by one hop — see :func:`_co_occurring_entities` — and the memories reached
+    only through that hop are folded in at the damped weight. The two passes are separate
+    queries merged in Python rather than one query with per-entity multipliers, so no SQL
+    is composed from Python values.
+    """
+    direct = _entity_view(conn, entity_names, workspace)
+    if not ENTITY_EXPANSION_DAMPING or not entity_names:
+        return direct
+    expanded = _co_occurring_entities(conn, entity_names, workspace)
+    if not expanded:
+        return direct
+    indirect = _entity_view(conn, expanded, workspace)
+    memories = {**indirect.memories, **direct.memories}
+    scores = dict(indirect.scores)
+    for memory_id in scores:
+        scores[memory_id] *= ENTITY_EXPANSION_DAMPING
+    for memory_id, score in direct.scores.items():
+        scores[memory_id] = scores.get(memory_id, 0.0) + score
+    return _View(memories, scores)
+
+
+def _entity_view(conn: sqlite3.Connection, entity_names: list[str], workspace: str | None) -> _View:
+    """Memories carrying any of ``entity_names``, scored by Σ of their link weights."""
     if not entity_names:
         # `IN ()` is a syntax error in SQLite, and a query with no entities has no
         # relational view to build anyway.
@@ -579,6 +680,28 @@ def _relational_view(
         params.extend(scope)
     params.append(CANDIDATE_LIMIT)
     return _read_view(conn, sql + _RELATIONAL_ORDER_BY, params)
+
+
+def _co_occurring_entities(
+    conn: sqlite3.Connection, entity_names: list[str], workspace: str | None
+) -> list[str]:
+    """Return up to :data:`ENTITY_EXPANSION_LIMIT` entities one hop from ``entity_names``.
+
+    Ranked by Σ of the product of the two link weights over the memories they share, so an
+    entity that is central to a memory the query's entity also dominates outranks one that
+    merely appears in the same paragraph. Query entities themselves are excluded — they
+    are already the direct pass.
+    """
+    predicate, scope = _workspace_scope(workspace)
+    marks = ", ".join("?" for _ in entity_names)
+    sql = _CO_ENTITY_SQL.format(placeholders=marks, excluded=marks)
+    params: list[object] = [*entity_names, *entity_names]
+    if predicate:
+        sql += " AND " + predicate
+        params.extend(scope)
+    params.append(ENTITY_EXPANSION_LIMIT)
+    rows = conn.execute(sql + _CO_ENTITY_ORDER_BY, params).fetchall()
+    return [str(row["norm_name"]) for row in rows]
 
 
 def _recent_view(
@@ -671,6 +794,7 @@ def _to_row(row: sqlite3.Row) -> _Row:
         source=row["source"],
         seen_count=int(row["seen_count"]),
         session_id=row["session_id"],
+        keywords=row["keywords"],
         created_at=row["created_at"],
         superseded_by=None if row["superseded_by"] is None else int(row["superseded_by"]),
     )
@@ -682,6 +806,7 @@ def _fuse(
     now: datetime,
     recency_weight: float,
     workspace: str | None = None,
+    query: str = "",
 ) -> list[_Scored]:
     """Combine both views into one ranking, best first.
 
@@ -729,6 +854,8 @@ def _fuse(
         relational_score = normalized_relational.get(memory_id)
         fused = weights[0] * (lexical_score if lexical_score is not None else 0.0)
         fused += weights[1] * (relational_score if relational_score is not None else 0.0)
+        if COVERAGE_WEIGHT and query:
+            fused += COVERAGE_WEIGHT * dedup.coverage(query, _searchable_text(row))
         fused += recency_boost(row.created_at, now, recency_weight)
         fused += seen_count_boost(row.seen_count)
         if row.superseded_by is not None:
@@ -788,6 +915,11 @@ def _cap_superseded(penalized: dict[int, float], links: dict[int, int | None]) -
                 score = min(score, final[replacement] * SUPERSEDED_SCORE_PENALTY)
             final[memory_id] = score
     return final
+
+
+def _searchable_text(row: _Row) -> str:
+    """Return both FTS5-indexed columns joined, so the term sees what could have matched."""
+    return row.content if not row.keywords else f"{row.content} {row.keywords}"
 
 
 def _min_max(scores: dict[int, float]) -> dict[int, float]:

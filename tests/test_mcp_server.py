@@ -54,6 +54,7 @@ CLI_COMMANDS = {
     "backfill",
     "benchmark",
     "dedupe",
+    "eval",
     "export",
     "forget",
     "gc",

@@ -364,6 +364,7 @@ def test_cli_command_set() -> None:
         "backfill",
         "benchmark",
         "dedupe",
+        "eval",
         "export",
         "forget",
         "gc",

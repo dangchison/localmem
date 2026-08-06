@@ -5,6 +5,106 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`localmem eval` — retrieval quality is now a number this repo can produce.** Every threshold in
+  the project was fitted against a fixture that lived in a scratchpad and was deleted with it, so
+  no change to ranking has been measurable since. The new command builds a throwaway database,
+  writes a versioned bilingual fixture (`localmem/evaldata/bilingual_v1.json`) through
+  `store.add_memory`, asks every query through
+  `retriever.retrieve`, and reports recall@1/3/5, MRR and how many off-corpus queries stayed
+  silent. Production paths only — nothing is re-implemented. The user's own database is never
+  opened. `tests/fixtures/eval/baseline.json` pins the result and
+  `test_bundled_fixture_matches_the_recorded_baseline` fails on **any** movement, up or down;
+  rewrite it with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`.
+
+  Corpus: 59 documents, 45 graded queries, 20 off-corpus. First recorded at recall@1 **0.6667**,
+  MRR **0.7552**; **0.7556 / 0.8163** as of the two retrieval changes below, with off-corpus silence
+  unmoved at **1/20** throughout. `answered_by` is `both 9, lexical 3, relational 8, fallback 44,
+  none 1`.
+
+  Two findings came straight out of it and are recorded in `docs/design_decisions.md` §53:
+
+  - **The conjunctive lexical view answers no natural-language query at all.** The disjunctive
+    fallback does two thirds of the work; the primary path only ever answers short code-shaped
+    queries, because a multi-word question needs every token in one document and prose never
+    satisfies that.
+  - **The fusion weights are invisible to any rank-based metric unless both views fire.** With
+    one view empty its weight multiplies zeros and the other is a constant factor. The first
+    30-document corpus had no query engaging both views, so four ranking constants were
+    unmeasurable; §55 records widening the corpus until all eight are caught under perturbation.
+    The report still prints `answered_by` and warns when `both` is 0.
+
+### Changed — retrieval
+
+- **One damped hop across the entity graph** (`docs/design_decisions.md` §57). View B previously
+  asked one question: which memories carry an entity the query names. It now also asks which
+  entities *co-occur* with those, and folds the memories carrying them in at
+  `ENTITY_EXPANSION_DAMPING = 0.25`. A query for `config_loader` can now reach a memory about
+  `cache_warmer` that shares no word with it, because some third memory mentions both — the shape
+  of retrieval Gate 0 wanted embeddings for, reached with two SQL statements and no model.
+
+  recall@1 **0.6667 → 0.6889**, MRR **0.7552 → 0.7737**, four queries better and one worse, and
+  off-corpus silence **unchanged at 1/20** with not one off-corpus query changing even its first
+  result. Both constants come from a sweep whose results are identical from damping 0.25 upward
+  across limits 3/5/10 — a plateau, not a peak. The one regression is named in §57 rather than
+  tuned away.
+
+  This is the first change to the ranking that `localmem eval` has approved rather than rejected.
+
+- **A query-coverage term** — how much of the question a candidate actually covers, via the new
+  `dedup.coverage`, at `COVERAGE_WEIGHT = 0.4` (§58). Neither view asks this: bm25 ranks by term
+  rarity, and the disjunctive fallback admits a row on a *single* shared word, so among fallback
+  results — two thirds of everything returned — nothing separated "matched one word of five" from
+  "matched four of five".
+
+  **Refused once and landed on the second measurement**, which is the harness working in both
+  directions. On the original 30-document corpus it moved one query and §54 refused it as within
+  noise, naming the condition that would change the answer. §55 built that corpus; re-measured,
+  the same term moves **five queries and worsens none**: recall@1 **0.6889 → 0.7556**, recall@3
+  **0.8444 → 0.8889**, MRR **0.7737 → 0.8163**, off-corpus silence unchanged at 1/20. One of the
+  five is the query §57's entity hop had regressed — the two changes repair each other.
+
+  0.4 is chosen from a **control run in which coverage cannot see the `keywords` column**, because
+  the fixture's keywords and its queries were written by the same person and a keyword-driven win
+  would be partly circular. That control gains +2 queries and peaks at the same 0.4. Everything the
+  shipped configuration adds beyond it is recorded as an upper bound, not a result.
+
+### Measured and not shipped
+
+- **Replacing the fusion with coverage alone.** With both view weights zeroed — bm25 and the entity
+  graph serving only as candidate generation — coverage alone scores recall@1 **0.9111** against the
+  shipped fusion's 0.6889. Two thirds of that collapses (to 0.7111) when it cannot read keywords, so
+  the figure is inflated by exactly the circularity described above and is **not** evidence that the
+  fusion should go. It does say the views are better at finding candidates than at ordering them,
+  and that the ordering half of the design had never been compared against a trivial baseline. §58
+  records why the next thing `localmem eval` needs is a corpus whose keywords were written without
+  sight of the queries — until that exists, §34's own keyword column weight rests on the same
+  circularity.
+
+### Measured and found not to be a defect
+
+- **The English-only `dedup._STOPWORDS` was reported as narrowing Vietnamese near-duplicate
+  candidate generation. It does not.** Measured through `nearest_neighbour` on a 57-row corpus with
+  five independently-written Vietnamese restatement pairs: candidate recall is **5/5 with and
+  without** ~70 added Vietnamese function words, identical to four decimals, and unchanged when
+  `TIER2_MAX_CANDIDATES` and `TIER2_TOP_TERMS` are swept. bm25 already discounts a term that appears
+  in most rows, so the "wasted" slots were being ignored anyway. The original claim was made from
+  reading `top_terms` output instead of measuring behaviour (§56).
+- **What the same measurement did find:** `CAPTURE_JACCARD_THRESHOLD = 0.25` fires on only **1 of 5**
+  independently-written Vietnamese restatements, which score 0.158–0.273 — against the 0.314 minimum
+  recorded in `gate-d-capture.md`. The separating band against novel traces narrows from 0.174 to
+  **0.047**. Not enough to justify a new constant; enough to say the current one is looser than its
+  founding measurement claims.
+
+### Changed
+
+- `localmem.cli._KIND_CHOICES` and `localmem.mcp_server.ADD_KINDS` now name each other in comments.
+  They stay separate lists — one is a security boundary, the other a UI — but adding a kind means
+  editing both, and nothing said so.
+
 ## [0.5.1] — 2026-08-06
 
 A bugfix release, and both bugs were found the same way: by installing v0.5.0 for real on a

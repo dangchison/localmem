@@ -2102,3 +2102,451 @@ INSERT INTO memories_fts(memories_fts) VALUES('integrity-check');
 
 afterwards. It is the only check that sees it, and `PRAGMA foreign_key_check` is asserted clean
 alongside it.
+
+## 53. Retrieval quality is measured in-repo, and the measurement is pinned
+
+Every constant in this project is a recorded measurement. Until this change, none of the *retrieval*
+measurements were recorded anywhere the code could reach: the 14-pair bilingual set that chose the
+keyword column weight (§34), the fixture that chose the capture thresholds (§44, §45) and the 24-doc
+corpus that failed the semantic gate (`.corp/localmem-v1/gate0-v030-result.md`) all lived in a
+scratchpad and were deleted with it. What survived was prose. That is enough to explain a decision
+and not enough to re-run it, so every later change to ranking was, in practice, unmeasurable.
+
+`localmem eval` is the instrument. It builds a throwaway database, writes a versioned fixture
+through `store.add_memory` and asks every query through `retriever.retrieve` — the production paths,
+not a re-implementation, for the reason `audit._trace_similarity` gives: a number produced by a
+different path than the one it informs is worse than no number.
+
+**The fixture is new, and its baseline is not comparable to Gate 0's.** The original pairs are gone;
+`localmem/evaldata/bilingual_v1.json` rebuilds the same *shape* — Vietnamese and English, developer
+prose, 12 off-corpus queries whose answer is genuinely absent — from what the reports describe. Any
+sentence of the form "recall went from Gate 0's N to our M" would be false.
+
+**Metrics are rank-based, never raw scores.** bm25 magnitudes here sit around 1e-06 (§8) and carry
+no portable meaning; which document came back where does. That also makes the baseline survive a
+different SQLite build, up to tokenizer differences.
+
+**The baseline is an equality, in both directions.** A metric that moved *up* fails
+`test_bundled_fixture_matches_the_recorded_baseline` exactly as one that moved down, because an
+unexplained improvement is as much a hole in the record as a regression. Per-query ranks are pinned
+alongside the aggregates: on 20 positive queries one query is worth five points of recall, so two
+queries moving in opposite directions would leave every aggregate untouched. Rewrite it with
+`LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py` and put the diff in the CHANGELOG entry
+of whatever moved it.
+
+Two determinism traps had to be closed first, and both are properties of the system rather than of
+the harness. A recall bumps `recalled_count`, which feeds `seen_count_boost`, so with tracking left
+on the score of query *n* depends on queries 1..*n-1* — the runner sets `LOCALMEM_NO_TRACKING` for
+the duration. And recency is a live clock, so documents are backdated relative to a fixed
+`EVAL_EPOCH` that every retrieval is also measured against.
+
+### What the first run found, which is why `answered_by` is a reported metric
+
+On the bundled fixture, of 32 queries:
+
+| answered by | count |
+|---|---|
+| both views | **0** |
+| lexical only | 0 |
+| relational only | 7 |
+| OR fallback | 24 |
+| nothing | 1 |
+
+The conjunctive lexical view — the primary path, the one carrying `LEXICAL_WEIGHT = 0.6` — answers
+**no** natural-language query at all. A multi-word question requires every token to appear in one
+document, which developer prose essentially never satisfies. What actually answers is the
+disjunctive fallback (§35), on 24 of 32 queries, and the entity view on the 7 whose text carries a
+code-shaped token: an identifier, a file path, an acronym.
+
+This has a direct consequence for what the gate can catch. When one view is empty its weight
+multiplies a column of zeros and the other view's weight is a constant factor applied to every
+candidate — and no rank-based metric can see a monotone rescaling. **The fusion weights only change
+a ranking when both views return candidates.** On the first 30-document corpus that never happened,
+so the gate was measurably blind to them, and the report printed `answered_by` and said outright,
+when `both` was 0, that the run was not evidence about those weights. A blind spot that announces
+itself is a different object from one that does not.
+
+That corpus has since been widened deliberately to close the hole — see §55 — and the blind spot is
+now gone rather than merely declared.
+
+The off-corpus column is the other half of the measurement and reproduces Gate 0 §4 exactly:
+**1 of 12** off-corpus queries stays silent. `cấu hình kubernetes ingress` returns the tailwind note
+because both contain `cấu hình`. That is the OR fallback's known price, now a number that moves when
+someone changes it rather than a sentence in a report.
+
+## 54. A query-coverage rerank was measured and not shipped
+
+The first thing `localmem eval` (§53) was pointed at was its own most obvious follow-up: the
+fallback answers 24 of 32 queries, it admits a row on a *single* shared word, and bm25 then orders
+those rows by term rarity rather than by how much of the question they cover. Adding a coverage term
+to `_fuse` is cheap, LLM-free and needs no schema change. It was built, swept, and **reverted**.
+Recording why, because the idea will occur to the next person too.
+
+### Jaccard is the wrong function, and the measurement says so bluntly
+
+The obvious primitive is `dedup.jaccard`, already in the codebase and already sharing the capture
+gate's tokenizer. Swept at 0.05 → 0.8, it moved **zero** queries at every weight up to 0.2 and made
+one *worse* above 0.3.
+
+The reason is the denominator. Jaccard divides by the union, and a stored memory is roughly four
+times the length of the question, so every word the question did not ask about counts against the
+row that answers it. Measured on the query `sao deploy chậm thế` across all 30 documents: **the
+Jaccard spread was 0.0000** — it did not separate the corpus at all.
+
+`coverage(query, text) = |query ∩ text| / |query|` is the asymmetric version and is what the
+argument above actually described. It is not a refinement of Jaccard; it is a different question.
+
+### Coverage must see keywords, not just content
+
+`sao deploy chậm thế` has **zero** token overlap with its own answer, whose content is
+*"CI cache miss làm build lâu gấp đôi"*. The words `deploy` and `chậm` live in that row's
+`keywords` column — which is the whole point of §34, and the lever that took recall from 0/14 to
+11/14. A coverage term reading `content` alone is blind to the mechanism the system actually relies
+on and would score the correct row at 0.
+
+So the honest version reads both indexed columns. Offline, that version separated the gold row from
+the row blocking it in **5 of the 7** misranked queries, worsening none. That is the number that
+made this worth building.
+
+### It still did not clear the bar
+
+Through the real pipeline, at every weight from 0.1 to 1.0:
+
+| | baseline | coverage 0.2 | coverage 0.8 + VI stopwords |
+|---|---|---|---|
+| recall@1 | 0.650 | 0.650 | 0.700 |
+| recall@3 | 0.850 | **0.900** | **0.900** |
+| MRR | 0.7750 | 0.7875 | 0.8125 |
+| off-corpus silent | 1/12 | 1/12 | 1/12 |
+| queries improved / worsened | — | +1 / −0 | +1 / −0 |
+
+Nothing regressed, and the off-corpus column — the one that killed the semantic view — did not
+move. But **one** query improved, on a 20-query fixture, which is five points of recall bought by a
+single row changing places. §53 fixed the rule for this case in advance: a change counts as an
+improvement when at least two queries move the right way. This is the same "within noise of zero"
+that Gate 0 refused to ship on, and refusing it here as well is the only consistent answer.
+
+The gap between the offline prediction (5 fixes) and the measured result (1) is itself the finding:
+beating the row *directly above* the gold is not the same as beating every row above it, and the
+coverage term is competing against a min-max-normalized lexical score whose spread is the full
+`[0, 1]` interval. Making coverage decisive requires a weight of 0.8 — larger than `LEXICAL_WEIGHT`
+itself, i.e. a redesign of the ranking rather than a term added to it, justified by one query.
+
+**What would change the answer.** A fixture large enough that one query is not 5% of the sample, or
+a query band built specifically to isolate the fallback's ordering. Not a bigger weight.
+
+> **Verdict overturned — see §58.** Every number above was measured on the 30-document corpus. §55
+> widened it to 59 documents and 45 positive queries, which is exactly the "large enough" condition
+> this section names; re-measured there, the same term moves five queries and worsens none, and it
+> shipped at `COVERAGE_WEIGHT = 0.4`. This entry is left standing rather than rewritten because the
+> refusal was correct **on the evidence available at the time**, and because its two structural
+> findings — Jaccard's zero spread, and coverage being blind without the keywords column — do not
+> depend on the corpus size and are what made the second attempt work.
+
+### One *apparent* defect found on the way — measured in §56, and it is not one
+
+`_STOPWORDS` is **English only**, and `top_terms` — which generates tier-2 near-duplicate candidates
+— uses it. On Vietnamese text roughly two of the five term slots are spent on function words:
+
+```
+lỗi 500 khi gọi api là do gateway nuốt header…   ->  ['lỗi', '500', 'khi', 'gọi', 'api']
+retry chỉ an toàn khi endpoint idempotent…       ->  ['retry', 'chỉ', 'toàn', 'khi', 'endpoint']
+staging chạy trên snapshot của prod đã ẩn danh…  ->  ['staging', 'chạy', 'trên', 'snapshot', 'của']
+```
+
+`khi`, `chỉ`, `trên`, `của` are the Vietnamese equivalents of the words this frozenset exists to
+remove, so this was written up as a real narrowing of candidate generation for half of this
+project's users. **That claim was wrong**, and §56 records the measurement that overturned it: the
+wasted slots are visible in `top_terms` output and change nothing about which candidates come back,
+because bm25 already discounts a term that appears in most documents. The claim was made from
+reading output rather than from measuring behaviour — which is the exact failure mode this file
+exists to prevent.
+
+## 55. The eval corpus is widened until every ranking constant is observable
+
+§53 shipped a 30-document corpus and, honestly, a gate with a hole in it: no query engaged both
+retrieval views, so four of the retriever's ranking constants could be changed to absurd values
+without the pinned baseline noticing. A regression gate that cannot see half the constants it
+guards is a comfort, not a control. The corpus was widened to 59 documents / 45 positive queries /
+20 off-corpus, in bands chosen by **which code path was unobserved**, not by which numbers would
+improve.
+
+The rule §53 set — a change counts as an improvement when at least two queries move — was the other
+motivation. On 20 positive queries one query is five points of recall; on 45 it is two.
+
+### The bands, and what each one exists to reach
+
+| band | reaches |
+|---|---|
+| English documents with Vietnamese queries and vice versa | cross-language recall, which lexical retrieval cannot do and which is the strongest case *for* a semantic view |
+| everyday Vietnamese engineering prose | the fallback path, where this system does most of its work |
+| **short** code-shaped queries (`open_database 0600`) | the conjunctive lexical view — previously answering **nothing** — because a two-token query can actually have both tokens in one document |
+| a document *about* a symbol next to one that merely *uses* it (`memories_fts` ×3 vs ×1) | the case where the two views **disagree**, which is the only condition under which the fusion weights change a ranking |
+| supersede pairs (Node 18 → Node 22) | `SUPERSEDED_SCORE_PENALTY` and `_cap_superseded`, roughly eighty lines of subtle code the first corpus never touched |
+| `seen_count` above 1 on two rows | `seen_count_boost`, which is `0.02 · ln(seen_count)` and therefore **exactly zero** on a corpus where every row was written once |
+
+The last one is the clearest example of the difference between a fixture that runs code and a
+fixture that observes it. Every row had `seen_count` 1, so the boost was `0.02 · ln(1) = 0` for
+every candidate; the weight could be set to 0.5 and nothing moved. The fixture now stages
+`seen_count` with a direct `UPDATE`, the same way it stages `created_at`, because writing the same
+content twice would merge onto one row and leave two fixture ids naming one memory.
+
+### Pinning gold ranks was not enough either
+
+The baseline originally recorded, per query, the rank of the first relevant document. That misses
+every change that reorders the rows *below* it — which is most of what a recall returns. With ranks
+alone, four of eight perturbed constants slipped through; pinning the **full returned ranking** as
+well took that to six of eight, and the two remaining ones were the fixture gaps above.
+
+Everything pinned is an id or a position. No bm25 score is recorded, so the document stays portable
+across SQLite builds — the property §53 chose rank-based metrics for in the first place.
+
+### The result
+
+Every ranking constant in `retriever.py`, plus the keyword column weight in `store.py`, now moves
+the baseline when perturbed:
+
+| perturbation | caught |
+|---|---|
+| `LEXICAL_WEIGHT` 0.6 → 0.3 | ✅ |
+| `LEXICAL_WEIGHT_ON_ENTITY_HIT` 0.4 → 0.9 | ✅ |
+| `RELATIONAL_WEIGHT_ON_ENTITY_HIT` 0.6 → 0.1 | ✅ |
+| `SUPERSEDED_SCORE_PENALTY` 0.1 → 1.0 | ✅ |
+| `SEEN_COUNT_WEIGHT` 0.02 → 0.5 | ✅ |
+| `RECENCY_HALF_LIFE_DAYS` 30 → 3 | ✅ |
+| `CANDIDATE_LIMIT` 20 → 3 | ✅ |
+| `KEYWORDS_COLUMN_WEIGHT` 0.35 → 1.0 | ✅ |
+
+New baseline: recall@1 **0.6667**, recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**,
+off-corpus silent **1/20**. These are lower than the 30-document numbers and **are not comparable to
+them**: a wider corpus with cross-language queries in it is a harder corpus, which is the point.
+`answered_by` is now `both 9, lexical 3, relational 8, fallback 44, none 1` — the fallback still
+does two thirds of the work, and off-corpus silence is still 1 in 20, which remains this system's
+worst measured property.
+
+### What was deliberately not done
+
+The bands were written before they were measured and were not adjusted afterwards to improve any
+number. The two exceptions are recorded here rather than hidden: the `memories_fts`/`index_memory`
+distractor documents were rewritten *after* a measurement showed the views agreeing rather than
+disagreeing, and `seen_count` was added *after* a measurement showed the boost was structurally
+zero. Both changes were made to reach an unobserved code path, and both were made knowing they
+could push the aggregate metrics down — which they did.
+
+## 56. The Vietnamese stopword "defect" is not one, and the capture threshold is looser than recorded
+
+§54 reported, as a live defect, that `_STOPWORDS` is English-only while `top_terms` uses it to pick
+the five terms that generate near-duplicate candidates. Vietnamese memories visibly spend two of
+those five slots on `khi`, `chỉ`, `trên`, `của`. It was measured before being fixed. **It is not a
+defect**, and the way it failed is worth more than the fix would have been.
+
+### The measurement
+
+A fixture of five Vietnamese traces plus five independently-written restatements of them, against a
+57-row background corpus, scored through the production path — `dedup.nearest_neighbour` with
+`store.build_or_match_expression`, the same call the capture gate makes:
+
+| | candidate recall | gate fires | max score on a novel trace |
+|---|---|---|---|
+| English-only stopwords (today) | **5/5** | 1/5 | 0.1111 |
+| plus ~70 Vietnamese function words | **5/5** | 1/5 | 0.1111 |
+
+Identical, to four decimal places. Sweeping `TIER2_MAX_CANDIDATES` over 10/25/50 and
+`TIER2_TOP_TERMS` over 5/8 changes nothing either.
+
+**Why.** The candidate query is `ORDER BY -bm25(...) LIMIT n`, and bm25 already discounts a term by
+its inverse document frequency — a word appearing in most rows contributes almost nothing to the
+ranking. Dropping such words from the term list removes terms that were already being ignored. The
+stopword list earns its keep for the *conjunctive* tier-2 query, where every term must appear; for
+the disjunctive capture query it is close to a no-op. The comment at `dedup.py:67` is right and did
+not need extending.
+
+### The contaminated measurement in between, recorded because it was believable
+
+The first attempt at a larger corpus used the eval fixture (§55) as background and reported
+candidate recall collapsing from 5/5 to 2/5 — apparently confirming that the gate degrades as a
+database grows. It did not. The eval corpus contains rows stating the *same facts* as the fixture's
+"originals" (`doc-multipart` and the upload trace; `doc-cron-overlap` and the cron trace), so
+`nearest_neighbour` was returning a **better** match and being scored as a miss. Two fixtures written
+by the same author about the same domain will overlap; a near-duplicate benchmark has to check for
+that explicitly, and this one now does.
+
+### What the measurement did find
+
+`CAPTURE_JACCARD_THRESHOLD = 0.25` fires on **1 of 5** independently-written Vietnamese
+restatements. Their scores are 0.158, 0.189, 0.194, 0.216, 0.273 — against `gate-d-capture.md`'s
+recorded minimum of **0.314** over its own restatements. The gate is looser than its founding
+measurement suggests, and §44's own words — "provisional, and honestly so… a starting point, not a
+finding" — are holding up.
+
+The tempting move is to lower the threshold. The numbers do not support it yet: the novel-trace
+maximum here is 0.1111, so the separating band is 0.111 → 0.158, a gap of **0.047** against
+gate-D's 0.174. A threshold inside a gap that narrow, on five pairs, is a guess wearing a decimal
+point. What this justifies is a bigger redundancy fixture, not a new constant — and `audit`'s
+similarity histogram remains the instrument for deriving one from real traces.
+
+## 57. One hop across the entity graph, damped — the first retrieval change to clear the gate
+
+§54 refused a coverage rerank because it moved one query. This one moves four, worsens one, and
+does not cost a single point of off-corpus silence. It is the first change to the ranking that
+`localmem eval` has approved rather than rejected, and the difference between the two outcomes is
+the whole argument for having built the harness.
+
+### What it does
+
+`retrieve` already extracts the query's entities and asks view B for memories carrying them. That
+is one lookup, not a traversal — `architecture.md` says so in as many words. The hop adds a second
+lookup: entities that **co-occur** with a query entity, and the memories carrying *those*, folded in
+at :data:`ENTITY_EXPANSION_DAMPING`.
+
+The case it exists for has no lexical component at all. A memory saying *"cache_warmer đọc danh
+sách khoá lúc bật máy"* shares no token with the query `config_loader`. But some third memory says
+*"config_loader và cache_warmer luôn khởi động cùng nhau"*, and that is enough: `config_loader`
+co-occurs with `cache_warmer`, so the query reaches a memory it has no word in common with. This is
+the shape of retrieval Gate 0 wanted embeddings for, reached with two SQL statements and no model.
+
+Co-entities are ranked by `SUM(me1.weight * me2.weight)` — the product of both link weights across
+every memory the pair shares — so an entity central to a memory the query's entity also dominates
+outranks one that merely appears in the same paragraph.
+
+**Two passes merged in Python, not one query with per-entity multipliers.** Damping the second pass
+inside SQL would mean a `CASE` built from Python values, which is the habit `store.py`'s docstring
+warns about. Two `_read_view` calls and a dictionary merge cost one extra statement per recall on a
+candidate set already capped at 20.
+
+### Both constants come from the sweep, and the shape of the sweep matters
+
+| damping | limit | recall@1 | MRR | off-corpus silent | queries better / worse |
+|---|---|---|---|---|---|
+| 0.00 | — | 0.6667 | 0.7552 | 1/20 | — |
+| 0.10 | 3 | 0.6889 | 0.7663 | 1/20 | +2 / −1 |
+| 0.10 | 5 | 0.6889 | 0.7700 | 1/20 | +3 / −1 |
+| **0.25** | **5** | **0.6889** | **0.7737** | **1/20** | **+4 / −1** |
+| 0.25 | 10 | 0.6889 | 0.7737 | 1/20 | +4 / −1 |
+| 0.50 | 5 | 0.6889 | 0.7737 | 1/20 | +4 / −1 |
+
+Everything from 0.25 upward is **identical**, across limits 3, 5 and 10. That plateau is the reason
+to trust the number: a constant sitting in the flat interior of a two-dimensional shelf is a
+different object from one perched on a peak, and §54's rejected term needed a weight of 0.8 —
+larger than `LEXICAL_WEIGHT` — to matter at all. 0.25 is the least aggressive point on the shelf and
+5 is its interior on the other axis.
+
+### The leak that did not happen
+
+Every hop widens the candidate set, and widening is how the OR fallback ended up leaking on 19 of 20
+off-corpus queries. So the gate was the noise column, not the recall column. Measured: off-corpus
+silence stays at 1/20, and **not one off-corpus query changes even its first result**. The damping
+and the cap are why — a memory reached only through a hop carries a quarter weight and competes
+against directly-matched rows rather than displacing them, which
+`test_a_directly_matched_memory_outranks_one_reached_by_a_hop` pins.
+
+### The one regression, named
+
+`open_database 0700` falls from rank 1 to rank 2. It is one of the queries §55 added *specifically*
+to make the two views disagree, so it is the adversarial case by construction: the hop pulls in an
+entity that favours the memory about `open_database`'s file mode over the one about its directory
+mode. Reporting it rather than tuning it away is the point — a change that improves four queries and
+costs one is a trade the numbers can be checked against later, and a corpus where nothing ever
+regresses is a corpus that is not being asked anything hard.
+
+### What this does not do
+
+The `answered_by` breakdown is unchanged: `both 9, lexical 3, relational 8, fallback 44, none 1`.
+The hop reorders *within* the relational view; it does not make the relational view answer queries
+that had no entity to begin with. Two thirds of all recall still runs through the disjunctive
+fallback, and off-corpus silence at 1 in 20 remains this system's worst measured property. Neither
+of those is addressed here.
+
+## 58. The coverage rerank, refused in §54 and landed here — and what its control exposed
+
+§54 refused a query-coverage term because it moved one query on a 20-query corpus, and named the
+condition that would change the answer: *"a fixture large enough that one query is not 5% of the
+sample."* §55 built that fixture. Re-measured on it, the same term moves five queries and worsens
+none. It ships at `COVERAGE_WEIGHT = 0.4`.
+
+This is the harness doing the job it was built for, in both directions: it refused this change when
+the evidence was thin and approved it when the evidence improved. Neither verdict was an opinion.
+
+### The measurement
+
+All constants as shipped, coverage added on top of the entity hop (§57):
+
+| | recall@1 | recall@3 | recall@5 | MRR | off-corpus silent | better / worse |
+|---|---|---|---|---|---|---|
+| baseline | 0.6889 | 0.8444 | 0.9111 | 0.7737 | 1/20 | — |
+| coverage 0.2 | 0.6889 | 0.8667 | 0.9333 | 0.7811 | 1/20 | +2 / −0 |
+| **coverage 0.4** | **0.7556** | **0.8889** | **0.9333** | **0.8163** | **1/20** | **+5 / −0** |
+| coverage 1.0 | 0.7778 | 0.8889 | 0.9556 | 0.8404 | 1/20 | +8 / −0 |
+
+One of the five it fixes is `open_database 0700`, the single query §57's entity hop regressed. The
+two changes repair each other, which is not something either sweep could have predicted alone.
+
+### The control, which is the important part of this entry
+
+Coverage reads **both** indexed columns. That is the correct design — a memory found only through
+its keywords must not be scored as covering nothing, which is the entire point of §34 — but it
+creates a validity problem the numbers above cannot see: **the fixture's keywords and the fixture's
+queries were written by the same person.** A keyword-driven win may be measuring nothing more than
+that.
+
+So the same sweep was run with coverage unable to see keywords at all:
+
+| | recall@1 | recall@3 | MRR | better / worse |
+|---|---|---|---|---|
+| baseline | 0.6889 | 0.8444 | 0.7737 | — |
+| content-only coverage 0.4 | **0.7333** | 0.8444 | 0.7959 | **+2 / −0** |
+| content-only coverage 1.0 | 0.7333 | 0.8222 | 0.7930 | +2 / −0 |
+
+The gain survives the control, at half the size, and peaks at the same 0.4 — so **0.4 is chosen from
+the control, not from the headline**, and everything the shipped configuration adds beyond +2
+queries is recorded as an upper bound rather than a result. (On the 30-document corpus the
+content-only variant did nothing at all; the widened corpus is what made it visible.)
+
+### The number that should worry the next person
+
+With both view weights zeroed — bm25 and the entity graph contributing **nothing** to the ranking,
+serving only as candidate generation — coverage alone scores:
+
+| | recall@1 | recall@3 | MRR |
+|---|---|---|---|
+| shipped fusion | 0.6889 | 0.8444 | 0.7737 |
+| **coverage alone, content + keywords** | **0.9111** | **0.9333** | **0.9267** |
+| coverage alone, content only | 0.7111 | 0.7556 | 0.7544 |
+
+A single set intersection, ranking the candidates the views retrieve, outscores the entire two-view
+fusion by twenty-two points of recall@1 — **and two thirds of that collapses when it cannot read
+keywords.** Both halves of that sentence matter:
+
+* the views are demonstrably better at *finding* candidates than at *ordering* them, and the
+  ordering half of the design has never been measured against a trivial baseline until now;
+* but the headline figure is inflated by exactly the circularity the control was built to expose,
+  so it is **not** evidence that the fusion should be replaced.
+
+What it does justify is refusing to read any keyword-inclusive result off this fixture again. A
+corpus whose keywords were written without sight of the queries — ideally from real memories — is
+now the highest-value thing that could be added to `localmem eval`, because until it exists, §34's
+own 0.35 column weight rests on the same circularity this entry just found.
+
+### Weight, and why it is below `LEXICAL_WEIGHT`
+
+§54's structural objection was that making the term decisive required a weight above
+`LEXICAL_WEIGHT`, i.e. a redesign rather than an addition. At 0.4 that objection is answered on its
+own terms: coverage contributes less than the lexical view it sits beside, and the sweep shows it
+does not need more to deliver everything the control can vouch for.
+
+### One invariant it improved, recorded because the test changed
+
+`test_the_cap_holds_when_the_correction_itself_scores_zero` pinned the degenerate corner §43
+describes: a correction that is the weakest lexical candidate normalizes to 0.0, its recency term
+underflows, the supersede cap lands on 0.0, and the correction ranks first only because `_fuse`'s
+sort key breaks the tie by id. Coverage is computed from the row's own text rather than from its
+rank within a view, so it survives being weakest — the correction now carries 0.4 and the retracted
+row a tenth of that. **The correction wins on score, by an order of magnitude, instead of on a
+tiebreak.** The test now pins the separation; the ordering assertion that guards the sort key is
+unchanged.
+
+`MILESTONE_B_RANKING` was re-recorded for the same reason. Every id, neighbour list and ordering in
+it is what milestone B produced; only the absolute scores moved, each by exactly
+`COVERAGE_WEIGHT × coverage`. That was verified before the snapshot was rewritten, because the
+guarantee the table exists for is the ranking, and updating it without checking would have
+discarded that silently.

@@ -1,8 +1,8 @@
 """The ``localmem`` command line.
 
 Commands: ``init``, ``add``, ``promote``, ``forget``, ``search``, ``import``, ``agents``,
-``benchmark``, ``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``, ``export``,
-``restore``, ``serve``.
+``benchmark``, ``eval``, ``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``,
+``export``, ``restore``, ``serve``.
 
 Every command runs headless — no prompts, no TTY requirement, with one deliberate
 exception. ``dedupe`` and ``init`` prompt only when stdin is a terminal; with no terminal
@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -37,6 +38,7 @@ from localmem import (
     core_memory,
     db,
     dedup,
+    evaluate,
     importer,
     indexer,
     retriever,
@@ -47,7 +49,9 @@ from localmem import (
 #: Every kind a person may write from the command line. ``imported`` is missing on
 #: purpose — it is the importer's stamp and nothing else may claim it. ``core`` is here
 #: and deliberately absent from :data:`localmem.mcp_server.ADD_KINDS`: the CLI is the
-#: human channel. Shared by ``add`` and ``promote`` so the two can never drift.
+#: human channel. Shared by ``add`` and ``promote`` so the two can never drift. The two
+#: lists are not derived from one another on purpose — that one is a security boundary,
+#: this one is a UI — so a new kind has to be added here *and* there, deliberately.
 _KIND_CHOICES = ("note", "trace", "core", "lesson")
 
 #: What ``promote`` defaults to. The command exists because lessons are the kind worth
@@ -737,6 +741,99 @@ def benchmark_command(paths: tuple[Path, ...], workspace: str | None, as_json: b
         click.echo(json.dumps(_benchmark_payload(report, target_workspace), ensure_ascii=False))
         return
     _echo_benchmark(report, target_workspace)
+
+
+@main.command("eval")
+@click.option(
+    "--fixture",
+    "fixture_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Fixture to measure (default: the bundled bilingual corpus).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def eval_command(fixture_path: Path | None, as_json: bool) -> None:
+    """Measure retrieval quality against a graded fixture.
+
+    Builds a throwaway database, loads the fixture through the ordinary write path and
+    runs every query through the ordinary recall path, then reports recall@k, MRR and how
+    many off-corpus queries stayed silent. The user's own database is never opened.
+
+    This is a report, so it always exits 0. The regression gate lives in the test suite,
+    which pins this output against ``tests/fixtures/eval/baseline.json``.
+    """
+    try:
+        fixture = evaluate.load_fixture(fixture_path)
+    except (ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    with tempfile.TemporaryDirectory(prefix="localmem-eval-") as scratch:
+        try:
+            report = evaluate.run_eval(fixture, Path(scratch) / "eval.db")
+        except (ValueError, RuntimeError, sqlite3.Error) as exc:
+            raise click.ClickException(f"eval failed: {exc}") from exc
+    if as_json:
+        click.echo(json.dumps(report.summary(), ensure_ascii=False))
+        return
+    _echo_eval(report)
+
+
+def _echo_eval(report: evaluate.EvalReport) -> None:
+    """Print the metrics table, then every query that did not land where it should."""
+    click.echo(f"fixture: {report.fixture_name} (v{report.fixture_version})")
+    click.echo(
+        f"{report.positive_queries} queries with a stored answer, "
+        f"{report.negative_queries} off-corpus"
+    )
+    click.echo("")
+    for cutoff, value in sorted(report.recall.items()):
+        click.echo(f"  recall@{cutoff}          {value:.4f}")
+    click.echo(f"  MRR                 {report.mrr:.4f}")
+    click.echo(
+        f"  off-corpus silent   {report.off_corpus_silent}/{report.negative_queries} "
+        "(higher is better: a query with no stored answer should return nothing)"
+    )
+
+    click.echo("\nanswered by:")
+    for source in evaluate.ANSWER_SOURCES:
+        click.echo(f"  {source:<12} {report.answered_by[source]}")
+    if not report.answered_by[evaluate.ANSWERED_BY_BOTH]:
+        click.echo(
+            "  note: no query engaged both views, so this run is NOT evidence about the\n"
+            "        fusion weights — with one view empty they only rescale the ranking."
+        )
+
+    misses = [
+        outcome
+        for outcome in report.outcomes
+        if not outcome.is_negative and outcome.first_gold_rank is None
+    ]
+    ranked_low = [
+        (outcome, outcome.first_gold_rank)
+        for outcome in report.outcomes
+        if not outcome.is_negative
+        and outcome.first_gold_rank is not None
+        and outcome.first_gold_rank > 1
+    ]
+    leaks = [outcome for outcome in report.outcomes if outcome.is_negative and not outcome.silent]
+
+    if misses:
+        click.echo("\nmissed entirely:")
+        for outcome in misses:
+            top = outcome.returned[0] if outcome.returned else "(nothing)"
+            click.echo(f"  {outcome.query_id}: {outcome.text!r}")
+            click.echo(f"    wanted {', '.join(outcome.gold)} — got {top} first")
+    if ranked_low:
+        click.echo("\nfound but not first:")
+        for outcome, rank in ranked_low:
+            click.echo(
+                f"  {outcome.query_id}: rank {rank} "
+                f"(above it: {', '.join(outcome.returned[: rank - 1])})"
+            )
+    if leaks:
+        click.echo("\noff-corpus queries that returned something anyway:")
+        for outcome in leaks:
+            marker = " [fallback]" if outcome.from_fallback else ""
+            click.echo(f"  {outcome.query_id}: {outcome.text!r} → {outcome.returned[0]}{marker}")
 
 
 @contextmanager
