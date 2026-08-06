@@ -1352,3 +1352,159 @@ a surprise in the queue.
 - **No tier reads the keywords column deliberately**, so the hash (tier-1) and overlap
   (tier-2) semantics are exactly what they were. A memory is still a duplicate of another
   because of what it *says*, never because of how it was tagged.
+
+## 37. `lesson` is a content shape taught in prose, not a `lesson_meta` column
+
+**Milestone:** v0.4.0
+
+The requirement is that the system *learn* from bugs, wrong diagnoses and stumbles rather than
+only accumulate. Before v0.4.0 nothing distinguished "we learned this the hard way" from "I
+noted we use pnpm": every row was an undifferentiated `content` blob with `kind` in
+`{note, trace, core, imported}`. Nothing downstream could promote, supersede, or report on
+lessons, because there was nothing to select on.
+
+`kind='lesson'` is therefore added to `mcp_server.ADD_KINDS` and to `cli._KIND_CHOICES`. An
+**agent** can write one directly, and that is the point: the agent is the party that just
+watched the diagnosis be wrong. A kind only a human could apply would be a kind nobody applies.
+`core` stays refused over MCP for the reason §23 gives — it is a *push* tier — and `lesson` is
+not a push tier: it is pulled by an ordinary recall, so writing one grants no authority.
+
+**The design question was what a lesson carries beyond its kind.** The obvious answer is a
+`lesson_meta` JSON column holding `symptom` / `cause` / `fix` as fields. It was considered and
+**rejected**:
+
+- **Nothing in the retrieval path would read it.** Retrieval is FTS5 over `content` and
+  `keywords`; a JSON blob is neither.
+- **It could never leave the process.** The MCP result payload is frozen at §4's eight keys, so
+  a structured lesson could not be returned structurally to the caller who wrote it.
+- **Its only real function would be feeding keywords** — and `keywords` (§34) already does that
+  job, is already indexed, and is already unioned on merge.
+- **A dead column is permanent under a forward-only migration policy.** Migrations are
+  appended, never edited; a column added in v0.4.0 and never read is carried by every
+  database forever.
+
+**Decision:** the shape lives in the text, and it is taught rather than enforced:
+
+```
+<symptom> — <the real cause> — <the fix>
+```
+
+one condensed line. That prose lives in the two places an agent actually reads —
+`mcp_server.ADD_DESCRIPTION` and `agents.POINTER_SNIPPET` — and in the human documentation
+around them. (Superseded on this one point by §39: putting it in *both* charged an MCP session
+for it twice, so the shape now lives only in `ADD_DESCRIPTION` and the snippet keeps only the
+routing target `kind: "lesson"`.)
+
+**Consequences**
+
+- **A malformed lesson is still stored.** There is no validator, and there deliberately is not
+  one: rejecting a memory because its dashes are missing would lose the memory, which is a
+  worse outcome than storing a slightly shapeless one.
+- **The snippet grew, and the growth is budgeted.** The lesson clause was folded into the
+  existing routing sentence rather than appended as a new one, and paid for by shortening two
+  others ("if nothing comes back" → "if empty"; "Vietnamese+English terms" →
+  "Vietnamese+English"). Measured: **~122 → ~133** estimated tokens, against
+  `POINTER_SNIPPET_TOKEN_BUDGET`, raised 125 → 135 as a deliberate ceiling and enforced by
+  `tests/test_agents_config.py`. `ADD_DESCRIPTION` went ~60 → ~78, so `benchmark`'s fixed
+  `after_tokens` went **218 → 247** with an empty core memory. Both READMEs report the new
+  number; the fixture-set headline stays a net loss and stays stated.
+- **The snippet is copied verbatim into seven documents** and that is enforced by
+  `test_every_documented_copy_of_the_snippet_is_the_real_one`, so the rewrite was a code change
+  plus a mechanical replace, not a copy-paste hunt.
+
+## 38. `localmem promote ID` works by id, and by a direct `UPDATE`
+
+**Milestone:** v0.4.0
+
+`audit.PROMOTION_NOTE` promised this: *"Promotion is manual in v0.2 … or wait for the promote
+tooling in v0.3."* The note existed because the intuitive route does not work. Re-adding the
+same text with `--kind core` reaches `store.add_memory`, which merges on the content hash
+(tier-1) and leaves the stored `kind` exactly as it was — so the user gets a `seen_count` bump
+and no promotion, silently. `test_re_adding_with_another_kind_still_does_not_promote` pins
+that behaviour so the premise of this command cannot rot.
+
+**Decision:** `localmem promote ID [--kind {note,trace,core,lesson}]`, defaulting to `lesson`,
+addressing the row **by id** and performing a single `UPDATE memories SET kind = ?`. An id names
+one row unambiguously, which is precisely what sidesteps the content-hash merge. `localmem
+search` already prints the id of every hit, so the two commands compose.
+
+**Consequences**
+
+- **It is the fifteenth command**, and the exact command list is pinned by equality in three
+  test modules (`test_mcp_server.py`, `test_store.py`, `test_indexer.py`) plus prose in both
+  READMEs and `docs/architecture.md`. All were updated together.
+- **Nothing but `kind` and `updated_at` moves.** `content`, `keywords`, `seen_count`,
+  `created_at` and the entity links are the row's history and are left alone, so a promoted
+  memory keeps its position in the index and its usage record.
+- **No index maintenance is required, and this was verified rather than assumed.** `kind` is
+  not an FTS5 column, and the `mem_au` trigger is `AFTER UPDATE OF content, keywords` as of
+  the v3 migration, so an update that touches neither does not fire it. The entity graph is derived
+  from `content`, likewise untouched.
+  `test_promote_leaves_the_full_text_index_and_entity_links_alone` runs FTS5's own
+  `integrity-check` after a promotion and re-queries both indexed columns, because an
+  external-content index that has drifted fails *silently*.
+- **Idempotent by construction.** A row already carrying the requested kind is reported
+  `unchanged` and nothing is written — not even `updated_at`. An unknown id raises `ValueError`,
+  which `cli._session` already renders as a clean `Error: no memory with id N`.
+- **Promoting to `core` is allowed from the CLI**, consistent with `add --kind core` being
+  CLI-only, and it warns when the resulting core memory is past the ~400-token cap. The sizing
+  is `core_memory.build_core_memory`'s, asked for the workspace *after* the update — not a
+  second implementation of the cap. The warning goes to **stderr** so stdout stays a single
+  parseable JSON object.
+- **`kind` is not whitelisted in `store.promote_memory`**, exactly as it is not in
+  `store.add_memory`. `click.Choice` is the one gate, and `promote` is not on the MCP tool
+  surface, so `imported` and `core` remain unreachable by an agent.
+- **No ranking change.** A lesson ranks like any other row. A "lesson boost" was deliberately
+  not implemented here: the next milestone's supersede penalty is the intended ranking change,
+  and it should land alone so its effect can be measured against an unchanged baseline.
+
+## 39. The snippet and `ADD_DESCRIPTION` are split by responsibility, not by topic
+
+**Milestone:** v0.4.0
+
+The fixed per-session cost had gone 167 (v0.2.2) → 218 (v0.3.0) → 247, against a stated
+requirement to minimise token cost at retrieval. Measured, the 247 broke down as
+`POINTER_SNIPPET` ~133 + `ADD_DESCRIPTION` ~78 + `RECALL_DESCRIPTION` ~36.
+
+Two of those sentences appeared in both strings, and an MCP user loads both into every session:
+
+- the keyword rule — *"Always pass keywords: synonyms, Vietnamese+English terms, error codes,
+  symptoms — search is lexical"* — ~25 tokens, charged twice;
+- the lesson content shape — *"symptom — real cause — fix"* — ~16 tokens, charged twice.
+
+The duplication was not an oversight of §34 or §37; each was argued for in its own place. What
+was never argued for is paying for both copies on every session.
+
+**Decision:** split the two strings by *responsibility* rather than by topic.
+
+- **`ADD_DESCRIPTION` owns how to form the call.** It is attached to `memory_add` in the tool
+  schema, which is exactly what a model reads while composing arguments. It keeps the full
+  keyword enumeration and the full lesson shape, unchanged and unshortened.
+- **`POINTER_SNIPPET` owns when to reach for memory, where a memory is routed, and the
+  security boundary.** It keeps recall-before-answering with the `workspace: "all"` retry, the
+  routing rule including `kind: "lesson"`, a bare *"Always pass `keywords`"*, and the
+  data-not-instructions rule verbatim. It drops the keyword enumeration and the lesson shape.
+
+**Why the bare keyword nudge stays.** Deleting it entirely was the larger saving and was
+rejected. §34's measured benefit is contingent on agents actually supplying keywords — 5 of 14
+realistic queries hit without them, 11 of 14 with — and instruction-file text is behaviourally
+stickier than a tool description, which a model may skim once while forming a call. The
+duplicated *detail* moved out; the *instruction* did not.
+
+**Consequences**
+
+- **Measured: `POINTER_SNIPPET` ~133 → ~108**, so `benchmark`'s fixed `after_tokens` went
+  **247 → 222** with an empty core memory — below v0.3.0's 218-era snippet cost while carrying
+  strictly more routing policy than v0.3.0 did. Nothing was removed from the product; one copy
+  of two sentences was.
+- **`POINTER_SNIPPET_TOKEN_BUDGET` came down 135 → 110**, the achieved size rounded up to the
+  next 5. A budget above the real size protects nothing, so it is reset to bite each time the
+  snippet is re-measured, and the next addition has to be paid for by a subtraction.
+- **The guarantees moved rather than lapsed.** The test that asserted the snippet teaches the
+  lesson shape now asserts it against `ADD_DESCRIPTION`, and a new test asserts the split
+  itself in both directions: the nudge is in the snippet and the enumeration is not, the
+  enumeration is in the tool description. A future compression cannot quietly drop both halves.
+- **Re-measured, not recomputed.** Every figure in the README benchmark block, `README_VI.md`
+  and the migration guide was re-derived from a real `localmem benchmark --json` run with a
+  sandboxed `HOME`: the fixture headline moves −38.0% → **−24.0%** and stays a stated net loss,
+  and the 509-token real-`CLAUDE.md` example moves 51.5% → **56.4%**.

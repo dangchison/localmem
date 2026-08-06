@@ -1,8 +1,8 @@
 """The ``localmem`` command line.
 
-Commands: ``init``, ``add``, ``search``, ``import``, ``agents``, ``benchmark``,
-``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``, ``export``, ``restore``,
-``serve``.
+Commands: ``init``, ``add``, ``promote``, ``search``, ``import``, ``agents``,
+``benchmark``, ``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``, ``export``,
+``restore``, ``serve``.
 
 Every command runs headless — no prompts, no TTY requirement. ``dedupe`` and ``init``
 prompt only when stdin is a terminal; with no terminal and no flags ``init`` prints what
@@ -42,7 +42,15 @@ from localmem import (
     transfer,
 )
 
-_KIND_CHOICES = ("note", "trace", "core")
+#: Every kind a person may write from the command line. ``imported`` is missing on
+#: purpose — it is the importer's stamp and nothing else may claim it. ``core`` is here
+#: and deliberately absent from :data:`localmem.mcp_server.ADD_KINDS`: the CLI is the
+#: human channel. Shared by ``add`` and ``promote`` so the two can never drift.
+_KIND_CHOICES = ("note", "trace", "core", "lesson")
+
+#: What ``promote`` defaults to. The command exists because lessons are the kind worth
+#: reclassifying after the fact — you rarely know a note was a lesson while writing it.
+_PROMOTE_DEFAULT_KIND = "lesson"
 _SIZE_UNITS = ("B", "KB", "MB", "GB")
 _NEIGHBOR_PREVIEW_CHARS = 100
 
@@ -116,6 +124,45 @@ def add(
             ensure_ascii=False,
         )
     )
+
+
+@main.command()
+@click.argument("memory_id", metavar="ID", type=int)
+@click.option(
+    "--kind",
+    type=click.Choice(_KIND_CHOICES),
+    default=_PROMOTE_DEFAULT_KIND,
+    show_default=True,
+    help="The kind to give the memory.",
+)
+def promote(memory_id: int, kind: str) -> None:
+    """Reclassify the memory ID — by default into a lesson.
+
+    Addressed by id, because re-adding the same text with a different `--kind` does not
+    reclassify it: `add` merges on the content hash and keeps the stored kind.
+    Run `localmem search` first; every hit prints its id.
+
+    Nothing but the kind changes — content, keywords, seen_count and the entity links
+    all stay as they are. Safe to run twice: a memory that already has that kind is
+    reported as `unchanged` and nothing is written.
+    """
+    with _session() as (conn, _path):
+        result = store.promote_memory(conn, memory_id, kind)
+        warning = _core_cap_warning(conn, result)
+    click.echo(
+        json.dumps(
+            {
+                "status": result.status,
+                "id": result.id,
+                "workspace": result.workspace,
+                "kind": result.kind,
+                "previous_kind": result.previous_kind,
+            },
+            ensure_ascii=False,
+        )
+    )
+    if warning is not None:
+        click.echo(warning, err=True)
 
 
 @main.command(context_settings=_TEXT_ARGUMENT_SETTINGS)
@@ -553,6 +600,34 @@ def _session() -> Iterator[tuple[sqlite3.Connection, Path]]:
         raise click.ClickException(f"database error: {exc}") from exc
     finally:
         conn.close()
+
+
+def _core_cap_warning(conn: sqlite3.Connection, result: store.PromoteResult) -> str | None:
+    """Return the warning a promotion into ``core`` earns, or ``None``.
+
+    Core memory is the one tier that is *pushed* into every recall, and it is capped at
+    :data:`localmem.core_memory.CORE_MEMORY_TOKEN_CAP` estimated tokens; past that, whole
+    rows are dropped oldest-first and silently stop being loaded. Promoting a long memory
+    into that tier can therefore evict another one, which is worth saying out loud at the
+    moment it happens.
+
+    The sizing is :func:`localmem.core_memory.build_core_memory`'s, not a second
+    implementation of the cap: it is asked what this workspace's core memory looks like
+    *after* the update, and reports whatever that call says is being dropped.
+
+    Written to stderr by the caller, so stdout stays a single JSON object.
+    """
+    if result.kind != core_memory.CORE_KIND:
+        return None
+    built = core_memory.build_core_memory(conn, result.workspace)
+    if not built.dropped:
+        return None
+    return (
+        f"warning: {built.dropped} core rows in workspace {result.workspace!r} are hidden "
+        f"by the {core_memory.CORE_MEMORY_TOKEN_CAP}-token cap and will not be loaded on "
+        f"recall; what a recall does load is ~{built.tokens} estimated tokens. "
+        "`localmem audit` reports the core tier per workspace"
+    )
 
 
 def _resolve_workspace(explicit: str | None) -> str:

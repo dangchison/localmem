@@ -157,6 +157,17 @@ def test_the_promotion_note_refuses_to_imply_a_command_that_does_not_exist(
     assert "does not promote" in audit.PROMOTION_NOTE
 
 
+def test_the_promotion_note_names_the_command_that_now_exists() -> None:
+    """v0.4.0 makes good on the v0.2 note; the command it names has to be real.
+
+    Asserted against the live command registry rather than the string, so a rename
+    breaks here instead of leaving the report pointing at nothing.
+    """
+    assert "localmem promote ID" in audit.PROMOTION_NOTE
+    assert "promote" in main.commands
+    assert "wait for the promote tooling" not in audit.PROMOTION_NOTE
+
+
 # ---------------------------------------------------------- section 3: distribution
 
 

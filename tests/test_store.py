@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from localmem import config, db, store
+from localmem import config, core_memory, db, store
 from localmem.cli import main
 from localmem.dedup import content_hash, normalize
 
@@ -681,6 +681,87 @@ def test_search_honours_limit(conn: sqlite3.Connection) -> None:
     assert len(store.search_memories(conn, "pnpm", "ws", 2)) == 2
 
 
+# --- promote ----------------------------------------------------------------
+
+
+def _row(conn: sqlite3.Connection, memory_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    assert row is not None
+    return row
+
+
+def test_promote_changes_the_kind_by_id(conn: sqlite3.Connection) -> None:
+    """v0.4.0 B3: a direct UPDATE, which is what sidesteps the content-hash merge."""
+    added = store.add_memory(conn, "413 came from nginx, not the app", "ws", keywords=["upload"])
+    before = _row(conn, added.id)
+
+    result = store.promote_memory(conn, added.id, "lesson")
+
+    assert result == (store.STATUS_PROMOTED, added.id, "ws", "lesson", "note")
+    after = _row(conn, added.id)
+    assert after["kind"] == "lesson"
+    # Only the kind moves. seen_count, created_at, content and keywords are history.
+    assert (after["content"], after["keywords"]) == (before["content"], before["keywords"])
+    assert (after["seen_count"], after["created_at"]) == (
+        before["seen_count"],
+        before["created_at"],
+    )
+
+
+def test_re_adding_with_another_kind_still_does_not_promote(conn: sqlite3.Connection) -> None:
+    """The premise of the whole command, asserted rather than assumed."""
+    added = store.add_memory(conn, "413 came from nginx, not the app", "ws")
+    merged = store.add_memory(conn, "413 came from nginx, not the app", "ws", kind="lesson")
+
+    assert merged.status == store.STATUS_DUPLICATE_MERGED
+    assert merged.id == added.id
+    assert _row(conn, added.id)["kind"] == "note"
+
+
+def test_promote_is_idempotent(conn: sqlite3.Connection) -> None:
+    added = store.add_memory(conn, "a note that becomes a lesson", "ws")
+    store.promote_memory(conn, added.id, "lesson")
+    updated_at = _row(conn, added.id)["updated_at"]
+
+    again = store.promote_memory(conn, added.id, "lesson")
+
+    assert again == (store.STATUS_UNCHANGED, added.id, "ws", "lesson", "lesson")
+    assert _row(conn, added.id)["updated_at"] == updated_at
+
+
+def test_promote_rejects_an_unknown_id(conn: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="no memory with id 404"):
+        store.promote_memory(conn, 404, "lesson")
+
+
+def test_promote_leaves_the_full_text_index_and_entity_links_alone(
+    conn: sqlite3.Connection,
+) -> None:
+    """`kind` is not an FTS column and `mem_au` fires only on content/keywords.
+
+    Verified, not assumed: FTS5's own integrity-check fails loudly on an external-content
+    index that has drifted from its table, and the promoted row must still be findable
+    by both of its indexed columns.
+    """
+    added = store.add_memory(conn, "load src/main.py with MyClass", "ws", keywords=["boot"])
+    links = conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_entities WHERE memory_id = ?", (added.id,)
+    ).fetchone()["n"]
+    assert links > 0
+
+    store.promote_memory(conn, added.id, "lesson")
+
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+    assert [hit.id for hit in store.search_memories(conn, "MyClass", "ws")] == [added.id]
+    assert [hit.id for hit in store.search_memories(conn, "boot", "ws")] == [added.id]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entities WHERE memory_id = ?", (added.id,)
+        ).fetchone()["n"]
+        == links
+    )
+
+
 # --- stats ------------------------------------------------------------------
 
 
@@ -731,8 +812,8 @@ def test_cli_stats_reports_recalls(db_path: Path) -> None:
 def test_cli_exposes_exactly_the_expected_commands() -> None:
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
-    # M3 added dedupe and gc, M4 added serve, M5 added init/import/agents/benchmark;
-    # the assertion stays exact so a stray command is noticed.
+    # M3 added dedupe and gc, M4 added serve, M5 added init/import/agents/benchmark,
+    # v0.4.0 added promote; the assertion stays exact so a stray command is noticed.
     assert set(main.commands) == {
         "add",
         "agents",
@@ -744,6 +825,7 @@ def test_cli_exposes_exactly_the_expected_commands() -> None:
         "gc",
         "import",
         "init",
+        "promote",
         "restore",
         "search",
         "serve",
@@ -769,6 +851,109 @@ def test_cli_add_rejects_blank_workspace() -> None:
     result = CliRunner().invoke(main, ["add", "text", "-w", " "])
     assert result.exit_code != 0
     assert "non-empty" in result.output
+
+
+def test_cli_add_accepts_the_lesson_kind() -> None:
+    """v0.4.0 B1: `lesson` is writable from the CLI as well as over MCP."""
+    runner = CliRunner()
+    added = runner.invoke(
+        main, ["add", "413 was nginx all along", "-w", "proj", "--kind", "lesson"]
+    )
+    assert added.exit_code == 0, added.output
+    assert json.loads(added.stdout)["status"] == "added"
+
+    stats = runner.invoke(main, ["stats"])
+    assert "by kind:\n  lesson  1" in stats.output
+
+
+def test_cli_promote_turns_a_note_into_a_lesson() -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "upload 413 was the proxy, not the app", "-w", "proj"])
+
+    promoted = runner.invoke(main, ["promote", "1"])
+
+    assert promoted.exit_code == 0, promoted.output
+    assert json.loads(promoted.stdout) == {
+        "status": "promoted",
+        "id": 1,
+        "workspace": "proj",
+        "kind": "lesson",
+        "previous_kind": "note",
+    }
+    assert "kind=lesson" in runner.invoke(main, ["search", "upload 413", "-w", "proj"]).output
+    assert "by kind:\n  lesson  1" in runner.invoke(main, ["stats"]).output
+
+
+def test_cli_promote_defaults_to_lesson_and_takes_any_other_kind() -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "a trace of what the agent did", "-w", "proj"])
+    promoted = runner.invoke(main, ["promote", "1", "--kind", "trace"])
+    assert json.loads(promoted.stdout)["kind"] == "trace"
+    assert "--kind" in runner.invoke(main, ["promote", "--help"]).output
+
+
+def test_cli_promote_reports_an_unknown_id() -> None:
+    result = CliRunner().invoke(main, ["promote", "404"])
+    assert result.exit_code != 0
+    assert "no memory with id 404" in result.output
+
+
+def test_cli_promote_rejects_a_kind_nobody_may_write() -> None:
+    """`imported` is the importer's stamp; promote must not hand it out."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "a note", "-w", "proj"])
+    result = runner.invoke(main, ["promote", "1", "--kind", "imported"])
+    assert result.exit_code != 0
+
+
+def test_cli_promote_is_idempotent() -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "a note that becomes a lesson", "-w", "proj"])
+    runner.invoke(main, ["promote", "1"])
+
+    again = runner.invoke(main, ["promote", "1"])
+
+    assert again.exit_code == 0, again.output
+    assert json.loads(again.stdout) == {
+        "status": "unchanged",
+        "id": 1,
+        "workspace": "proj",
+        "kind": "lesson",
+        "previous_kind": "lesson",
+    }
+
+
+def test_cli_promote_to_core_warns_when_the_cap_starts_hiding_rows() -> None:
+    """The warning is on stderr, so stdout stays one parseable JSON object."""
+    runner = CliRunner()
+    filler = "x" * (core_memory.CORE_MEMORY_TOKEN_CAP * 4)
+    runner.invoke(main, ["add", filler, "-w", "proj", "--kind", "core"])
+    runner.invoke(main, ["add", "one more rule that will not fit", "-w", "proj"])
+
+    result = runner.invoke(main, ["promote", "2", "--kind", "core"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["kind"] == "core"
+    assert f"{core_memory.CORE_MEMORY_TOKEN_CAP}-token cap" in result.stderr
+    assert "are hidden" in result.stderr
+    assert "will not be loaded on recall" in result.stderr
+
+
+def test_cli_promote_to_core_is_quiet_under_the_cap() -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "prefer small commits", "-w", "proj"])
+    result = runner.invoke(main, ["promote", "1", "--kind", "core"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+
+
+def test_cli_promote_to_a_non_core_kind_never_warns() -> None:
+    runner = CliRunner()
+    filler = "x" * (core_memory.CORE_MEMORY_TOKEN_CAP * 4)
+    runner.invoke(main, ["add", filler, "-w", "proj", "--kind", "core"])
+    runner.invoke(main, ["add", "a note that stays out of the core tier", "-w", "proj"])
+    result = runner.invoke(main, ["promote", "2"])
+    assert result.stderr == ""
 
 
 def test_cli_search_outputs_hits() -> None:

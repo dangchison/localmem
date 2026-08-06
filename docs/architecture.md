@@ -24,7 +24,7 @@ localmem/
 ├── audit.py        the read-only hygiene report; every statement is a SELECT
 ├── transfer.py     export/restore of the raw memories table
 ├── mcp_server.py   the two frozen tools, stdio
-├── cli.py          fourteen commands; the only module that calls Path.home()
+├── cli.py          fifteen commands; the only module that calls Path.home()
 └── agents/         one config writer per supported agent
 ```
 
@@ -210,10 +210,17 @@ declared the constraint globally, which would make the same fact learned in two 
 collide and leak one project's memory into another's recall. Deduplication is per workspace by
 design; workspaces are the privacy and relevance boundary of the product.
 
-**`kind`** is one of `note` (default), `trace`, `imported`, `core`. The MCP `memory_add` tool
-accepts only `note` and `trace`: `imported` belongs to the importer, and `core` is the
-always-load tier and therefore human-curated — an agent acting on injected instructions must
-not be able to write one. `localmem add --kind core` still does. See `design_decisions.md` §23.
+**`kind`** is one of `note` (default), `trace`, `lesson`, `imported`, `core`. The MCP
+`memory_add` tool accepts `note`, `trace` and `lesson`: `imported` belongs to the importer, and
+`core` is the always-load tier and therefore human-curated — an agent acting on injected
+instructions must not be able to write one. `localmem add --kind core` still does. See
+`design_decisions.md` §23.
+
+`lesson` (v0.4.0) is what the project taught the hard way, as opposed to what someone was told;
+its content shape — `<symptom> — <the real cause> — <the fix>` — is taught in prose rather than
+enforced by a column, and it is written either directly or by `localmem promote ID`, which
+rewrites `kind` in place by id. Nothing in the retrieval path reads `kind`: a lesson ranks
+exactly as a note does. See `design_decisions.md` §37 and §38.
 
 **`session_id`** is populated only by `localmem add --session-id`. The frozen `memory_add` tool
 schema has no such parameter, so **every memory written through MCP stores `NULL`**. The

@@ -58,6 +58,7 @@ CLI_COMMANDS = {
     "gc",
     "import",
     "init",
+    "promote",
     "restore",
     "search",
     "serve",
@@ -160,7 +161,8 @@ def test_stdio_initialize_and_list_tools(db_path: Path, tmp_path: Path) -> None:
     )
     assert tools["memory_add"].description == (
         "Save a durable fact, decision, or lesson to the user's persistent memory. "
-        "Call when you learn something worth remembering across sessions. Always pass "
+        "Call when you learn something worth remembering across sessions. A bug you "
+        "fought: kind='lesson', one line: symptom — real cause — fix. Always pass "
         "keywords: synonyms, Vietnamese+English terms, error codes, symptoms — search is "
         "lexical."
     )
@@ -271,6 +273,47 @@ def test_stdio_refuses_a_core_write_without_a_protocol_error(db_path: Path, tmp_
     assert "localmem add --kind core" in body["message"]
     # Nothing was written: the one row in the file is the legitimate note.
     assert row_count(db_path) == 1
+
+
+def test_stdio_writes_a_lesson_and_recalls_it_as_one(db_path: Path, tmp_path: Path) -> None:
+    """v0.4.0 B1, over a real round trip.
+
+    The agent is the party that just watched a diagnosis be wrong, so the agent has to be
+    able to write the lesson itself — a kind only a human could apply would never be
+    applied. `lesson` is pulled by a recall like any other row, which is what separates it
+    from `core`.
+    """
+
+    async def work(session: ClientSession) -> tuple[CallToolResult, CallToolResult]:
+        await session.initialize()
+        written = await session.call_tool(
+            "memory_add",
+            {
+                "content": (
+                    "upload 413 — not the app body-parser limit, nginx "
+                    "client_max_body_size — raise it in the server block"
+                ),
+                "workspace": "lessons",
+                "kind": "lesson",
+                "keywords": ["413", "tải lên"],
+            },
+        )
+        recalled = await session.call_tool(
+            "memory_recall", {"query": "upload 413", "workspace": "lessons"}
+        )
+        return written, recalled
+
+    written, recalled = over_stdio(db_path, tmp_path / "err.log", work)
+
+    assert written.is_error is False
+    body = payload(written)
+    assert set(body) == ADD_KEYS
+    assert body["status"] == "added"
+
+    hits = payload(recalled)["results"]
+    assert [hit["kind"] for hit in hits] == ["lesson"]
+    # §4's result object is still exactly eight keys: `lesson` adds no structure.
+    assert set(hits[0]) == RESULT_KEYS
 
 
 def test_recall_from_a_named_workspace_reaches_the_global_tier(db_path: Path) -> None:
@@ -440,7 +483,7 @@ def test_blank_workspace_is_an_input_error(db_path: Path) -> None:
 # ------------------------------------------------------------------ input validation
 
 
-@pytest.mark.parametrize("kind", ["note", "trace"])
+@pytest.mark.parametrize("kind", ["note", "trace", "lesson"])
 def test_add_accepts_the_agent_writable_kinds(db_path: Path, kind: str) -> None:
     body = mcp_server.memory_add(f"a {kind} memory", workspace="kinds", kind=kind)
     assert body["status"] == "added"

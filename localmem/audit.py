@@ -43,12 +43,13 @@ DEAD_MEMORY_AGE_DAYS = 30
 _DEAD_MEMORY_CUTOFF = f"-{DEAD_MEMORY_AGE_DAYS} days"
 
 #: Verbatim in both output modes: audit must not imply a command that does not exist.
-#: Re-adding with ``--kind core`` does *not* promote — tier-1 merges on the hash and
-#: leaves the original ``kind`` alone (verified in M1).
+#: v0.4.0 makes good on the note this replaced — ``localmem promote`` now exists, so the
+#: report names it. The warning about re-adding stays, because that is still the mistake
+#: a reader makes: tier-1 merges on the hash and leaves the original ``kind`` alone.
 PROMOTION_NOTE = (
-    "Promotion is manual in v0.2: re-adding with --kind core does not promote, because "
-    "tier-1 merges on the content hash and keeps the original kind. Add the text again "
-    "as a core memory in its own words, or wait for the promote tooling in v0.3."
+    "Promote by id: `localmem promote ID --kind core` (or --kind lesson, the default) "
+    "rewrites the kind in place. Re-adding the same text with --kind core does not "
+    "promote it, because tier-1 merges on the content hash and keeps the original kind."
 )
 
 #: Verbatim in both output modes. Usage tracking arrived with schema version 2, so a

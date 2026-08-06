@@ -25,6 +25,11 @@ MAX_LIMIT = 20
 STATUS_ADDED = "added"
 STATUS_DUPLICATE_MERGED = "duplicate_merged"
 
+#: :func:`promote_memory`'s two outcomes. ``unchanged`` is not a failure — it is what
+#: makes the command idempotent, so a script may run it twice without special-casing.
+STATUS_PROMOTED = "promoted"
+STATUS_UNCHANGED = "unchanged"
+
 #: Caps on the agent-supplied keyword list, in the same spirit as the indexer's
 #: :data:`localmem.indexer.MAX_EXTRACT_CHARS` / :data:`~localmem.indexer.MAX_ENTITIES_PER_MEMORY`:
 #: a keyword list is a hint, and a pathological one must not become an index of its own.
@@ -59,6 +64,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 
 _SELECT_BY_HASH_SQL = """
 SELECT id, seen_count, keywords FROM memories WHERE workspace = ? AND content_hash = ?
+"""
+
+_SELECT_BY_ID_SQL = "SELECT id, workspace, kind FROM memories WHERE id = ?"
+
+# `kind` is not an indexed FTS5 column and `mem_au` fires only `AFTER UPDATE OF content,
+# keywords`, so this statement costs no index maintenance and cannot desynchronize
+# `memories_fts`. The entity graph is derived from `content`, which is likewise untouched.
+_PROMOTE_SQL = """
+UPDATE memories
+   SET kind = ?,
+       updated_at = datetime('now')
+ WHERE id = ?
 """
 
 _MERGE_DUPLICATE_SQL = """
@@ -103,6 +120,24 @@ class AddResult(NamedTuple):
     status: str
     id: int
     seen_count: int
+
+
+class PromoteResult(NamedTuple):
+    """Outcome of :func:`promote_memory`.
+
+    Attributes:
+        status: :data:`STATUS_PROMOTED` or :data:`STATUS_UNCHANGED`.
+        id: the row that was addressed.
+        workspace: where that row lives — the caller needs it to size the core tier.
+        kind: the kind the row carries now.
+        previous_kind: the kind it carried before, equal to ``kind`` when unchanged.
+    """
+
+    status: str
+    id: int
+    workspace: str
+    kind: str
+    previous_kind: str
 
 
 @dataclass(frozen=True)
@@ -205,6 +240,44 @@ def add_memory(
             conn, row_id, content, target_workspace, build_match_expression
         )
         return AddResult(STATUS_ADDED, row_id, 1)
+
+
+def promote_memory(conn: sqlite3.Connection, memory_id: int, kind: str) -> PromoteResult:
+    """Change the ``kind`` of the row ``memory_id``, in place.
+
+    Promotion is **by id**, not by text, because the two are not interchangeable here:
+    re-adding the same words with a different ``--kind`` reaches :func:`add_memory`,
+    which merges on the content hash and leaves the stored ``kind`` exactly as it was.
+    An id names one row unambiguously, so the update is a single ``UPDATE`` with no
+    hashing, no merge and no second copy of the text
+    (``docs/design_decisions.md`` §38).
+
+    Nothing else about the row moves: ``content``, ``keywords``, ``seen_count``,
+    ``created_at`` and the entity links are all untouched, so a promoted memory keeps
+    its history and its position in the index. Only ``updated_at`` advances.
+
+    Idempotent: promoting a row to the kind it already has writes nothing and reports
+    :data:`STATUS_UNCHANGED`.
+
+    ``kind`` is not checked against a whitelist, exactly as :func:`add_memory` does not
+    check it — the command line's ``click.Choice`` is the one gate, and this function is
+    not reachable from the MCP tool surface.
+
+    Raises:
+        ValueError: if no memory carries ``memory_id``.
+    """
+    with db.transaction(conn):
+        row = conn.execute(_SELECT_BY_ID_SQL, (memory_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"no memory with id {memory_id}; `localmem search` prints the id of every hit"
+            )
+        previous = str(row["kind"])
+        workspace = str(row["workspace"])
+        if previous == kind:
+            return PromoteResult(STATUS_UNCHANGED, memory_id, workspace, kind, previous)
+        conn.execute(_PROMOTE_SQL, (kind, memory_id))
+    return PromoteResult(STATUS_PROMOTED, memory_id, workspace, kind, previous)
 
 
 def search_memories(

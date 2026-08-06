@@ -45,7 +45,8 @@ RECALL_DESCRIPTION = (
 )
 ADD_DESCRIPTION = (
     "Save a durable fact, decision, or lesson to the user's persistent memory. "
-    "Call when you learn something worth remembering across sessions. Always pass "
+    "Call when you learn something worth remembering across sessions. A bug you "
+    "fought: kind='lesson', one line: symptom — real cause — fix. Always pass "
     "keywords: synonyms, Vietnamese+English terms, error codes, symptoms — search is "
     "lexical."
 )
@@ -57,7 +58,13 @@ ALL_WORKSPACES = "all"
 # The kinds an agent may write. `imported` belongs to the importer and `core` to the human
 # (see :data:`CORE_KIND_REJECTION`); neither is on the tool surface. This is input
 # validation, not a change to §4's payload shape — see docs/design_decisions.md §23.
-ADD_KINDS = ("note", "trace")
+#
+# `lesson` joins the list in v0.4.0 and is the point of the milestone: an agent is the
+# party that just watched a diagnosis be wrong, so it must be able to write the lesson
+# itself rather than wait for a human to reclassify a note. It carries no extra
+# authority — a lesson is pulled by a recall like any other row, unlike `core`, which is
+# pushed into every session and therefore stays human-only.
+ADD_KINDS = ("note", "trace", "lesson")
 
 # Core memory is a *push* tier: every recall loads it, in every session. An agent acting on
 # injected instructions must therefore not be able to write one, and with the global tier
