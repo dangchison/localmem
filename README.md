@@ -981,9 +981,8 @@ path, asks every query through the ordinary recall path, and reports:
   nothing. A retrieval change that lifts recall by getting noisier shows up here and nowhere
   else;
 - **answered by** — which view produced each ranking. This states what the run is evidence
-  about. On the shipped fixture the answer is uncomfortable and worth knowing: 24 of 32 queries
-  are answered by the OR fallback, 7 by the entity view, and **none** by the conjunctive lexical
-  view.
+  about. On the shipped fixture the answer is uncomfortable and worth knowing: 44 of 65 queries
+  are answered by the OR fallback, and only 3 by the conjunctive lexical view on its own.
 
 Your own database is never opened. The numbers are ranks, not bm25 scores, so they mean the same
 thing on another machine. `--fixture PATH` runs your own corpus in the same format.
@@ -1064,10 +1063,10 @@ behaviour of v0.5.0, not speculation.
 
    You can now re-run all of this yourself: `localmem eval` measures recall@1/3/5, MRR and
    off-corpus silence against a shipped bilingual fixture, through the real read path. Its first
-   run says the quiet part out loud — of 32 queries, **24 are answered by the OR fallback and 0
-   by the conjunctive lexical view**. The primary path answers no natural-language question at
-   all; keywords and the fallback are not a mitigation of the lexical limit so much as the thing
-   actually doing the work.
+   run says the quiet part out loud: of 65 queries, **44 are answered by the OR fallback**, and
+   the conjunctive lexical view answers only the short code-shaped ones. On natural-language
+   prose the primary path answers nothing at all — keywords and the fallback are not a mitigation
+   of the lexical limit so much as the thing actually doing the work.
 2. **Entity extraction is regex-based and language-naive.** No model, no dictionary. It
    recognizes URLs, @-mentions, file paths, quoted strings, CamelCase, snake_case and
    ALL-CAPS runs — and it cannot tell a real acronym from shouty prose, so `THIS IS URGENT`

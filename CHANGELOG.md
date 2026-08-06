@@ -20,20 +20,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `test_bundled_fixture_matches_the_recorded_baseline` fails on **any** movement, up or down;
   rewrite it with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`.
 
-  First run, recorded as the baseline: recall@1 **0.65**, recall@3 **0.85**, recall@5 **0.95**,
-  MRR **0.775**, off-corpus silent **1/12**.
+  Corpus: 59 documents, 45 graded queries, 20 off-corpus. Baseline: recall@1 **0.6667**,
+  recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**, off-corpus silent **1/20**.
+  `answered_by` is `both 9, lexical 3, relational 8, fallback 44, none 1`.
 
   Two findings came straight out of it and are recorded in `docs/design_decisions.md` §53:
 
-  - **The conjunctive lexical view answers no natural-language query at all.** Of 32 queries,
-    24 are answered by the disjunctive fallback, 7 by the entity view, 0 by the primary lexical
-    path — a multi-word question needs every token in one document, which prose never satisfies.
-  - **The fusion weights are invisible to any rank-based metric unless both views fire, and on
-    realistic queries they never both do.** With one view empty its weight multiplies zeros and
-    the other is a constant factor. The report therefore prints an `answered_by` breakdown and
-    states, when `both` is 0, that the run is not evidence about those weights. Confirmed by
-    perturbation: changing the keyword column weight, the recency weight or the candidate limit
-    each turns the baseline test red; changing `RELATIONAL_WEIGHT_ON_ENTITY_HIT` does not.
+  - **The conjunctive lexical view answers no natural-language query at all.** The disjunctive
+    fallback does two thirds of the work; the primary path only ever answers short code-shaped
+    queries, because a multi-word question needs every token in one document and prose never
+    satisfies that.
+  - **The fusion weights are invisible to any rank-based metric unless both views fire.** With
+    one view empty its weight multiplies zeros and the other is a constant factor. The first
+    30-document corpus had no query engaging both views, so four ranking constants were
+    unmeasurable; §55 records widening the corpus until all eight are caught under perturbation.
+    The report still prints `answered_by` and warns when `both` is 0.
 
 ### Measured and not shipped
 
