@@ -134,6 +134,26 @@ def _open_at_version_1(path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.C
     return db.open_database(path)
 
 
+def _open_at_version_2(path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """Open ``path`` with only the v1 and v2 migrations registered — a v0.2.x database."""
+    monkeypatch.setattr(db, "_MIGRATIONS", db._MIGRATIONS[:2])
+    return db.open_database(path)
+
+
+def _insert_at_old_version(
+    connection: sqlite3.Connection, content: str, workspace: str, kind: str = "note"
+) -> None:
+    """Write one row the way the localmem of that schema version would have.
+
+    ``store.add_memory`` cannot be used here: it writes today's column list, and the whole
+    point of these fixtures is a database that does not have those columns yet.
+    """
+    connection.execute(
+        "INSERT INTO memories (content, content_hash, workspace, kind) VALUES (?, ?, ?, ?)",
+        (content, content_hash(content), workspace, kind),
+    )
+
+
 def test_a_version_1_database_upgrades_with_its_data_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -141,8 +161,8 @@ def test_a_version_1_database_upgrades_with_its_data_intact(
     path = tmp_path / "v1.db"
     old = _open_at_version_1(path, monkeypatch)
     try:
-        store.add_memory(old, "use pnpm not npm", "ws")
-        store.add_memory(old, "prefer small commits", "ws", "core")
+        _insert_at_old_version(old, "use pnpm not npm", "ws")
+        _insert_at_old_version(old, "prefer small commits", "ws", "core")
         assert db.schema_version(old) == 1
         assert "recalled_count" not in _columns(old)
     finally:
@@ -151,7 +171,7 @@ def test_a_version_1_database_upgrades_with_its_data_intact(
 
     upgraded = db.open_database(path)
     try:
-        assert db.schema_version(upgraded) == 2
+        assert db.schema_version(upgraded) == db.CURRENT_SCHEMA_VERSION
         assert {"recalled_count", "last_recalled_at"} <= _columns(upgraded)
         rows = upgraded.execute(
             "SELECT content, recalled_count, last_recalled_at FROM memories ORDER BY id"
@@ -166,13 +186,104 @@ def test_a_version_1_database_upgrades_with_its_data_intact(
         upgraded.close()
 
 
+def test_a_version_2_database_upgrades_with_its_data_and_index_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v3 drops and rebuilds ``memories_fts``, which is the risky part of the migration.
+
+    A dropped FTS index that is not correctly rebuilt fails *silently* — the table is
+    still there and queries still run, they just return nothing. So this asserts search
+    actually works afterwards, on both an ASCII and a Vietnamese row.
+    """
+    path = tmp_path / "v2.db"
+    old = _open_at_version_2(path, monkeypatch)
+    try:
+        _insert_at_old_version(old, "use pnpm not npm", "ws")
+        _insert_at_old_version(old, VIETNAMESE, "ws")
+        assert db.schema_version(old) == 2
+        assert "keywords" not in _columns(old)
+    finally:
+        old.close()
+    monkeypatch.undo()
+
+    upgraded = db.open_database(path)
+    try:
+        assert db.schema_version(upgraded) == 3
+        assert "keywords" in _columns(upgraded)
+        # Pre-existing rows have no keywords, and NULL is the value that keeps them
+        # ranking exactly as they did before the upgrade.
+        assert [row["keywords"] for row in upgraded.execute("SELECT keywords FROM memories")] == [
+            None,
+            None,
+        ]
+        assert [hit.content for hit in store.search_memories(upgraded, "pnpm", "ws")] == [
+            "use pnpm not npm",
+            VIETNAMESE,
+        ]
+        # The rebuilt index keeps the tokenizer, so diacritic folding still works.
+        assert [hit.content for hit in store.search_memories(upgraded, "dung pnpm", "ws")] == [
+            VIETNAMESE
+        ]
+        # And the recreated triggers still maintain it for new writes.
+        store.add_memory(upgraded, "a fresh row about caching", "ws", keywords=["cache"])
+        assert len(store.search_memories(upgraded, "cache", "ws")) == 1
+    finally:
+        upgraded.close()
+
+
+def test_a_keyword_free_database_ranks_exactly_as_version_2_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression that matters most: almost every existing row has no keywords.
+
+    The same corpus is built twice — once on the v2 single-column index, once on today's
+    two-column one — and the same query is run against both. Ids *and* scores must match
+    exactly. bm25 divides by total document length across all columns, so an empty
+    ``keywords`` column adds nothing to the denominator and the second column is
+    arithmetically invisible; this pins that, rather than trusting it.
+    """
+    corpus = [
+        "pnpm is the package manager",
+        "pnpm pnpm pnpm workspace protocol",
+        "use pnpm not npm for this project",
+        "totally unrelated weather notes",
+    ]
+
+    legacy_path = tmp_path / "v2.db"
+    legacy = _open_at_version_2(legacy_path, monkeypatch)
+    try:
+        for content in corpus:
+            _insert_at_old_version(legacy, content, "ws")
+        legacy_ranked = legacy.execute(
+            "SELECT m.id AS id, -bm25(memories_fts) AS score "
+            "  FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid "
+            " WHERE memories_fts MATCH ? AND m.workspace = ? "
+            " ORDER BY score DESC, m.created_at DESC",
+            ('"pnpm"', "ws"),
+        ).fetchall()
+    finally:
+        legacy.close()
+    monkeypatch.undo()
+
+    current = db.open_database(tmp_path / "v3.db")
+    try:
+        for content in corpus:
+            store.add_memory(current, content, "ws")
+        current_hits = store.search_memories(current, "pnpm", "ws")
+    finally:
+        current.close()
+
+    assert [row["id"] for row in legacy_ranked] == [hit.id for hit in current_hits]
+    assert [row["score"] for row in legacy_ranked] == [hit.score for hit in current_hits]
+
+
 def test_upgrading_a_version_1_database_twice_changes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "v1.db"
     old = _open_at_version_1(path, monkeypatch)
     try:
-        store.add_memory(old, "use pnpm not npm", "ws")
+        _insert_at_old_version(old, "use pnpm not npm", "ws")
     finally:
         old.close()
     monkeypatch.undo()
@@ -469,6 +580,89 @@ def test_search_with_no_searchable_tokens_returns_empty(conn: sqlite3.Connection
 
 def test_build_match_expression_quotes_tokens() -> None:
     assert store.build_match_expression("npm AND (broken") == '"npm" "AND" "broken"'
+
+
+def test_build_or_match_expression_joins_the_same_tokens_disjunctively() -> None:
+    assert store.build_or_match_expression("npm AND (broken") == '"npm" OR "AND" OR "broken"'
+
+
+def test_build_or_match_expression_drops_empty_query() -> None:
+    assert store.build_or_match_expression("  -- ") == ""
+
+
+# --- keywords ---------------------------------------------------------------
+
+
+def test_a_memory_is_found_by_a_keyword_that_is_not_in_its_content(
+    conn: sqlite3.Connection,
+) -> None:
+    """The whole point of the feature: the query shares no token with the content."""
+    store.add_memory(
+        conn,
+        "client_max_body_size mặc định 1m trong nginx",
+        "ws",
+        keywords=["413", "upload", "tải lên"],
+    )
+    assert "413" not in "client_max_body_size mặc định 1m trong nginx"
+
+    hits = store.search_memories(conn, "413 upload", "ws")
+
+    assert [hit.content for hit in hits] == ["client_max_body_size mặc định 1m trong nginx"]
+
+
+def test_keywords_are_lowercased_deduplicated_and_capped() -> None:
+    assert store.normalize_keywords(["Upload", "upload", "  TẢI LÊN  "]) == "upload tải lên"
+    assert store.normalize_keywords(None) is None
+    assert store.normalize_keywords([]) is None
+    assert store.normalize_keywords(["   ", ""]) is None
+    assert store.normalize_keywords(["x" * 200]) == "x" * store.MAX_KEYWORD_CHARS
+    many = store.normalize_keywords([f"kw{index}" for index in range(50)])
+    assert many is not None
+    assert len(many.split()) == store.MAX_KEYWORDS
+
+
+def test_a_memory_without_keywords_stores_null_not_empty_string(
+    conn: sqlite3.Connection,
+) -> None:
+    """NULL is what makes a keyword-free row indistinguishable from a v0.2.2 one."""
+    added = store.add_memory(conn, "no keywords here", "ws")
+    stored = conn.execute("SELECT keywords FROM memories WHERE id = ?", (added.id,)).fetchone()
+    assert stored["keywords"] is None
+
+
+def test_merging_a_duplicate_unions_its_keywords(conn: sqlite3.Connection) -> None:
+    """The only route by which an already-stored memory ever gains keywords."""
+    first = store.add_memory(conn, "use pnpm not npm", "ws", keywords=["package manager"])
+    second = store.add_memory(conn, "use pnpm not npm", "ws", keywords=["trình quản lý gói"])
+
+    assert second.status == store.STATUS_DUPLICATE_MERGED
+    assert second.id == first.id
+    assert second.seen_count == 2
+    stored = conn.execute("SELECT keywords FROM memories WHERE id = ?", (first.id,)).fetchone()
+    assert stored["keywords"] == "package manager trình quản lý gói"
+    # The union is indexed, not just stored: the new wording finds the row.
+    assert [hit.id for hit in store.search_memories(conn, "trình quản lý gói", "ws")] == [first.id]
+
+
+def test_merging_enriches_a_memory_that_had_no_keywords_at_all(
+    conn: sqlite3.Connection,
+) -> None:
+    """Covers the pre-existing rows a migration cannot backfill without a model."""
+    first = store.add_memory(conn, "deploy needs the VPN", "ws")
+    assert store.search_memories(conn, "mạng riêng ảo", "ws") == []
+
+    store.add_memory(conn, "deploy needs the VPN", "ws", keywords=["mạng riêng ảo"])
+
+    assert [hit.id for hit in store.search_memories(conn, "mạng riêng ảo", "ws")] == [first.id]
+
+
+def test_merging_without_keywords_leaves_the_stored_ones_alone(
+    conn: sqlite3.Connection,
+) -> None:
+    first = store.add_memory(conn, "use pnpm not npm", "ws", keywords=["package manager"])
+    store.add_memory(conn, "use pnpm not npm", "ws")
+    stored = conn.execute("SELECT keywords FROM memories WHERE id = ?", (first.id,)).fetchone()
+    assert stored["keywords"] == "package manager"
 
 
 def test_build_match_expression_drops_empty_query() -> None:

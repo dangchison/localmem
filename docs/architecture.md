@@ -52,10 +52,17 @@ content
   ├─ 1. tier-1 dedup ─ dedup.content_hash(): NFC-normalize, strip markdown bullet prefixes
   │                    per line, lowercase, collapse whitespace runs, strip, sha256.
   │                    SELECT … WHERE workspace = ? AND content_hash = ?
-  │                      hit  → seen_count += 1, updated_at = now  → "duplicate_merged"
+  │                      hit  → seen_count += 1, updated_at = now, keywords unioned
+  │                                                                → "duplicate_merged"
   │                      miss → INSERT (raw content, verbatim)     → continue
   │
-  ├─ 2. FTS5 index ─── the AFTER INSERT trigger mirrors the row into memories_fts.
+  ├─ 1b. keywords ──── store.normalize_keywords(): lowercase, dedupe preserving order,
+  │                    cap 20 keywords x 64 chars, stored space-separated. NULL when the
+  │                    caller supplied none, which is what keeps such a row ranking
+  │                    exactly as it did before schema version 3.
+  │
+  ├─ 2. FTS5 index ─── the AFTER INSERT trigger mirrors content *and* keywords into
+  │                    memories_fts.
   │
   ├─ 3. entity index ─ indexer.index_memory(): seven regex classes in priority order over a
   │                    working copy, each masking class blanking its matches so a lower
@@ -93,10 +100,17 @@ query
   │        rows and the shared tier. `'global'` itself and None are unchanged, and two
   │        named workspaces never see each other. See design_decisions.md §24.
   │
-  ├─ 2. view A — lexical: bm25 over memories_fts, workspace-filtered, top 20.
+  ├─ 2. view A — lexical: bm25 over memories_fts, workspace-filtered, top 20. The two
+  │      columns are weighted content 1.0 / keywords 0.35, bound as parameters rather
+  │      than formatted into the SQL. See design_decisions.md §34.
   │
   ├─ 3. view B — relational: memories sharing an entity with the query, scored by
   │      SUM(memory_entities.weight), top 20. One hop. No traversal, no PageRank.
+  │
+  ├─ 3b. fallback: if view A *and* view B both came back empty, view A is re-run with a
+  │      disjunctive MATCH ("any token" instead of "every token") and its rows are marked
+  │      from_fallback. It is a weaker claim and is labelled as one: `search --context`
+  │      drops these entirely. See design_decisions.md §35.
   │
   ├─ 4. fuse: each view min-max normalized into [0, 1] independently, then
   │      0.6·lexical + 0.4·relational — flipped to 0.4/0.6 when view B found anything.
@@ -159,20 +173,26 @@ when a transport that fields genuinely concurrent clients lands.
 
 ## Schema
 
-Version **2**. `localmem/schema.sql` is the version-1 baseline and is never edited; migrations
+Version **3**. `localmem/schema.sql` is the version-1 baseline and is never edited; migrations
 are forward-only, and `db.migrate()` reads `meta.schema_version` and applies the numbered steps
 after it, idempotently. Version 2 is `db._add_recall_tracking`, two `ALTER TABLE ... ADD COLUMN`
-statements — the first real use of the mechanism built in M1. A v0.1.0 database upgrades in
-place on the next open, with its data untouched and `recalled_count` starting at 0.
+statements — the first real use of the mechanism built in M1. Version 3 is `db._add_keywords`:
+it adds the column, then **drops and recreates** `memories_fts` with a second column, because
+FTS5 has no `ALTER` for a virtual table. All three triggers are recreated carrying the extra
+column — the delete-side rows must pass the OLD value of every indexed column or the index
+corrupts silently — and the step ends with a `'rebuild'`, measured at under 10 ms for 5,000
+rows. A v0.1.0 database upgrades in place on the next open, with its data untouched,
+`recalled_count` starting at 0 and `keywords` NULL.
 
 ```sql
 memories(
     id, content, content_hash, workspace, kind, source, session_id,
     seen_count, superseded_by, created_at, updated_at,
     recalled_count, last_recalled_at,          -- schema version 2
+    keywords,                                  -- schema version 3
     UNIQUE (workspace, content_hash)
 )
-memories_fts        -- external-content FTS5 over memories.content,
+memories_fts        -- external-content FTS5 over memories.content + memories.keywords,
                     -- tokenize='unicode61 remove_diacritics 2', synced by three triggers
 entities(id, name, norm_name, UNIQUE (norm_name))
 memory_entities(memory_id, entity_id, weight, PRIMARY KEY (memory_id, entity_id))
@@ -209,6 +229,14 @@ ids are local to a database. Tier-3 temporal supersede is still open.
 best-effort statement at the end of `retriever.retrieve()`. They exist for `audit` and `stats`;
 nothing in retrieval reads them, and no MCP payload carries them. Rows that predate the upgrade
 start at 0, which `audit` states on every run rather than letting it read as history.
+
+**`keywords`** arrives with schema version 3: a space-separated string of the alternative
+wordings the *writing agent* supplied, indexed as the second column of `memories_fts`. It is
+the one model-authored value in the database, and it is written once, at write time — the
+recall path calls no model. There is **no backfill**: generating keywords needs a model, so
+pre-existing rows stay NULL and rank exactly as they did in v0.2.2. The only way an existing
+row gains keywords is the duplicate merge, which unions the two sets. See
+`design_decisions.md` §34.
 
 **`dedup_queue.status`** is `pending`, `merged` or `kept_both`. Both `memory_id` and
 `candidate_id` declare `ON DELETE CASCADE`, so resolving a pair with `--merge` — which deletes

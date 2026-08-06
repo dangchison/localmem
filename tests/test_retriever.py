@@ -846,6 +846,81 @@ def test_session_neighbors_stay_inside_the_workspace(conn: sqlite3.Connection) -
     assert outcome.results[0].neighbors == ()
 
 
+# --- the disjunctive fallback -----------------------------------------------
+
+
+def test_the_fallback_finds_a_row_the_conjunctive_query_missed(
+    conn: sqlite3.Connection,
+) -> None:
+    """The measured failure: one unmatched token used to zero out the whole query."""
+    target = store.add_memory(conn, "client_max_body_size mặc định 1m trong nginx", WORKSPACE)
+    store.add_memory(conn, "totally different subject about the weather", WORKSPACE)
+    # "khi" appears in no memory, so the conjunctive MATCH returns nothing at all.
+    assert store.search_memories(conn, "nginx khi", WORKSPACE) == []
+
+    outcome = retriever.retrieve(conn, "nginx khi", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [target.id]
+    assert outcome.results[0].from_fallback is True
+
+
+def test_the_fallback_does_not_fire_when_the_lexical_view_answered(
+    conn: sqlite3.Connection,
+) -> None:
+    store.add_memory(conn, "config_loader reads the timeout", WORKSPACE)
+    store.add_memory(conn, "an unrelated note about timeout handling elsewhere", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "config_loader timeout", WORKSPACE, now=NOW)
+
+    # The conjunctive query matched, so the second row — which shares only "timeout" —
+    # must not be dragged in.
+    assert len(outcome.results) == 1
+    assert outcome.results[0].from_fallback is False
+
+
+def test_the_fallback_does_not_fire_when_only_the_relational_view_answered(
+    conn: sqlite3.Connection,
+) -> None:
+    """The gate is "both views empty". An entity-only hit still counts as answered."""
+    store.add_memory(conn, "ConfigLoader retries three times on timeout", WORKSPACE)
+    store.add_memory(conn, "a note mentioning retries and nothing else relevant", WORKSPACE)
+    query = "ConfigLoader zzqqxx"
+    assert store.search_memories(conn, query, WORKSPACE) == []
+    assert retriever.query_entities(query) == ["configloader"]
+
+    outcome = retriever.retrieve(conn, query, WORKSPACE, now=NOW)
+
+    assert [hit.from_fallback for hit in outcome.results] == [False]
+    assert outcome.results[0].lexical_score is None
+
+
+def test_the_fallback_cannot_invent_a_hit_from_nothing(conn: sqlite3.Connection) -> None:
+    """It relaxes AND to OR; it does not lower the bar to "no shared token at all"."""
+    store.add_memory(conn, "config_loader reads the timeout", WORKSPACE)
+
+    outcome = retriever.retrieve(conn, "cấu hình tailwind", WORKSPACE, now=NOW)
+
+    assert outcome.results == ()
+    assert outcome.message == retriever.EMPTY_MESSAGE
+
+
+def test_a_keyword_reaches_the_retriever_without_the_fallback(
+    conn: sqlite3.Connection,
+) -> None:
+    """Keywords are the main lever; the fallback is only the safety net behind them."""
+    target = store.add_memory(
+        conn,
+        "client_max_body_size mặc định 1m trong nginx",
+        WORKSPACE,
+        keywords=["413", "upload", "tải lên"],
+    )
+
+    outcome = retriever.retrieve(conn, "413 upload", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [target.id]
+    assert outcome.results[0].from_fallback is False
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -1035,6 +1110,71 @@ def test_context_prints_no_neighbors_or_scores(db_path: Path) -> None:
     result = runner.invoke(main, ["search", "timeout", "--context", "-w", WORKSPACE])
     assert "related id=" not in result.output
     assert "score" not in result.output
+
+
+def test_context_drops_fallback_hits_but_plain_search_keeps_them(db_path: Path) -> None:
+    """The hook runs on every prompt, so the weak pass is exactly where noise is dear."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "client_max_body_size 1m trong nginx", "-w", WORKSPACE])
+    query = "nginx khi"
+
+    plain = runner.invoke(main, ["search", query, "-w", WORKSPACE])
+    context = runner.invoke(main, ["search", query, "--context", "-w", WORKSPACE])
+
+    assert plain.exit_code == 0
+    assert "client_max_body_size" in plain.output
+    assert "weak: no exact match" in plain.output
+    assert context.exit_code == 0
+    assert context.output == ""
+
+
+def test_context_fallback_opts_the_weak_hits_back_in(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "client_max_body_size 1m trong nginx", "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "nginx khi", "--context-fallback", "-w", WORKSPACE])
+
+    assert result.exit_code == 0
+    assert result.output.splitlines()[0] == "Relevant memories (localmem):"
+    assert "client_max_body_size" in result.output
+
+
+def test_context_still_prints_ordinary_hits_unchanged(db_path: Path) -> None:
+    """The flag must not disturb the common path the hook actually runs."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "config_loader reads the timeout", "-w", WORKSPACE])
+
+    result = runner.invoke(main, ["search", "config_loader", "--context", "-w", WORKSPACE])
+
+    assert result.output.splitlines() == [
+        "Relevant memories (localmem):",
+        f"- ({WORKSPACE}) config_loader reads the timeout",
+    ]
+
+
+def test_cli_add_accepts_repeatable_keywords_and_recall_finds_them(db_path: Path) -> None:
+    runner = CliRunner()
+    added = runner.invoke(
+        main,
+        [
+            "add",
+            "client_max_body_size mặc định 1m trong nginx",
+            "-w",
+            WORKSPACE,
+            "-K",
+            "413",
+            "-K",
+            "tải lên",
+        ],
+    )
+    assert json.loads(added.output)["status"] == "added"
+
+    found = runner.invoke(main, ["search", "413", "-w", WORKSPACE])
+
+    assert found.exit_code == 0
+    assert "client_max_body_size" in found.output
+    # A keyword hit is an ordinary hit, not a weak one.
+    assert "weak: no exact match" not in found.output
 
 
 # --- LOCALMEM_NO_TRACKING ---------------------------------------------------

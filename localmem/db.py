@@ -169,6 +169,71 @@ def _add_recall_tracking(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE memories ADD COLUMN last_recalled_at TEXT")
 
 
+def _add_keywords(conn: sqlite3.Connection) -> None:
+    """v3 — index agent-supplied keywords alongside content.
+
+    ``memories.keywords`` holds the normalized, space-separated keyword string
+    :func:`localmem.store.add_memory` writes; it is NULL for every row that predates this
+    migration and for every row written without keywords, so a keyword-free database
+    ranks exactly as it did in v0.2.2.
+
+    FTS5 has no ``ALTER`` for a virtual table, so ``memories_fts`` is dropped and
+    recreated with the second column. The tokenizer string is copied verbatim from
+    ``schema.sql`` — ``remove_diacritics 2`` is what makes ``dung pnpm`` find ``dùng
+    pnpm``, and any drift here silently unteaches that.
+
+    All three triggers are recreated carrying the extra column. Two details are
+    load-bearing:
+
+    * the delete-side rows pass the OLD value of **every** indexed column. An
+      external-content FTS5 index cannot verify a delete, so a wrong value there corrupts
+      the index with no error;
+    * ``mem_au`` stays narrow — ``AFTER UPDATE OF content, keywords``. The recall path's
+      ``recalled_count`` bump (:func:`localmem.retriever._record_recall`) depends on that
+      list to cost no index maintenance.
+
+    The final ``'rebuild'`` repopulates the new index from ``memories``. It is the only
+    part of this step whose cost scales with the database, and it is small: measured at
+    under 10 ms for 5000 rows on this machine. It is paid once, synchronously, on the
+    first ``open_database`` after the upgrade — including inside the MCP server, which
+    opens the database on every tool call, so one tool call pays it and the rest do not.
+    """
+    conn.execute("ALTER TABLE memories ADD COLUMN keywords TEXT")
+    conn.execute("DROP TABLE memories_fts")
+    conn.execute(
+        "CREATE VIRTUAL TABLE memories_fts USING fts5("
+        "content, "
+        "keywords, "
+        "content='memories', "
+        "content_rowid='id', "
+        "tokenize='unicode61 remove_diacritics 2')"
+    )
+    conn.execute("DROP TRIGGER IF EXISTS mem_ai")
+    conn.execute("DROP TRIGGER IF EXISTS mem_ad")
+    conn.execute("DROP TRIGGER IF EXISTS mem_au")
+    conn.execute(
+        "CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN "
+        "INSERT INTO memories_fts(rowid, content, keywords) "
+        "VALUES (new.id, new.content, new.keywords); "
+        "END"
+    )
+    conn.execute(
+        "CREATE TRIGGER mem_ad AFTER DELETE ON memories BEGIN "
+        "INSERT INTO memories_fts(memories_fts, rowid, content, keywords) "
+        "VALUES ('delete', old.id, old.content, old.keywords); "
+        "END"
+    )
+    conn.execute(
+        "CREATE TRIGGER mem_au AFTER UPDATE OF content, keywords ON memories BEGIN "
+        "INSERT INTO memories_fts(memories_fts, rowid, content, keywords) "
+        "VALUES ('delete', old.id, old.content, old.keywords); "
+        "INSERT INTO memories_fts(rowid, content, keywords) "
+        "VALUES (new.id, new.content, new.keywords); "
+        "END"
+    )
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+
 def _iter_statements(script: str) -> Iterator[str]:
     """Yield complete SQL statements, keeping ``CREATE TRIGGER`` bodies intact."""
     buffer = ""
@@ -195,6 +260,7 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 _MIGRATIONS: tuple[tuple[int, MigrationStep], ...] = (
     (1, _apply_initial_schema),
     (2, _add_recall_tracking),
+    (3, _add_keywords),
 )
 
 #: The version a freshly opened database ends up at. Derived, never typed twice.

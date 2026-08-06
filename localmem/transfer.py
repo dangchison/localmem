@@ -53,11 +53,18 @@ _COUNT_SQL = "SELECT COUNT(*) AS n FROM memories"
 # collide with whatever the target already stores. `superseded_by` is absent for the same
 # reason — it holds an id, it is reserved schema with no logic behind it in v0.2, and
 # carrying a remapped-away reference would be worse than carrying none.
+#
+# Every OTHER column of `memories` must be listed here. Export is `SELECT *` and picks up
+# a new column for free; restore is explicit and does not, so a column added by a
+# migration and forgotten here vanishes on the round trip with no error at all. A test
+# pins the actual values of `keywords` through export→restore for exactly this reason —
+# checking the column *list* against `PRAGMA table_info` is not enough, because that
+# passes for any column whether or not it is carried.
 _RESTORE_SQL = """
 INSERT INTO memories
     (content, content_hash, workspace, kind, source, session_id,
-     seen_count, created_at, updated_at, recalled_count, last_recalled_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     seen_count, created_at, updated_at, recalled_count, last_recalled_at, keywords)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(workspace, content_hash) DO UPDATE
    SET seen_count = max(memories.seen_count, excluded.seen_count)
 """
@@ -204,7 +211,24 @@ def _values(record: dict[str, Any], now: str) -> tuple[object, ...]:
         _text(record.get("updated_at")) or created_at,
         _count(record.get("recalled_count"), default=0),
         _text(record.get("last_recalled_at")),
+        # Re-normalized rather than trusted, the same treatment `content_hash` gets: a
+        # hand-written document may spell them as a JSON list, and one written by an
+        # older localmem has no keywords at all.
+        store.normalize_keywords(_keywords(record.get("keywords"))),
     )
+
+
+def _keywords(value: object) -> list[str]:
+    """Return a record's ``keywords`` as a list, from either shape a document may use.
+
+    ``export`` writes the stored string, but a document a human assembled is far more
+    likely to carry a JSON array, so both are accepted.
+    """
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
 
 
 def _text(value: object) -> str | None:

@@ -160,7 +160,9 @@ def test_stdio_initialize_and_list_tools(db_path: Path, tmp_path: Path) -> None:
     )
     assert tools["memory_add"].description == (
         "Save a durable fact, decision, or lesson to the user's persistent memory. "
-        "Call when you learn something worth remembering across sessions."
+        "Call when you learn something worth remembering across sessions. Always pass "
+        "keywords: synonyms, Vietnamese+English terms, error codes, symptoms — search is "
+        "lexical."
     )
 
 

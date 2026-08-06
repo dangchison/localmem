@@ -7,6 +7,8 @@ Implements the original spec §5. The pipeline is pure code — no model, no net
    a *named* workspace also reads the shared ``global`` tier (§24 of the design
    decisions); ``None`` ("every workspace") and ``"global"`` itself are unchanged;
 3. **view B**, relational: memories sharing an entity with the query, scored by Σweight;
+   with both views empty, view A is retried as a disjunction and its rows are marked
+   ``from_fallback``;
 4. fuse — each view min-max normalized independently, then weighted;
 5. recency and ``seen_count`` boosts;
 6. evidence closure — up to two neighbors per result;
@@ -116,6 +118,9 @@ EMPTY_MESSAGE = "no memories yet — memories will accumulate as you work"
 # Both views select the same columns so :func:`_read_view` can read either one. The list
 # is spelled out per query rather than interpolated: composing SQL from Python fragments
 # is the habit that hides an injection, even when the fragment is a constant.
+# The two `?` in bm25() are the column weights, bound from `store.BM25_COLUMN_WEIGHTS`
+# ahead of the MATCH expression. Binding them keeps the one ranking rule defined in one
+# place without either module building a query string out of Python values.
 _LEXICAL_SQL = """
 SELECT m.id         AS id,
        m.content    AS content,
@@ -125,7 +130,7 @@ SELECT m.id         AS id,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
        m.created_at AS created_at,
-       -bm25(memories_fts) AS score
+       -bm25(memories_fts, ?, ?) AS score
   FROM memories_fts
   JOIN memories AS m ON m.id = memories_fts.rowid
  WHERE memories_fts MATCH ?
@@ -224,6 +229,9 @@ class RetrievedMemory:
         relational_score: the normalized view B score, or ``None`` if view B missed it.
         neighbors: up to :data:`MAX_NEIGHBORS` supporting memories, never a row that is
             itself in ``results``.
+        from_fallback: the row was found by the disjunctive last-resort pass, after both
+            views came back empty. A weaker claim than an ordinary hit — see
+            :func:`retrieve` — and the reason ``search --context`` drops these by default.
     """
 
     id: int
@@ -237,6 +245,7 @@ class RetrievedMemory:
     lexical_score: float | None
     relational_score: float | None
     neighbors: tuple[Neighbor, ...]
+    from_fallback: bool
 
 
 @dataclass(frozen=True)
@@ -307,6 +316,11 @@ def retrieve(
         k: number of results, from 1 to 20.
         now: the instant recency is measured against; defaults to the current UTC time.
 
+    When **both** views come back empty the lexical query is retried disjunctively (see
+    :func:`_fallback_view`) and every result of that pass is marked ``from_fallback``.
+    The gate is deliberately "both empty", not "few results": as long as either view
+    answered, the conjunctive ranking is the better one and is left alone.
+
     A recall is *almost* read-only: the ids it returns get their ``recalled_count``
     bumped by :func:`_record_recall`, best-effort and never able to fail the call.
     Setting :data:`NO_TRACKING_ENV_VAR` removes that write and makes it read-only.
@@ -323,6 +337,7 @@ def retrieve(
     recency_weight = RECENCY_CUE_WEIGHT if cued else RECENCY_WEIGHT
     match_expression = store.build_match_expression(lexical_text)
 
+    fallback = False
     if cued and not match_expression:
         # The query was nothing but a cue — "today", "tuần trước". There is no lexical or
         # relational question to ask, so the recency term becomes the whole ranking.
@@ -335,6 +350,8 @@ def retrieve(
         # entities under any of the indexer's classes, so stripping them would only risk
         # two divergent query texts flowing through the pipeline.
         relational = _relational_view(conn, query_entities(query), scope)
+        if not lexical.memories and not relational.scores:
+            lexical, fallback = _fallback_view(conn, lexical_text, scope)
         top = _fuse(lexical, relational, moment, recency_weight, scope)[:k]
 
     selected = {scored.row.id for scored in top}
@@ -351,6 +368,7 @@ def retrieve(
             lexical_score=scored.lexical,
             relational_score=scored.relational,
             neighbors=_neighbors(conn, scored.row, selected),
+            from_fallback=fallback,
         )
         for scored in top
     )
@@ -471,12 +489,34 @@ def _lexical_view(conn: sqlite3.Connection, match_expression: str, workspace: st
     """View A: bm25 over the FTS5 index, best ``CANDIDATE_LIMIT`` rows."""
     predicate, scope = _workspace_scope(workspace)
     sql = _LEXICAL_SQL
-    params: list[object] = [match_expression]
+    params: list[object] = [*store.BM25_COLUMN_WEIGHTS, match_expression]
     if predicate:
         sql += " AND " + predicate
         params.extend(scope)
     params.append(CANDIDATE_LIMIT)
     return _read_view(conn, sql + _LEXICAL_ORDER_BY, params)
+
+
+def _fallback_view(
+    conn: sqlite3.Connection, lexical_text: str, workspace: str | None
+) -> tuple[_View, bool]:
+    """Re-run view A disjunctively, and report whether it actually found anything.
+
+    Reached only when the conjunctive query and the entity view both returned nothing —
+    the case the CEO measured at 13 empty results out of 14 realistic queries. Requiring
+    *any* token instead of *every* token turns most of those into a hit.
+
+    It is a genuinely weaker signal and is labelled as one. An OR query cannot stay
+    silent: over ten queries whose answer was not in the corpus at all it returned
+    plausible-looking rows ten times out of ten. That is tolerable for a recall an agent
+    reads and judges, and not tolerable for the per-prompt hook — which is why the flag
+    travels all the way out to ``RetrievedMemory.from_fallback``.
+    """
+    expression = store.build_or_match_expression(lexical_text)
+    if not expression:
+        return _View({}, {}), False
+    view = _lexical_view(conn, expression, workspace)
+    return view, bool(view.memories)
 
 
 def _relational_view(

@@ -1239,3 +1239,116 @@ Default behaviour is unchanged.
   process and a test suite both change the environment after import time.
 - `audit` degrades honestly rather than lying: with tracking off, every memory reads as never
   recalled. That is stated in the README's limitations rather than hidden.
+
+---
+
+## 34. `keywords` is a second FTS5 column, weighted 0.35 against content's 1.0
+
+**Milestone:** v0.3.0
+
+Limitation 1 was the most-felt one in the product, and it was finally measured rather than
+described: over 14 realistic query/memory pairs sharing no tokens — half Vietnamese, some
+crossing languages — v0.2.2 returned **nothing at all for 13 of them**. The cause is not that
+bm25 is weak; it is that `build_match_expression` is **conjunctive**. `"xử" "lý" "upload"
+"ảnh"` demands all four tokens, so one unmatched word zeroes the whole query.
+
+Two candidates were measured. An embedding view was prototyped and **rejected**: no similarity
+threshold separated signal from noise across the same 14 pairs, and it cost a 1 GB model to
+get there (the four incidental findings are recorded in the README's roadmap so nobody repeats
+the work). The winner was agent-supplied keywords indexed alongside content: **11 of 14
+correct in the top 3**, at roughly 20-40 output tokens per memory, paid once at write time.
+
+**Decision:** `memories.keywords` holds a normalized, space-separated string, indexed as a
+second column of `memories_fts`. `-bm25(memories_fts, 1.0, 0.35)` weights it.
+
+**Consequences**
+
+- **The weight is measured, not chosen.** bm25 rewards a hit in a short field, and a keyword
+  list is the shortest field in the table, so an unweighted second column systematically
+  out-ranks real content matches. Sweeping 0.2 → 1.0 over a bilingual fixture set gives a safe
+  band of **[0.25, 0.5]**: below it a keyword-only target drops out of the top 3, and at 0.6
+  and above a *one-word* keyword list starts beating a paragraph genuinely about the term.
+  0.35 sits inside with margin on both sides.
+- **The weights are bound parameters, not formatted into the SQL.** SQLite accepts
+  `bm25(memories_fts, ?, ?)`, so the one ranking rule is defined once in
+  `store.BM25_COLUMN_WEIGHTS` without either module composing a query string — this module's
+  docstring warns against exactly that habit, and ruff's `S608` enforces it.
+- **A keyword-free database ranks identically to v0.2.2**, and a test proves it rather than
+  asserting it: the same corpus is built on the v2 single-column index and on today's
+  two-column one, and both ids *and* scores must match exactly. bm25 divides by total document
+  length across all columns, so an empty `keywords` column is arithmetically invisible. This
+  matters because almost every already-stored row has no keywords.
+- **There is no backfill, and there cannot be one.** Generating keywords needs a model and
+  localmem calls none. The only route by which an existing memory gains keywords is the
+  duplicate merge, which **unions** the two sets — so re-adding a memory with keywords enriches
+  it in place. That merge uses a separate `UPDATE` statement carrying the column, run only when
+  the union actually changes something, because `mem_au` fires on any statement that *mentions*
+  `keywords` and re-indexing on every ordinary merge is a cost that path should not pay.
+- **`schema.sql` stays the version-1 baseline.** v3 is a forward-only migration step written
+  as direct `conn.execute` calls. FTS5 has no `ALTER` for a virtual table, so the step drops
+  `memories_fts`, recreates it with both columns and the *byte-identical* tokenizer string,
+  recreates all three triggers carrying the extra column, and rebuilds. Measured at under
+  10 ms for 5,000 rows.
+- **`mem_au` stays narrow** — `AFTER UPDATE OF content, keywords`. §27's `recalled_count` bump
+  depends on that column list to cost no index maintenance.
+- **`restore` had to be edited by hand.** `export` is `SELECT *` and picked the column up for
+  free; `_RESTORE_SQL` is an explicit column list and did not. The existing test could not
+  catch it — it derives expected columns from `PRAGMA table_info` at runtime, so it passes for
+  any new column whether or not restore carries it. The new test pins keyword **values**
+  through a round trip.
+
+---
+
+## 35. The OR fallback fires only when both views are empty, and `--context` drops its results
+
+**Milestone:** v0.3.0
+
+Keywords are the main lever (§34), but they only help a memory somebody thought to annotate. A
+query with one stray word — `413 khi upload`, where `khi` appears in no memory and no keyword
+list — still returns nothing under a conjunctive match.
+
+Relaxing to OR fixes that, and on its own is a **bad** trade: measured alone it recovers only
+5 of the 14 pairs, and it is incapable of silence. Over 10 off-corpus queries — questions whose
+answer was never stored — an OR match returned plausible-looking rows **10 times out of 10**.
+
+**Decision:** re-run view A disjunctively **only** when the lexical *and* relational views both
+came back empty, and mark every result of that pass `from_fallback`.
+
+**Consequences**
+
+- **The gate is "both empty", not "few results".** As long as either view answered, the
+  conjunctive ranking is the better one and is left untouched — so the entity-only recall of
+  §11 and every existing ranking test behave exactly as before.
+- **`build_match_expression` is not modified.** `build_or_match_expression` is a sibling; both
+  share one private tokenizer/quoter, so the two expressions can never drift in their escaping.
+- **The label travels all the way out.** `RetrievedMemory.from_fallback` is not on the MCP
+  wire — §4's result object is frozen at eight keys — but `localmem search` appends
+  `[weak: no exact match, any-word fallback]`, and that is the honest description.
+- **`search --context` drops fallback hits by default**, with `--context-fallback` to opt back
+  in. This is the one caller that pays for noise on *every prompt* (§30), which is precisely
+  where a 10-out-of-10 false-positive rate is expensive. Ordinary `search` and `memory_recall`
+  return them and leave the judgement to the agent, which can see the query it asked.
+
+---
+
+## 36. Tier-2 dedup candidate generation widens, and is left alone
+
+**Milestone:** v0.3.0
+
+`dedup._CANDIDATE_SQL` matches `memories_fts`, which now covers `keywords` as well as
+`content`. Tier-2 candidate generation therefore sees strictly more candidates than it did in
+v0.2.2 — two memories that share a keyword but no content term can now be proposed to each
+other.
+
+**Decision:** change nothing. Recorded here so the widening is a known consequence rather than
+a surprise in the queue.
+
+**Consequences**
+
+- **The gate is unchanged and still content-only.** `_CANDIDATE_SQL` only *proposes*; the
+  merge decision is Jaccard token overlap ≥ 0.7 computed over `content` alone (`dedup.jaccard`).
+  A pair that shares only a keyword scores far below that and is dropped, so the widening
+  costs a few more Jaccard computations and produces no new queue rows in practice.
+- **No tier reads the keywords column deliberately**, so the hash (tier-1) and overlap
+  (tier-2) semantics are exactly what they were. A memory is still a duplicate of another
+  because of what it *says*, never because of how it was tagged.

@@ -64,6 +64,62 @@ def test_the_document_carries_every_column_of_every_row(
     assert {"content_hash", "seen_count", "recalled_count", "created_at", "session_id"} <= columns
 
 
+def test_keywords_survive_a_round_trip_with_their_values_intact(
+    tmp_path: Path,
+) -> None:
+    """Export is ``SELECT *``; restore is an explicit column list. Only the second can
+    forget a column, and forgetting it loses data with no error whatsoever.
+
+    ``test_the_document_carries_every_column_of_every_row`` cannot catch that: it derives
+    the expected columns from ``PRAGMA table_info`` at runtime, so it passes for any new
+    column whether or not restore actually carries it. This asserts the *values*.
+    """
+    origin = _open(tmp_path / "origin.db")
+    try:
+        store.add_memory(
+            origin,
+            "client_max_body_size mặc định 1m trong nginx",
+            WORKSPACE,
+            keywords=["413", "upload", "tải lên"],
+        )
+        store.add_memory(origin, "a memory with no keywords at all", WORKSPACE)
+        document = transfer.export_document(origin)
+    finally:
+        origin.close()
+
+    assert [record["keywords"] for record in document[transfer.MEMORIES_KEY]] == [
+        "413 upload tải lên",
+        None,
+    ]
+
+    target = _open(tmp_path / "target.db")
+    try:
+        transfer.restore(target, document[transfer.MEMORIES_KEY])
+        stored = target.execute("SELECT keywords FROM memories ORDER BY id").fetchall()
+        assert [row["keywords"] for row in stored] == ["413 upload tải lên", None]
+        # Restored keywords are indexed, not merely stored: the recall works on the
+        # other machine too, which is the only reason to carry them at all.
+        assert [hit.content for hit in store.search_memories(target, "413", WORKSPACE)] == [
+            "client_max_body_size mặc định 1m trong nginx"
+        ]
+    finally:
+        target.close()
+
+
+def test_a_hand_written_document_may_spell_keywords_as_a_list(tmp_path: Path) -> None:
+    target = _open(tmp_path / "target.db")
+    try:
+        transfer.restore(
+            target,
+            [{"content": "nginx body size limit", "workspace": WORKSPACE, "keywords": ["413"]}],
+        )
+        assert [hit.content for hit in store.search_memories(target, "413", WORKSPACE)] == [
+            "nginx body size limit"
+        ]
+    finally:
+        target.close()
+
+
 def test_the_document_holds_no_derived_or_transient_table(
     source: sqlite3.Connection,
 ) -> None:

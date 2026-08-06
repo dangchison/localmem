@@ -45,7 +45,9 @@ RECALL_DESCRIPTION = (
 )
 ADD_DESCRIPTION = (
     "Save a durable fact, decision, or lesson to the user's persistent memory. "
-    "Call when you learn something worth remembering across sessions."
+    "Call when you learn something worth remembering across sessions. Always pass "
+    "keywords: synonyms, Vietnamese+English terms, error codes, symptoms — search is "
+    "lexical."
 )
 
 # §4's `workspace` param: this value means "every workspace" on recall. It is not a
@@ -140,6 +142,7 @@ def memory_add(
     workspace: str | None = None,
     kind: str = store.DEFAULT_KIND,
     source: str | None = None,
+    keywords: list[str] | None = None,
 ) -> dict[str, Any]:
     """Store ``content`` and return §4's add payload.
 
@@ -150,6 +153,10 @@ def memory_add(
         kind: one of :data:`ADD_KINDS`. ``"core"`` is rejected with
             :data:`CORE_KIND_REJECTION`, which names the CLI command that writes one.
         source: the calling agent's name, if it knows it.
+        keywords: alternative wordings this memory should be findable by. This is the
+            one part of localmem a model contributes to, and it is charged at write
+            time only — roughly 20-40 output tokens, once, for a memory that is then
+            recalled for free forever. Recall itself stays LLM-free.
 
     Returns:
         ``{"status": "added" | "duplicate_merged", "id": int, "seen_count": int}``. On
@@ -161,7 +168,7 @@ def memory_add(
     See :func:`memory_recall` for why ``except Exception`` is authorized here.
     """
     try:
-        return _add(content, workspace, kind, source)
+        return _add(content, workspace, kind, source, keywords)
     except Exception as exc:
         _LOGGER.exception("memory_add failed for kind %r", kind)
         return {"status": "error", "id": 0, "seen_count": 0, "message": f"{ERROR_PREFIX}{exc}"}
@@ -180,7 +187,13 @@ def _recall(query: str, workspace: str | None, k: int) -> dict[str, Any]:
     }
 
 
-def _add(content: str, workspace: str | None, kind: str, source: str | None) -> dict[str, Any]:
+def _add(
+    content: str,
+    workspace: str | None,
+    kind: str,
+    source: str | None,
+    keywords: list[str] | None,
+) -> dict[str, Any]:
     """Run one write; raises on bad input or a database failure."""
     if not content.strip():
         # Checked before the workspace is resolved so an empty write never pays for the
@@ -192,7 +205,7 @@ def _add(content: str, workspace: str | None, kind: str, source: str | None) -> 
         raise ValueError(f"kind must be one of {', '.join(ADD_KINDS)}; got {kind!r}")
     target = _add_workspace(workspace)
     with _connection() as conn:
-        result = store.add_memory(conn, content, target, kind, source, None)
+        result = store.add_memory(conn, content, target, kind, source, None, keywords)
     return {"status": result.status, "id": result.id, "seen_count": result.seen_count}
 
 

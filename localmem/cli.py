@@ -52,6 +52,11 @@ _NEIGHBOR_PREVIEW_CHARS = 100
 CONTEXT_SNIPPET_CHARS = 400
 _CONTEXT_HEADER = "Relevant memories (localmem):"
 
+#: Appended to a result the disjunctive fallback found. Nothing else matched the query,
+#: so the row shares *some* word with it rather than all of them — worth showing, worth
+#: labelling. ``--context`` drops these entirely; see :func:`_echo_context`.
+_FALLBACK_MARKER = " [weak: no exact match, any-word fallback]"
+
 # The query `init` step 5 runs to prove recall works end to end.
 _SELF_CHECK_QUERY = "localmem"
 
@@ -80,17 +85,31 @@ def main() -> None:
 )
 @click.option("--source", default=None, help="Origin of the memory, e.g. the calling agent.")
 @click.option("--session-id", default=None, help="Session identifier for provenance.")
+@click.option(
+    "-K",
+    "--keyword",
+    "keywords",
+    multiple=True,
+    help=(
+        "Another word this memory should be findable by — a synonym, the other "
+        "language's term, an error code. Repeatable. Merging an identical memory "
+        "unions its keywords into the stored row."
+    ),
+)
 def add(
     content: str,
     workspace: str | None,
     kind: str,
     source: str | None,
     session_id: str | None,
+    keywords: tuple[str, ...],
 ) -> None:
     """Store CONTENT, merging it into an existing row if identical."""
     with _session() as (conn, _path):
         target_workspace = _resolve_workspace(workspace)
-        result = store.add_memory(conn, content, target_workspace, kind, source, session_id)
+        result = store.add_memory(
+            conn, content, target_workspace, kind, source, session_id, keywords
+        )
     click.echo(
         json.dumps(
             {"status": result.status, "id": result.id, "seen_count": result.seen_count},
@@ -117,19 +136,26 @@ def add(
     is_flag=True,
     help="Compact output for a prompt hook; prints nothing when nothing matches.",
 )
+@click.option(
+    "--context-fallback",
+    "context_fallback",
+    is_flag=True,
+    help="Include weak OR-fallback hits in --context output (implies --context).",
+)
 def search(
     query: str,
     workspace: str | None,
     limit: int,
     search_all: bool,
     as_context: bool,
+    context_fallback: bool,
 ) -> None:
     """Recall memories matching QUERY, best match first."""
     with _session() as (conn, _path):
         target_workspace = None if search_all else _resolve_workspace(workspace)
         outcome = retriever.retrieve(conn, query, target_workspace, limit)
-    if as_context:
-        _echo_context(outcome)
+    if as_context or context_fallback:
+        _echo_context(outcome, context_fallback)
         return
     _echo_core_memory(outcome)
     if not outcome.results:
@@ -143,6 +169,9 @@ def search(
             f"{rank}. [score {hit.score:.3g}] "
             f"id={hit.id} workspace={hit.workspace} kind={hit.kind} "
             f"seen={hit.seen_count} created={hit.created_at}"
+            # Only ever appended, and only on the weak pass, so the ordinary line is
+            # byte-for-byte what v0.2.2 printed.
+            f"{_FALLBACK_MARKER if hit.from_fallback else ''}"
         )
         if hit.source:
             click.echo(f"   source: {hit.source}")
@@ -545,21 +574,27 @@ def _preview(text: str) -> str:
     return collapsed[: _NEIGHBOR_PREVIEW_CHARS - 1] + "…"
 
 
-def _echo_context(outcome: retriever.RetrievalResult) -> None:
+def _echo_context(outcome: retriever.RetrievalResult, include_fallback: bool = False) -> None:
     """Print the compact block a prompt hook injects, or nothing at all.
 
-    Two rules, both about a hook that runs on *every* prompt:
+    Three rules, all about a hook that runs on *every* prompt:
 
     * no hits prints **nothing** — not the friendly empty-database message, which would
       otherwise be pasted into the context of every prompt the user ever writes;
     * core memory is left out. It is loaded on demand by an ordinary recall; injecting
       it per prompt would turn a capped 400-token block into a fixed per-prompt cost,
-      which is the charge localmem exists to avoid (``docs/design_decisions.md`` §30).
+      which is the charge localmem exists to avoid (``docs/design_decisions.md`` §30);
+    * OR-fallback hits are **dropped** unless ``include_fallback`` says otherwise. The
+      fallback cannot stay silent — on ten queries whose answer was not stored at all it
+      returned plausible-looking rows ten times out of ten — and this is the one caller
+      that pays for that on every single prompt. An ordinary ``search`` and
+      ``memory_recall`` still return them, for an agent to judge for itself.
     """
-    if not outcome.results:
+    shown = [hit for hit in outcome.results if include_fallback or not hit.from_fallback]
+    if not shown:
         return
     click.echo(_CONTEXT_HEADER)
-    for hit in outcome.results:
+    for hit in shown:
         click.echo(f"- ({hit.workspace}) {_context_snippet(hit)}")
 
 
