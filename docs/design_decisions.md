@@ -2235,6 +2235,13 @@ itself, i.e. a redesign of the ranking rather than a term added to it, justified
 **What would change the answer.** A fixture large enough that one query is not 5% of the sample, or
 a query band built specifically to isolate the fallback's ordering. Not a bigger weight.
 
+> **Superseded evidence, verdict not yet re-derived.** Every number above was measured on the
+> 30-document corpus. §55 widened it to 59 documents and 45 positive queries, which is precisely the
+> "large enough" condition this section names — so this rejection now rests on a fixture that no
+> longer exists, and the sweep should be re-run before anyone cites it. It is left standing rather
+> than deleted because the two structural findings — Jaccard's zero spread, and coverage being blind
+> without the keywords column — do not depend on the corpus size.
+
 ### One live defect found on the way, unrelated to the rerank
 
 `_STOPWORDS` is **English only**, and `top_terms` — which generates tier-2 near-duplicate candidates
