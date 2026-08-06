@@ -1,0 +1,379 @@
+{
+  "version": 1,
+  "name": "bilingual-v1",
+  "description": "A synthetic bilingual (Vietnamese + English) engineering corpus with graded queries. Seeded from the Gate 0 v0.3.0 pairs recorded in .corp/localmem-v1/gate0-v030-result.md and plan-v030.md; the pairs that survived only as prose in those reports were rewritten in the same spirit, so this is a NEW corpus with its own baseline, not a reproduction of the Gate 0 numbers. Keywords were written from each document alone, as an agent would at write time without knowing the future query.",
+  "corpus": [
+    {
+      "id": "doc-multipart",
+      "content": "fix multipart boundary khi upload file bị 413 — nginx client_max_body_size mặc định 1m, nâng lên 20m rồi reload là hết",
+      "kind": "lesson",
+      "keywords": ["upload", "ảnh", "image", "413", "payload too large", "nginx"],
+      "age_days": 40
+    },
+    {
+      "id": "doc-ci-cache",
+      "content": "CI cache miss làm build lâu gấp đôi — key cache dựng từ hash của lockfile, đổi lockfile là mất sạch cache",
+      "kind": "lesson",
+      "keywords": ["deploy", "chậm", "slow build", "pipeline"],
+      "age_days": 62
+    },
+    {
+      "id": "doc-migration",
+      "content": "the prod migration failed because ALTER TABLE takes an ACCESS EXCLUSIVE lock and the long-running report query never released its own",
+      "kind": "lesson",
+      "keywords": ["migration", "prod", "lock", "timeout", "deploy"],
+      "age_days": 12
+    },
+    {
+      "id": "doc-tailwind",
+      "content": "cấu hình tailwind: content globs phải trỏ đúng src/**/*.tsx, nếu không class bị purge mất khi build production",
+      "kind": "note",
+      "keywords": ["tailwind", "css", "purge", "frontend"],
+      "age_days": 90
+    },
+    {
+      "id": "doc-dockerfile",
+      "content": "reorder the Dockerfile so COPY package.json comes before COPY . — the layer cache then survives a source-only change",
+      "kind": "lesson",
+      "keywords": ["docker", "layer cache", "build"],
+      "age_days": 75
+    },
+    {
+      "id": "doc-naming",
+      "content": "naming convention: snake_case for python modules, camelCase for typescript identifiers, kebab-case for file names",
+      "kind": "note",
+      "keywords": ["naming", "style", "convention"],
+      "age_days": 110
+    },
+    {
+      "id": "doc-api-500",
+      "content": "lỗi 500 khi gọi api là do gateway nuốt header Authorization, không phải backend hỏng",
+      "kind": "lesson",
+      "keywords": ["500", "api", "gateway", "auth"],
+      "age_days": 20
+    },
+    {
+      "id": "doc-jwt-expiry",
+      "content": "JWT hết hạn sau 15 phút còn refresh token sống 7 ngày — client phải tự gia hạn trước khi phiên chết",
+      "kind": "note",
+      "keywords": ["token", "đăng nhập", "login", "session", "auth"],
+      "age_days": 33
+    },
+    {
+      "id": "doc-n1-query",
+      "content": "N+1 query trong danh sách đơn hàng — thêm include cho quan hệ customer là đủ, không cần raw SQL",
+      "kind": "lesson",
+      "keywords": ["chậm", "slow", "sequelize", "orm", "query"],
+      "age_days": 8
+    },
+    {
+      "id": "doc-index-missing",
+      "content": "adding a composite index on (user_id, created_at) took the report query from 8s down to 40ms",
+      "kind": "lesson",
+      "keywords": ["slow query", "index", "postgres", "báo cáo", "report"],
+      "age_days": 55
+    },
+    {
+      "id": "doc-timezone",
+      "content": "lưu timestamp bằng UTC trong DB, chỉ đổi sang giờ Việt Nam ở tầng hiển thị",
+      "kind": "note",
+      "keywords": ["timezone", "giờ", "date", "utc"],
+      "age_days": 100
+    },
+    {
+      "id": "doc-pnpm",
+      "content": "dùng pnpm chứ không npm trong repo này — npm install sẽ phá symlink của workspace",
+      "kind": "note",
+      "keywords": ["package manager", "cài đặt", "install", "dependency"],
+      "age_days": 47
+    },
+    {
+      "id": "doc-env-secret",
+      "content": ".env không được commit — dùng .env.example và đọc giá trị thật từ 1password ở CI",
+      "kind": "note",
+      "keywords": ["secret", "biến môi trường", "config", "credential"],
+      "age_days": 70
+    },
+    {
+      "id": "doc-idempotency",
+      "content": "retry chỉ an toàn khi endpoint idempotent — POST /orders bắt buộc mang Idempotency-Key",
+      "kind": "lesson",
+      "keywords": ["retry", "duplicate", "đơn trùng", "order"],
+      "age_days": 15
+    },
+    {
+      "id": "doc-flaky-clock",
+      "content": "test flaky vì gọi thẳng Date.now() — inject clock qua constructor là hết rung",
+      "kind": "lesson",
+      "keywords": ["test", "flaky", "thời gian", "clock"],
+      "age_days": 5
+    },
+    {
+      "id": "doc-cors",
+      "content": "CORS preflight fails when the server echoes * together with credentials true — it must name the origin explicitly",
+      "kind": "lesson",
+      "keywords": ["cors", "browser", "fetch", "frontend"],
+      "age_days": 28
+    },
+    {
+      "id": "doc-worker-leak",
+      "content": "memory leak ở worker vì listener không được gỡ khi job kết thúc, RSS bò lên sau vài giờ",
+      "kind": "lesson",
+      "keywords": ["rò rỉ", "ram", "node", "worker"],
+      "age_days": 18
+    },
+    {
+      "id": "doc-rate-limit",
+      "content": "rate limit 100 request mỗi phút theo API key, vượt thì trả 429 kèm Retry-After",
+      "kind": "note",
+      "keywords": ["429", "throttle", "giới hạn", "api"],
+      "age_days": 38
+    },
+    {
+      "id": "doc-websocket",
+      "content": "websocket rớt sau 60 giây vì load balancer đóng idle connection — bật heartbeat ping mỗi 30 giây",
+      "kind": "lesson",
+      "keywords": ["realtime", "disconnect", "mất kết nối", "socket"],
+      "age_days": 25
+    },
+    {
+      "id": "doc-git-rebase",
+      "content": "prefer rebase over merge on feature branches here; a linear history keeps cherry-picks cheap",
+      "kind": "note",
+      "keywords": ["git", "branch", "workflow"],
+      "age_days": 120
+    },
+    {
+      "id": "doc-review-sla",
+      "content": "review phải xong trong 24 giờ, quá hạn thì bot tự ping trong standup buổi sáng",
+      "kind": "note",
+      "keywords": ["quy trình", "process", "pull request", "team"],
+      "age_days": 85
+    },
+    {
+      "id": "doc-staging-data",
+      "content": "staging chạy trên snapshot của prod đã ẩn danh, refresh lại mỗi sáng thứ hai",
+      "kind": "note",
+      "keywords": ["staging", "dữ liệu", "môi trường", "environment"],
+      "age_days": 64
+    },
+    {
+      "id": "doc-mobile-viewport",
+      "content": "mobile viewport phải test ở 375px — bảng giá vỡ layout ở mọi bề ngang dưới 400px",
+      "kind": "lesson",
+      "keywords": ["responsive", "điện thoại", "ui", "mobile"],
+      "age_days": 30
+    },
+    {
+      "id": "doc-sentry-scope",
+      "content": "sentry hiện chỉ bắt lỗi phía server; lỗi phía client cần bật browser SDK riêng mới thấy",
+      "kind": "note",
+      "keywords": ["monitoring", "log", "lỗi", "sentry"],
+      "age_days": 50
+    },
+    {
+      "id": "doc-match-empty",
+      "content": "build_match_expression trả về chuỗi rỗng khi câu hỏi chỉ toàn ký tự đặc biệt, lúc đó nhánh lexical bỏ trống hoàn toàn",
+      "kind": "lesson",
+      "keywords": ["fts", "match", "rỗng", "empty query"],
+      "age_days": 22
+    },
+    {
+      "id": "doc-fts-tokenizer",
+      "content": "memories_fts khai báo tokenize unicode61 remove_diacritics 2, nhờ vậy gõ không dấu vẫn ra được kết quả có dấu",
+      "kind": "note",
+      "keywords": ["tokenizer", "dấu", "diacritics", "tiếng việt"],
+      "age_days": 58
+    },
+    {
+      "id": "doc-write-tx",
+      "content": "add_memory gọi index_memory trong cùng một BEGIN IMMEDIATE nên hàng memory và entity link luôn commit chung",
+      "kind": "lesson",
+      "keywords": ["transaction", "atomic", "ghi", "write path"],
+      "age_days": 44
+    },
+    {
+      "id": "doc-db-path",
+      "content": "config.py đọc biến môi trường trước, không có thì mới rơi về ~/.localmem/memory.db mặc định",
+      "kind": "note",
+      "keywords": ["đường dẫn", "path", "database", "env"],
+      "age_days": 66
+    },
+    {
+      "id": "doc-frozen-payload",
+      "content": "RetrievedMemory là frozen dataclass; payload trả qua MCP đóng băng đúng 8 khoá, thêm field là phá hợp đồng",
+      "kind": "lesson",
+      "keywords": ["payload", "api contract", "khoá", "schema"],
+      "age_days": 35
+    },
+    {
+      "id": "doc-schema-version",
+      "content": "schema_version nằm trong bảng meta và quyết định migration nào còn phải chạy; các bước chỉ được nối thêm, không sửa lại",
+      "kind": "note",
+      "keywords": ["migration", "forward only", "nâng cấp", "upgrade"],
+      "age_days": 78
+    }
+  ],
+  "queries": [
+    {
+      "id": "q-upload",
+      "text": "xử lý upload ảnh lỗi",
+      "relevant": ["doc-multipart"]
+    },
+    {
+      "id": "q-deploy-slow",
+      "text": "sao deploy chậm thế",
+      "relevant": ["doc-ci-cache"]
+    },
+    {
+      "id": "q-migration-prod",
+      "text": "why did the migration fail on prod",
+      "relevant": ["doc-migration"]
+    },
+    {
+      "id": "q-logout",
+      "text": "user bị đăng xuất liên tục",
+      "relevant": ["doc-jwt-expiry"]
+    },
+    {
+      "id": "q-report-slow",
+      "text": "báo cáo chạy chậm quá",
+      "relevant": ["doc-index-missing", "doc-n1-query"]
+    },
+    {
+      "id": "q-install",
+      "text": "cài đặt dependency thế nào",
+      "relevant": ["doc-pnpm"]
+    },
+    {
+      "id": "q-duplicate-order",
+      "text": "khách bị tạo đơn trùng",
+      "relevant": ["doc-idempotency"]
+    },
+    {
+      "id": "q-cors",
+      "text": "browser blocks my API call from the frontend",
+      "relevant": ["doc-cors"]
+    },
+    {
+      "id": "q-429",
+      "text": "api trả về 429",
+      "relevant": ["doc-rate-limit"]
+    },
+    {
+      "id": "q-realtime",
+      "text": "mất kết nối realtime sau một lúc",
+      "relevant": ["doc-websocket"]
+    },
+    {
+      "id": "q-secret",
+      "text": "để secret ở đâu cho an toàn",
+      "relevant": ["doc-env-secret"]
+    },
+    {
+      "id": "q-flaky",
+      "text": "test lúc pass lúc fail",
+      "relevant": ["doc-flaky-clock"]
+    },
+    {
+      "id": "q-mobile",
+      "text": "giao diện vỡ trên điện thoại",
+      "relevant": ["doc-mobile-viewport"]
+    },
+    {
+      "id": "q-timezone",
+      "text": "what timezone should timestamps be stored in",
+      "relevant": ["doc-timezone"]
+    },
+    {
+      "id": "q-match-empty",
+      "text": "build_match_expression trả rỗng lúc nào",
+      "relevant": ["doc-match-empty"]
+    },
+    {
+      "id": "q-tokenizer",
+      "text": "memories_fts bỏ dấu kiểu gì",
+      "relevant": ["doc-fts-tokenizer"]
+    },
+    {
+      "id": "q-write-tx",
+      "text": "ai gọi index_memory",
+      "relevant": ["doc-write-tx"]
+    },
+    {
+      "id": "q-db-path",
+      "text": "đổi đường dẫn DB thì sửa ở config.py chỗ nào",
+      "relevant": ["doc-db-path"]
+    },
+    {
+      "id": "q-payload",
+      "text": "RetrievedMemory có những field nào",
+      "relevant": ["doc-frozen-payload"]
+    },
+    {
+      "id": "q-schema-version",
+      "text": "schema_version nằm ở đâu",
+      "relevant": ["doc-schema-version"]
+    },
+    {
+      "id": "q-off-backup",
+      "text": "cách backup postgres hàng ngày",
+      "relevant": []
+    },
+    {
+      "id": "q-off-unknown-fn",
+      "text": "parse_frontmatter xử lý lỗi thế nào",
+      "relevant": []
+    },
+    {
+      "id": "q-off-unknown-file",
+      "text": "logic gì nằm trong scheduler.py",
+      "relevant": []
+    },
+    {
+      "id": "q-off-profile",
+      "text": "how do I profile a python script",
+      "relevant": []
+    },
+    {
+      "id": "q-off-k8s",
+      "text": "cấu hình kubernetes ingress",
+      "relevant": []
+    },
+    {
+      "id": "q-off-mlversion",
+      "text": "which python version should we use for the ML pipeline",
+      "relevant": []
+    },
+    {
+      "id": "q-off-email",
+      "text": "làm sao gửi email marketing hàng loạt",
+      "relevant": []
+    },
+    {
+      "id": "q-off-redis",
+      "text": "set up a redis cluster with sentinel",
+      "relevant": []
+    },
+    {
+      "id": "q-off-aws-cost",
+      "text": "chi phí AWS tháng này bao nhiêu",
+      "relevant": []
+    },
+    {
+      "id": "q-off-terraform",
+      "text": "how to write a terraform module for vpc",
+      "relevant": []
+    },
+    {
+      "id": "q-off-seo",
+      "text": "tối ưu SEO cho trang chủ",
+      "relevant": []
+    },
+    {
+      "id": "q-off-grafana",
+      "text": "configure grafana alerting rules",
+      "relevant": []
+    }
+  ]
+}

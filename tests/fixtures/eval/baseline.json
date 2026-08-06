@@ -1,0 +1,182 @@
+{
+  "fixture": "bilingual-v1",
+  "fixture_version": 1,
+  "positive_queries": 20,
+  "negative_queries": 12,
+  "recall": {
+    "@1": 0.65,
+    "@3": 0.85,
+    "@5": 0.95
+  },
+  "mrr": 0.775,
+  "off_corpus_silent": 1,
+  "answered_by": {
+    "both": 0,
+    "lexical": 0,
+    "relational": 7,
+    "fallback": 24,
+    "none": 1
+  },
+  "queries": {
+    "q-upload": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-deploy-slow": {
+      "first_gold_rank": 4,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-migration-prod": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-logout": {
+      "first_gold_rank": 4,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-report-slow": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-install": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-duplicate-order": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-cors": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-429": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-realtime": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-secret": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-flaky": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-mobile": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-timezone": {
+      "first_gold_rank": 2,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-match-empty": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-tokenizer": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-write-tx": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-db-path": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-payload": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-schema-version": {
+      "first_gold_rank": 1,
+      "silent": false,
+      "answered_by": "relational"
+    },
+    "q-off-backup": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-unknown-fn": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-unknown-file": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-profile": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-k8s": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-mlversion": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-email": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-redis": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-aws-cost": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-terraform": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-seo": {
+      "first_gold_rank": null,
+      "silent": false,
+      "answered_by": "fallback"
+    },
+    "q-off-grafana": {
+      "first_gold_rank": null,
+      "silent": true,
+      "answered_by": "none"
+    }
+  }
+}

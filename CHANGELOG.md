@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`localmem eval` — retrieval quality is now a number this repo can produce.** Every threshold in
+  the project was fitted against a fixture that lived in a scratchpad and was deleted with it, so
+  no change to ranking has been measurable since. The new command builds a throwaway database,
+  writes a versioned bilingual fixture (`localmem/evaldata/bilingual_v1.json`, 30 documents /
+  20 graded queries / 12 off-corpus) through `store.add_memory`, asks every query through
+  `retriever.retrieve`, and reports recall@1/3/5, MRR and how many off-corpus queries stayed
+  silent. Production paths only — nothing is re-implemented. The user's own database is never
+  opened. `tests/fixtures/eval/baseline.json` pins the result and
+  `test_bundled_fixture_matches_the_recorded_baseline` fails on **any** movement, up or down;
+  rewrite it with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`.
+
+  First run, recorded as the baseline: recall@1 **0.65**, recall@3 **0.85**, recall@5 **0.95**,
+  MRR **0.775**, off-corpus silent **1/12**.
+
+  Two findings came straight out of it and are recorded in `docs/design_decisions.md` §53:
+
+  - **The conjunctive lexical view answers no natural-language query at all.** Of 32 queries,
+    24 are answered by the disjunctive fallback, 7 by the entity view, 0 by the primary lexical
+    path — a multi-word question needs every token in one document, which prose never satisfies.
+  - **The fusion weights are invisible to any rank-based metric unless both views fire, and on
+    realistic queries they never both do.** With one view empty its weight multiplies zeros and
+    the other is a constant factor. The report therefore prints an `answered_by` breakdown and
+    states, when `both` is 0, that the run is not evidence about those weights. Confirmed by
+    perturbation: changing the keyword column weight, the recency weight or the candidate limit
+    each turns the baseline test red; changing `RELATIONAL_WEIGHT_ON_ENTITY_HIT` does not.
+
+### Changed
+
+- `localmem.cli._KIND_CHOICES` and `localmem.mcp_server.ADD_KINDS` now name each other in comments.
+  They stay separate lists — one is a security boundary, the other a UI — but adding a kind means
+  editing both, and nothing said so.
+
 ## [0.5.1] — 2026-08-06
 
 A bugfix release, and both bugs were found the same way: by installing v0.5.0 for real on a

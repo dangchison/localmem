@@ -2102,3 +2102,80 @@ INSERT INTO memories_fts(memories_fts) VALUES('integrity-check');
 
 afterwards. It is the only check that sees it, and `PRAGMA foreign_key_check` is asserted clean
 alongside it.
+
+## 53. Retrieval quality is measured in-repo, and the measurement is pinned
+
+Every constant in this project is a recorded measurement. Until this change, none of the *retrieval*
+measurements were recorded anywhere the code could reach: the 14-pair bilingual set that chose the
+keyword column weight (§34), the fixture that chose the capture thresholds (§44, §45) and the 24-doc
+corpus that failed the semantic gate (`.corp/localmem-v1/gate0-v030-result.md`) all lived in a
+scratchpad and were deleted with it. What survived was prose. That is enough to explain a decision
+and not enough to re-run it, so every later change to ranking was, in practice, unmeasurable.
+
+`localmem eval` is the instrument. It builds a throwaway database, writes a versioned fixture
+through `store.add_memory` and asks every query through `retriever.retrieve` — the production paths,
+not a re-implementation, for the reason `audit._trace_similarity` gives: a number produced by a
+different path than the one it informs is worse than no number.
+
+**The fixture is new, and its baseline is not comparable to Gate 0's.** The original pairs are gone;
+`localmem/evaldata/bilingual_v1.json` rebuilds the same *shape* — Vietnamese and English, developer
+prose, 12 off-corpus queries whose answer is genuinely absent — from what the reports describe. Any
+sentence of the form "recall went from Gate 0's N to our M" would be false.
+
+**Metrics are rank-based, never raw scores.** bm25 magnitudes here sit around 1e-06 (§8) and carry
+no portable meaning; which document came back where does. That also makes the baseline survive a
+different SQLite build, up to tokenizer differences.
+
+**The baseline is an equality, in both directions.** A metric that moved *up* fails
+`test_bundled_fixture_matches_the_recorded_baseline` exactly as one that moved down, because an
+unexplained improvement is as much a hole in the record as a regression. Per-query ranks are pinned
+alongside the aggregates: on 20 positive queries one query is worth five points of recall, so two
+queries moving in opposite directions would leave every aggregate untouched. Rewrite it with
+`LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py` and put the diff in the CHANGELOG entry
+of whatever moved it.
+
+Two determinism traps had to be closed first, and both are properties of the system rather than of
+the harness. A recall bumps `recalled_count`, which feeds `seen_count_boost`, so with tracking left
+on the score of query *n* depends on queries 1..*n-1* — the runner sets `LOCALMEM_NO_TRACKING` for
+the duration. And recency is a live clock, so documents are backdated relative to a fixed
+`EVAL_EPOCH` that every retrieval is also measured against.
+
+### What the first run found, which is why `answered_by` is a reported metric
+
+On the bundled fixture, of 32 queries:
+
+| answered by | count |
+|---|---|
+| both views | **0** |
+| lexical only | 0 |
+| relational only | 7 |
+| OR fallback | 24 |
+| nothing | 1 |
+
+The conjunctive lexical view — the primary path, the one carrying `LEXICAL_WEIGHT = 0.6` — answers
+**no** natural-language query at all. A multi-word question requires every token to appear in one
+document, which developer prose essentially never satisfies. What actually answers is the
+disjunctive fallback (§35), on 24 of 32 queries, and the entity view on the 7 whose text carries a
+code-shaped token: an identifier, a file path, an acronym.
+
+This has a direct consequence for what the gate can and cannot catch, verified by perturbing one
+constant at a time against the pinned baseline:
+
+| perturbation | baseline test |
+|---|---|
+| `KEYWORDS_COLUMN_WEIGHT` 0.35 → 1.0 | fails |
+| `RECENCY_WEIGHT` 0.05 → 0.9 | fails |
+| `CANDIDATE_LIMIT` 20 → 3 | fails |
+| `RELATIONAL_WEIGHT_ON_ENTITY_HIT` 0.6 → 0.1 | **passes** |
+
+The last one is not a gap in the fixture; it is arithmetic. When one view is empty its weight
+multiplies a column of zeros and the other view's weight is a constant factor applied to every
+candidate — and no rank-based metric can see a monotone rescaling. **The fusion weights only change
+a ranking when both views return candidates, and on realistic queries they never both do.** So the
+report prints `answered_by` and says outright, when `both` is 0, that the run is not evidence about
+those weights. A blind spot that announces itself is a different object from one that does not.
+
+The off-corpus column is the other half of the measurement and reproduces Gate 0 §4 exactly:
+**1 of 12** off-corpus queries stays silent. `cấu hình kubernetes ingress` returns the tailwind note
+because both contain `cấu hình`. That is the OR fallback's known price, now a number that moves when
+someone changes it rather than a sentence in a report.

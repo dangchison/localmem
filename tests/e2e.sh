@@ -5,8 +5,9 @@
 #   fresh venv -> pip install -e . -> localmem init (sandboxed HOME, decline agents and
 #   import) -> add x3 (one duplicate) -> search shows ranked results and the merge ->
 #   import a fixture twice with the row count stable -> drive `localmem serve` with a
-#   scripted MCP client over stdio -> benchmark --json parsed for saved_pct -> the
-#   `--context` hook surface, its fail-safes, and the file modes of a new database.
+#   scripted MCP client over stdio -> benchmark --json parsed for saved_pct -> eval --json
+#   run from the installed wheel -> the `--context` hook surface, its fail-safes, and the
+#   file modes of a new database.
 #
 # Both HOME and LOCALMEM_DB are redirected into a throwaway directory before any localmem
 # process starts, so this script cannot reach the real ~/.localmem/ or any real agent
@@ -407,6 +408,40 @@ if "±15%" not in report["caveat"]:
     raise SystemExit("the accuracy caveat is missing from the JSON payload")
 print(f"saved_pct = {report['saved_pct']}")
 PY
+
+# ------------------------------------------------------------------ 7b. eval --json
+
+step "7b. localmem eval --json"
+
+# The harness must run from an installed wheel with no arguments, which is the whole
+# reason the fixture ships inside the package rather than under tests/.
+"${LM}" eval --json >"${SANDBOX}/eval.json" 2>&1 ||
+    fail "localmem eval --json exited non-zero"
+cat "${SANDBOX}/eval.json"
+
+"${VENV}/bin/python" - "${SANDBOX}/eval.json" <<'PY' || fail "eval --json is not usable"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+
+required = {
+    "fixture", "fixture_version", "positive_queries", "negative_queries",
+    "recall", "mrr", "off_corpus_silent", "answered_by", "queries",
+}
+missing = required - set(report)
+if missing:
+    raise SystemExit(f"eval JSON is missing {sorted(missing)}")
+if set(report["recall"]) != {"@1", "@3", "@5"}:
+    raise SystemExit(f"unexpected recall cut-offs: {sorted(report['recall'])}")
+if sum(report["answered_by"].values()) != len(report["queries"]):
+    raise SystemExit("answered_by does not account for every query")
+print(f"recall@3 = {report['recall']['@3']}, off-corpus silent = {report['off_corpus_silent']}")
+PY
+
+# The user's own database must be untouched by a measurement: eval builds its own.
+[ -f "${LOCALMEM_DB}" ] || fail "eval --json removed the sandbox database"
 
 # ------------------------------------------------------------------ 8. search --context
 
