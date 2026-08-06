@@ -64,7 +64,10 @@ EVAL_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 DEFAULT_K_VALUES: tuple[int, ...] = (1, 3, 5)
 
 _RECALL_DIGITS = 4
-_BACKDATE_SQL = "UPDATE memories SET created_at = ? WHERE id = ?"
+# Stages the two columns a fixture controls but the write path derives from the clock and
+# from history. Deliberately not `UPDATE OF content, keywords`, so the `mem_au` trigger
+# does not fire and the FTS index is left alone (``docs/design_decisions.md`` §53).
+_STAGE_ROW_SQL = "UPDATE memories SET created_at = ?, seen_count = ? WHERE id = ?"
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,16 @@ class FixtureDoc:
         kind: ``note``, ``trace`` or ``lesson`` — the kinds an agent may write.
         keywords: the agent's alternative wordings, indexed as the second FTS5 column.
         age_days: how far before :data:`EVAL_EPOCH` the row is dated.
+        seen_count: how many times this fact was stored. Staged with a direct ``UPDATE``,
+            exactly as ``age_days`` is, rather than by writing the same content twice —
+            a second write would merge onto the same row and leave two fixture ids
+            pointing at one memory, which the id mapping cannot represent. Above 1 it is
+            the only thing that makes :func:`localmem.retriever.seen_count_boost`
+            non-zero, since ``ln(1)`` is 0 and the weight would multiply nothing.
+        supersedes: fixture ids this document corrects. They must appear **earlier** in
+            the corpus, because a supersede link is resolved against rows that already
+            exist — the same constraint :func:`localmem.store.add_memory` enforces
+            against real ids.
     """
 
     id: str
@@ -84,6 +97,8 @@ class FixtureDoc:
     kind: str
     keywords: tuple[str, ...]
     age_days: int
+    seen_count: int
+    supersedes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -204,9 +219,19 @@ class EvalReport:
     def summary(self) -> dict[str, object]:
         """Return the JSON-serializable form a baseline is pinned against.
 
-        Per-query ranks are included on purpose: aggregate metrics hide the case where
-        one query improves and another regresses by the same step, and on a fixture this
-        size a single query is worth several points of recall.
+        Three levels of detail, each catching what the one above it hides:
+
+        * the aggregates, which are the answer to "is retrieval better";
+        * the per-query gold rank, because two queries moving in opposite directions
+          leave every aggregate untouched;
+        * the **full returned ranking**, because a change can reorder everything below
+          the gold row — which is most of what the system returns — without moving a
+          single gold rank. Measured: with only ranks pinned, four of eight perturbed
+          constants slipped through, including the supersede penalty and the
+          ``seen_count`` boost.
+
+        Every field is an id or a position, never a bm25 score, so the whole document
+        stays portable across SQLite builds (§53).
         """
         return {
             "fixture": self.fixture_name,
@@ -222,6 +247,7 @@ class EvalReport:
                     "first_gold_rank": outcome.first_gold_rank,
                     "silent": outcome.silent,
                     "answered_by": outcome.answered_by,
+                    "returned": list(outcome.returned),
                 }
                 for outcome in self.outcomes
             },
@@ -264,6 +290,7 @@ def load_fixture(path: Path | None = None) -> Fixture:
     known = {doc.id for doc in corpus}
     if len(known) != len(corpus):
         raise ValueError(f"{target} repeats a corpus id")
+    _check_supersede_order(corpus, target)
 
     queries = tuple(
         _read_query(entry, known, target) for entry in _read_list(raw, "queries", target)
@@ -357,6 +384,7 @@ def run_eval(
 def _ingest(conn: sqlite3.Connection, fixture: Fixture) -> dict[int, str]:
     """Write every document through the production write path; return row id → doc id."""
     by_row_id: dict[int, str] = {}
+    row_ids: dict[str, int] = {}
     for doc in fixture.corpus:
         result = store.add_memory(
             conn,
@@ -365,13 +393,19 @@ def _ingest(conn: sqlite3.Connection, fixture: Fixture) -> dict[int, str]:
             kind=doc.kind,
             source="eval",
             keywords=doc.keywords,
+            supersedes=[row_ids[target] for target in doc.supersedes] or None,
         )
         by_row_id[result.id] = doc.id
+        row_ids[doc.id] = result.id
         created = EVAL_EPOCH - timedelta(days=doc.age_days)
         with db.transaction(conn):
             conn.execute(
-                _BACKDATE_SQL,
-                (created.strftime(retriever.SQLITE_TIMESTAMP_FORMAT), result.id),
+                _STAGE_ROW_SQL,
+                (
+                    created.strftime(retriever.SQLITE_TIMESTAMP_FORMAT),
+                    doc.seen_count,
+                    result.id,
+                ),
             )
     return by_row_id
 
@@ -442,6 +476,19 @@ def _mean_reciprocal_rank(positives: Sequence[QueryOutcome]) -> float:
     return round(sum(1.0 / rank for rank in ranks) / len(positives), _RECALL_DIGITS)
 
 
+def _check_supersede_order(corpus: Sequence[FixtureDoc], target: Path) -> None:
+    """Refuse a corpus whose supersede links point forward or nowhere."""
+    seen: set[str] = set()
+    for doc in corpus:
+        for superseded in doc.supersedes:
+            if superseded not in seen:
+                raise ValueError(
+                    f"{target}: {doc.id!r} supersedes {superseded!r}, which is not a "
+                    "document defined before it"
+                )
+        seen.add(doc.id)
+
+
 def _read_list(raw: Mapping[str, object], key: str, target: Path) -> list[object]:
     value = raw.get(key)
     if not isinstance(value, list):
@@ -460,12 +507,17 @@ def _read_doc(entry: object, target: Path) -> FixtureDoc:
     keywords = entry.get("keywords", [])
     if not isinstance(keywords, list):
         raise ValueError(f"{target}: keywords of {doc_id!r} must be a list")
+    supersedes = entry.get("supersedes", [])
+    if not isinstance(supersedes, list):
+        raise ValueError(f"{target}: supersedes of {doc_id!r} must be a list")
     return FixtureDoc(
         id=doc_id,
         content=content,
         kind=str(entry.get("kind", store.DEFAULT_KIND)),
         keywords=tuple(str(keyword) for keyword in keywords),
         age_days=int(entry.get("age_days", 0)),
+        seen_count=int(entry.get("seen_count", 1)),
+        supersedes=tuple(str(doc_id) for doc_id in supersedes),
     )
 
 

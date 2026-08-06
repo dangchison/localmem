@@ -2158,22 +2158,16 @@ document, which developer prose essentially never satisfies. What actually answe
 disjunctive fallback (§35), on 24 of 32 queries, and the entity view on the 7 whose text carries a
 code-shaped token: an identifier, a file path, an acronym.
 
-This has a direct consequence for what the gate can and cannot catch, verified by perturbing one
-constant at a time against the pinned baseline:
-
-| perturbation | baseline test |
-|---|---|
-| `KEYWORDS_COLUMN_WEIGHT` 0.35 → 1.0 | fails |
-| `RECENCY_WEIGHT` 0.05 → 0.9 | fails |
-| `CANDIDATE_LIMIT` 20 → 3 | fails |
-| `RELATIONAL_WEIGHT_ON_ENTITY_HIT` 0.6 → 0.1 | **passes** |
-
-The last one is not a gap in the fixture; it is arithmetic. When one view is empty its weight
+This has a direct consequence for what the gate can catch. When one view is empty its weight
 multiplies a column of zeros and the other view's weight is a constant factor applied to every
 candidate — and no rank-based metric can see a monotone rescaling. **The fusion weights only change
-a ranking when both views return candidates, and on realistic queries they never both do.** So the
-report prints `answered_by` and says outright, when `both` is 0, that the run is not evidence about
-those weights. A blind spot that announces itself is a different object from one that does not.
+a ranking when both views return candidates.** On the first 30-document corpus that never happened,
+so the gate was measurably blind to them, and the report printed `answered_by` and said outright,
+when `both` was 0, that the run was not evidence about those weights. A blind spot that announces
+itself is a different object from one that does not.
+
+That corpus has since been widened deliberately to close the hole — see §55 — and the blind spot is
+now gone rather than merely declared.
 
 The off-corpus column is the other half of the measurement and reproduces Gate 0 §4 exactly:
 **1 of 12** off-corpus queries stays silent. `cấu hình kubernetes ingress` returns the tailwind note
@@ -2257,3 +2251,74 @@ remove. The comment above it says "English only, and deliberately small" — del
 language it was written against, and a real narrowing of candidate generation for half of this
 project's users. Fixing it needs its own before/after through the capture-gate fixture, so it is not
 folded into this entry.
+
+## 55. The eval corpus is widened until every ranking constant is observable
+
+§53 shipped a 30-document corpus and, honestly, a gate with a hole in it: no query engaged both
+retrieval views, so four of the retriever's ranking constants could be changed to absurd values
+without the pinned baseline noticing. A regression gate that cannot see half the constants it
+guards is a comfort, not a control. The corpus was widened to 59 documents / 45 positive queries /
+20 off-corpus, in bands chosen by **which code path was unobserved**, not by which numbers would
+improve.
+
+The rule §53 set — a change counts as an improvement when at least two queries move — was the other
+motivation. On 20 positive queries one query is five points of recall; on 45 it is two.
+
+### The bands, and what each one exists to reach
+
+| band | reaches |
+|---|---|
+| English documents with Vietnamese queries and vice versa | cross-language recall, which lexical retrieval cannot do and which is the strongest case *for* a semantic view |
+| everyday Vietnamese engineering prose | the fallback path, where this system does most of its work |
+| **short** code-shaped queries (`open_database 0600`) | the conjunctive lexical view — previously answering **nothing** — because a two-token query can actually have both tokens in one document |
+| a document *about* a symbol next to one that merely *uses* it (`memories_fts` ×3 vs ×1) | the case where the two views **disagree**, which is the only condition under which the fusion weights change a ranking |
+| supersede pairs (Node 18 → Node 22) | `SUPERSEDED_SCORE_PENALTY` and `_cap_superseded`, roughly eighty lines of subtle code the first corpus never touched |
+| `seen_count` above 1 on two rows | `seen_count_boost`, which is `0.02 · ln(seen_count)` and therefore **exactly zero** on a corpus where every row was written once |
+
+The last one is the clearest example of the difference between a fixture that runs code and a
+fixture that observes it. Every row had `seen_count` 1, so the boost was `0.02 · ln(1) = 0` for
+every candidate; the weight could be set to 0.5 and nothing moved. The fixture now stages
+`seen_count` with a direct `UPDATE`, the same way it stages `created_at`, because writing the same
+content twice would merge onto one row and leave two fixture ids naming one memory.
+
+### Pinning gold ranks was not enough either
+
+The baseline originally recorded, per query, the rank of the first relevant document. That misses
+every change that reorders the rows *below* it — which is most of what a recall returns. With ranks
+alone, four of eight perturbed constants slipped through; pinning the **full returned ranking** as
+well took that to six of eight, and the two remaining ones were the fixture gaps above.
+
+Everything pinned is an id or a position. No bm25 score is recorded, so the document stays portable
+across SQLite builds — the property §53 chose rank-based metrics for in the first place.
+
+### The result
+
+Every ranking constant in `retriever.py`, plus the keyword column weight in `store.py`, now moves
+the baseline when perturbed:
+
+| perturbation | caught |
+|---|---|
+| `LEXICAL_WEIGHT` 0.6 → 0.3 | ✅ |
+| `LEXICAL_WEIGHT_ON_ENTITY_HIT` 0.4 → 0.9 | ✅ |
+| `RELATIONAL_WEIGHT_ON_ENTITY_HIT` 0.6 → 0.1 | ✅ |
+| `SUPERSEDED_SCORE_PENALTY` 0.1 → 1.0 | ✅ |
+| `SEEN_COUNT_WEIGHT` 0.02 → 0.5 | ✅ |
+| `RECENCY_HALF_LIFE_DAYS` 30 → 3 | ✅ |
+| `CANDIDATE_LIMIT` 20 → 3 | ✅ |
+| `KEYWORDS_COLUMN_WEIGHT` 0.35 → 1.0 | ✅ |
+
+New baseline: recall@1 **0.6667**, recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**,
+off-corpus silent **1/20**. These are lower than the 30-document numbers and **are not comparable to
+them**: a wider corpus with cross-language queries in it is a harder corpus, which is the point.
+`answered_by` is now `both 9, lexical 3, relational 8, fallback 44, none 1` — the fallback still
+does two thirds of the work, and off-corpus silence is still 1 in 20, which remains this system's
+worst measured property.
+
+### What was deliberately not done
+
+The bands were written before they were measured and were not adjusted afterwards to improve any
+number. The two exceptions are recorded here rather than hidden: the `memories_fts`/`index_memory`
+distractor documents were rewritten *after* a measurement showed the views agreeing rather than
+disagreeing, and `seen_count` was added *after* a measurement showed the boost was structurally
+zero. Both changes were made to reach an unobserved code path, and both were made knowing they
+could push the aggregate metrics down — which they did.

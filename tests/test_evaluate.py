@@ -33,9 +33,9 @@ def test_bundled_fixture_loads() -> None:
     fixture = evaluate.load_fixture()
     assert fixture.version == evaluate.SUPPORTED_FIXTURE_VERSION
     assert fixture.name == "bilingual-v1"
-    assert len(fixture.corpus) == 30
-    assert len(fixture.positives) == 20
-    assert len(fixture.negatives) == 12
+    assert len(fixture.corpus) == 59
+    assert len(fixture.positives) == 45
+    assert len(fixture.negatives) == 20
 
 
 def test_bundled_fixture_is_bilingual() -> None:
@@ -359,7 +359,7 @@ def test_cli_eval_json_is_one_object() -> None:
     payload = json.loads(result.output)
     assert payload["fixture"] == "bilingual-v1"
     assert set(payload["recall"]) == {"@1", "@3", "@5"}
-    assert payload["positive_queries"] == 20
+    assert payload["positive_queries"] == 45
 
 
 def test_cli_eval_rejects_a_broken_fixture(tmp_path: Path) -> None:
