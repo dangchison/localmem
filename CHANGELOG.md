@@ -5,6 +5,101 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-08-06
+
+The release where the memory store stops accumulating and starts **learning**.
+
+Until now a wrong diagnosis written in month 1 competed on equal footing with the correction
+written in month 6. `superseded_by` had been a column with no logic behind it since M1, where
+the comment promised "logic lands in v0.2". It lands here, together with the two things that
+make a correction expressible in the first place: a `lesson` kind, and a way to reclassify a
+memory after the fact.
+
+Nothing on the frozen MCP surface changed shape. `memory_add` takes two new *inputs*; both
+payloads still carry exactly the key sets the original spec §4 froze, and the correction
+attached to a retracted memory travels in `neighbors`, which was always there. The command
+list is still fifteen.
+
+### Added
+
+- **`kind='lesson'`, a first-class kind on both surfaces.** A note is what you were *told*; a
+  lesson is what the project *taught you the hard way*. Writable by an agent over MCP —
+  deliberately, because the agent is the party that just watched a diagnosis be wrong — and by
+  `localmem add --kind lesson`. It carries no ranking authority: a lesson is *pulled* by a
+  recall like any other row, unlike `core`, which is *pushed* into every session and therefore
+  stays human-only. Its content shape (`symptom — real cause — fix`) is taught by
+  `memory_add`'s own tool description, at the moment a model is composing the call.
+- **`localmem promote ID`**, which rewrites a memory's `kind` in place, **by id**. Re-adding
+  the same text with a different `--kind` never worked and never will — tier-1 merges on the
+  content hash and keeps the original kind — so promotion had to be addressed by id. Idempotent,
+  and it warns on stderr when promoting into `core` pushes that tier past its ~400-token cap.
+- **The supersede lifecycle: `--supersedes ID` on `localmem add` (repeatable) and
+  `memory_add(..., supersedes=[…])` over MCP.** The agent declares that this memory corrects
+  those ones, at write time. This is the ADD/UPDATE decision Mem0 spends a model call on,
+  collapsed onto the party that was already running — which is what keeps recall free of any
+  model. The link is written in the same `BEGIN IMMEDIATE` as the insert, so a database is
+  never left holding the correction without the retraction, and an unknown id fails the whole
+  call rather than storing a memory whose retraction quietly did nothing.
+- **A superseded memory is demoted, never hidden.** Its score is multiplied by
+  `SUPERSEDED_SCORE_PENALTY` (0.1) and, when its correction is in the same result set, capped
+  below it — so **whenever both are found, the correction is read first**. The retracted memory
+  stays in `search`, `stats` and `audit`, because "what did we think was wrong before?" is a
+  question worth answering.
+- **A superseded hit carries its correction with it**, as its **first** neighbour. An agent
+  that recalls "we thought it was a memory leak" reads "actually the connection pool was
+  exhausted" in the same response, with no second call and no API change — `neighbors` was
+  already one of the eight frozen result keys.
+- **A sixth `audit` section: superseded memories**, each printed with the memory that replaced
+  it and which workspace that lives in. Read-only like the rest of the report; `--json` carries
+  the same numbers under a new `superseded` key.
+
+### Changed
+
+- **`POINTER_SNIPPET` and `ADD_DESCRIPTION` split by responsibility.** Two sentences — the
+  keyword rule and the lesson shape — were being paid for twice by every MCP session. The tool
+  description now owns *how to form the call* and the snippet owns *when to reach for memory
+  and where it is routed*. Measured: the snippet went ~133 → ~108 tokens and `benchmark`'s
+  fixed `after_tokens` went **247 → 222**, with strictly more routing policy than v0.3.0
+  carried. Milestone C added nothing to that number.
+- **Core memory now excludes superseded rows.** It is the one *push* tier — loaded into every
+  recall in the workspace — so a retracted convention must stop being pushed the moment its
+  correction is written. Everywhere else a superseded row is merely ranked down.
+- **`dedupe --merge` moves supersede links onto the surviving row** before deleting the older
+  twin. Measured rather than assumed: `superseded_by` is `REFERENCES memories(id)` with no
+  `ON DELETE` clause and foreign keys are on, so deleting a row that another names as its
+  replacement fails outright with `FOREIGN KEY constraint failed`. Repointing is also the
+  better answer than nulling — the pair was judged to be the same memory, so the twin that
+  survives is the same correction.
+- **`audit`'s promotion note names `localmem promote ID`**, now that the command it used to
+  say did not exist does.
+
+### Fixed
+
+- **The supersede demotion does what it claims.** The multiply alone did not reorder the pair
+  it exists for: `_min_max` maps the weakest candidate of a view to exactly 0.0, so a
+  correction that is the weaker lexical match keeps nothing but its boosts while the retraction
+  keeps a tenth of a much larger number. Measured on that pair, at 0.1 the retraction won both
+  the "both old" and the "retraction old, correction new" case; no constant fixes it, because
+  once recency has decayed out of both rows the correction sits at 0.0 and every positive
+  factor leaves the retraction above it. The cap closes it as a guarantee rather than a
+  tendency. See `docs/design_decisions.md` §43.
+
+### Notes
+
+- **Schema stays at version 3.** This release needed no migration: the supersede column has
+  been there since M1, and the one delete path is handled in code.
+- **Supersede links are local to one database.** `export` carries `superseded_by` for
+  provenance but `restore` deliberately does not apply it, exactly as when the column was
+  reserved — it holds a row id, and ids are reassigned on restore. Both memories survive a
+  round trip; the link between them does not, and is re-declared with `--supersedes`.
+- **A `global` memory may supersede a repo-local one; the reverse is refused.** The rule is
+  exactly what a recall can see: a named workspace reads itself and `global`, so the
+  replacement is always reachable from the retracted row's workspace. One repo cannot retract
+  knowledge other repos depend on and cannot see.
+- **A database with no superseded rows anywhere ranks identically to v0.3.0 + milestone B** —
+  asserted by a test whose expected ids and scores were produced by running the same corpus
+  against the previous commit in a detached worktree, not by recording what the new code prints.
+
 ## [0.3.0] — 2026-08-06
 
 The release that fixes the product's most-felt weakness, and the first one whose headline

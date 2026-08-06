@@ -99,6 +99,16 @@ UPDATE memories
 
 _SET_STATUS_SQL = "UPDATE dedup_queue SET status = ? WHERE id = ?"
 
+# Run immediately before the one DELETE in this codebase; see `resolve_merge`. Bound as
+# (kept, kept, removed): every row that named the removed memory as its replacement is
+# handed the memory that survives it, except the kept row itself, which would otherwise be
+# left pointing at itself.
+_REPOINT_SUPERSEDE_SQL = """
+UPDATE memories
+   SET superseded_by = CASE WHEN id = ? THEN NULL ELSE ? END
+ WHERE superseded_by = ?
+"""
+
 # The two placeholders below are bound from QUEUE_RESOLVED_STATUSES, in order; the SQL is
 # written out in full rather than assembled, so nothing here can ever carry a value into
 # the statement text. Adding a third resolved status means adding a third `?`.
@@ -286,6 +296,14 @@ def resolve_merge(conn: sqlite3.Connection, queue_id: int) -> Resolution:
     including this one. The pair is therefore resolved by disappearing from the queue
     rather than by leaving a ``merged`` row behind; see ``docs/design_decisions.md``.
 
+    ``memories.superseded_by`` is the one reference that does **not** cascade: it is
+    declared ``REFERENCES memories(id)`` with no ``ON DELETE`` clause, and foreign keys
+    are on, so deleting a row some other row named as its replacement fails outright with
+    ``FOREIGN KEY constraint failed`` — measured, not assumed. The supersede links are
+    therefore moved onto the surviving twin first, which is also the better answer than
+    dropping them: the pair was judged to be the same memory, so the kept row is the same
+    correction. See ``docs/design_decisions.md`` §42.
+
     Raises:
         ValueError: if ``queue_id`` is unknown or has already been resolved.
     """
@@ -293,6 +311,7 @@ def resolve_merge(conn: sqlite3.Connection, queue_id: int) -> Resolution:
         pair = _load_pending(conn, queue_id)
         conn.execute(_FOLD_SEEN_COUNT_SQL, (pair.older.seen_count, pair.newer.id))
         conn.execute(_SET_STATUS_SQL, (QUEUE_STATUS_MERGED, queue_id))
+        conn.execute(_REPOINT_SUPERSEDE_SQL, (pair.newer.id, pair.newer.id, pair.older.id))
         conn.execute("DELETE FROM memories WHERE id = ?", (pair.older.id,))
         row = conn.execute(
             "SELECT seen_count FROM memories WHERE id = ?", (pair.newer.id,)

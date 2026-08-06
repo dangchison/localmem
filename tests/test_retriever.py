@@ -846,6 +846,271 @@ def test_session_neighbors_stay_inside_the_workspace(conn: sqlite3.Connection) -
     assert outcome.results[0].neighbors == ()
 
 
+# --- supersede: ranking, evidence and the no-op guarantee -------------------
+
+WRONG = "the leak is in src/resizer.py — it holds every buffer it allocates"
+RIGHT = "not a leak: the connection pool was exhausted, max=5 in config/db.yml"
+
+#: The ranking milestone B produced for :func:`_supersede_corpus`, captured by running
+#: this exact corpus against the previous commit's ``localmem`` package in a detached
+#: worktree — not by copying what the current code prints. Ids, scores to nine places and
+#: the neighbour lists must all still match, because C's only intended ranking change is
+#: the supersede penalty and a corpus with no superseded row must not feel it.
+MILESTONE_B_RANKING: dict[str, list[tuple[int, float, list[int]]]] = {
+    "pnpm": [(1, 0.625, []), (5, 0.048857998, [])],
+    "413 upload nginx": [(2, 0.6125, [])],
+    "src/main.py MyClass": [(3, 1.045586124, []), (6, 0.043527528, [])],
+    "vpn deploy": [(4, 0.634547822, [])],
+    "connection": [(6, 0.643527528, [3])],
+}
+
+_SUPERSEDE_CORPUS = (
+    ("use pnpm not npm in this repo", "proj", ["package manager"], "2026-07-06 12:00:00"),
+    (
+        "the 413 on upload comes from nginx client_max_body_size",
+        "proj",
+        ["upload"],
+        "2026-06-06 12:00:00",
+    ),
+    ("src/main.py boots MyClass before the config is read", "proj", [], "2026-08-01 12:00:00"),
+    (
+        "deploy needs the VPN, and the VPN needs the yubikey",
+        "global",
+        ["vpn"],
+        "2026-07-20 12:00:00",
+    ),
+    ("Dùng pnpm thay vì npm cho dự án này", "proj", ["trình quản lý gói"], "2026-08-04 12:00:00"),
+    (
+        "the retry loop in src/main.py never releases a connection",
+        "proj",
+        [],
+        "2026-07-30 12:00:00",
+    ),
+)
+
+
+def _build_supersede_corpus(conn: sqlite3.Connection) -> None:
+    for content, workspace, keywords, created_at in _SUPERSEDE_CORPUS:
+        added = store.add_memory(conn, content, workspace, keywords=keywords)
+        _backdate(conn, added.id, created_at)
+
+
+def test_a_superseded_row_is_ranked_down_by_exactly_the_penalty(
+    conn: sqlite3.Connection,
+) -> None:
+    """v0.4.0 C2. The correction shares no query token, so only the penalty moves."""
+    wrong = store.add_memory(conn, WRONG, WORKSPACE)
+    before = retriever.retrieve(conn, "resizer", WORKSPACE, now=NOW).results[0].score
+
+    store.add_memory(conn, RIGHT, WORKSPACE, supersedes=[wrong.id])
+
+    after = retriever.retrieve(conn, "resizer", WORKSPACE, now=NOW).results[0]
+    assert after.id == wrong.id
+    assert after.score == pytest.approx(before * retriever.SUPERSEDED_SCORE_PENALTY)
+
+
+def test_the_penalty_demotes_but_never_removes(conn: sqlite3.Connection) -> None:
+    """The user's requirement, literally: the wrong diagnosis is still findable."""
+    wrong = store.add_memory(conn, "the 413 is the app body-parser limit", WORKSPACE)
+    right = store.add_memory(
+        conn, "the 413 is nginx client_max_body_size", WORKSPACE, supersedes=[wrong.id]
+    )
+
+    outcome = retriever.retrieve(conn, "413", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [right.id, wrong.id]
+    assert outcome.results[1].score < outcome.results[0].score
+
+
+# The two configurations measured on the multiply-only build, where the retraction won
+# both. `_capped_below_replacement` is what turns them around; parametrizing them keeps
+# the numbers in the constant's docstring tied to something that runs.
+@pytest.mark.parametrize(
+    ("wrong_created_at", "right_created_at"),
+    [
+        pytest.param(SIXTY_DAYS_BEFORE_NOW, SIXTY_DAYS_BEFORE_NOW, id="both-old"),
+        pytest.param(SIXTY_DAYS_BEFORE_NOW, AT_NOW, id="retraction-old-correction-new"),
+    ],
+)
+def test_the_correction_outranks_the_retraction_whenever_both_are_found(
+    conn: sqlite3.Connection, wrong_created_at: str, right_created_at: str
+) -> None:
+    """v0.4.0 C2, the guarantee: the retraction is the better *lexical* match here.
+
+    It is shorter, so bm25 puts it on top and `_min_max` floors the correction at 0.0 —
+    the case where multiplying by 0.1 left the retraction winning at 0.0612 to 0.0489.
+    """
+    wrong = store.add_memory(conn, "the 413 is the body-parser limit", WORKSPACE)
+    right = store.add_memory(
+        conn,
+        "the 413 is nginx client_max_body_size, never the body-parser limit",
+        WORKSPACE,
+        supersedes=[wrong.id],
+    )
+    _backdate(conn, wrong.id, wrong_created_at)
+    _backdate(conn, right.id, right_created_at)
+
+    outcome = retriever.retrieve(conn, "413 body-parser limit", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [right.id, wrong.id]
+
+
+def test_the_cap_holds_when_the_correction_itself_scores_zero(
+    conn: sqlite3.Connection,
+) -> None:
+    """The corner the cap cannot separate on score alone, pinned deliberately.
+
+    The correction is the weakest candidate, so `_min_max` gives it 0.0, and both rows
+    are dated far enough back that ``2**(-age/30)`` underflows to exactly 0.0 for both —
+    so the correction scores 0.0, the cap lands on 0.0, and the two scores are equal.
+    What separates them is `_fuse`'s sort key, and both rows are given the **same**
+    ``created_at`` so the only thing left to break the tie is the id. A correction always
+    has the larger one, because it is written afterwards. If the sort key is ever
+    reordered, this test is the thing that notices.
+    """
+    wrong = store.add_memory(conn, "the 413 is the body-parser limit", WORKSPACE)
+    right = store.add_memory(
+        conn,
+        "the 413 is nginx client_max_body_size, never the body-parser limit",
+        WORKSPACE,
+        supersedes=[wrong.id],
+    )
+    for memory_id in (wrong.id, right.id):
+        _backdate(conn, memory_id, "1800-01-01 00:00:00")
+
+    outcome = retriever.retrieve(conn, "413 body-parser limit", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [right.id, wrong.id]
+    assert outcome.results[0].score == outcome.results[1].score == 0.0
+
+
+def test_the_cap_is_not_applied_when_the_correction_was_not_found(
+    conn: sqlite3.Connection,
+) -> None:
+    """No cap without a replacement to cap against — the plain multiply still applies."""
+    wrong = store.add_memory(conn, WRONG, WORKSPACE)
+    before = retriever.retrieve(conn, "resizer", WORKSPACE, now=NOW).results[0].score
+    right = store.add_memory(conn, RIGHT, WORKSPACE, supersedes=[wrong.id])
+
+    outcome = retriever.retrieve(conn, "resizer", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [wrong.id]
+    assert outcome.results[0].score == pytest.approx(before * retriever.SUPERSEDED_SCORE_PENALTY)
+    assert [neighbor.id for neighbor in outcome.results[0].neighbors] == [right.id]
+
+
+def test_a_chain_ranks_oldest_diagnosis_last(conn: sqlite3.Connection) -> None:
+    """Each cap is taken against an already demoted score, so the chain stays ordered."""
+    first = store.add_memory(conn, "the 413 is the body-parser limit", WORKSPACE)
+    second = store.add_memory(
+        conn, "the 413 is the proxy body limit, not body-parser", WORKSPACE, supersedes=[first.id]
+    )
+    third = store.add_memory(
+        conn,
+        "the 413 is nginx client_max_body_size, not the proxy or the body-parser",
+        WORKSPACE,
+        supersedes=[second.id],
+    )
+
+    outcome = retriever.retrieve(conn, "413 body-parser", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [third.id, second.id, first.id]
+
+
+def test_a_superseded_hit_carries_its_replacement_as_its_first_neighbour(
+    conn: sqlite3.Connection,
+) -> None:
+    """v0.4.0 C3: the correction rides along in the frozen ``neighbors`` field."""
+    wrong = store.add_memory(conn, WRONG, WORKSPACE)
+    # An entity sibling that would otherwise take the first slot; the replacement outranks it.
+    sibling = store.add_memory(conn, "src/resizer.py has been in the tree since 2019", WORKSPACE)
+    right = store.add_memory(conn, RIGHT, WORKSPACE, supersedes=[wrong.id])
+
+    outcome = retriever.retrieve(conn, "buffer", WORKSPACE, now=NOW)
+
+    assert [hit.id for hit in outcome.results] == [wrong.id]
+    neighbors = outcome.results[0].neighbors
+    assert neighbors[0] == retriever.Neighbor(id=right.id, content=RIGHT)
+    assert [neighbor.id for neighbor in neighbors] == [right.id, sibling.id]
+
+
+def test_the_replacement_is_not_repeated_when_it_already_ranked(
+    conn: sqlite3.Connection,
+) -> None:
+    """`_neighbors` dedupes against the result list, and that covers this path too."""
+    wrong = store.add_memory(conn, "the 413 is the app body-parser limit", WORKSPACE)
+    right = store.add_memory(
+        conn, "the 413 is nginx client_max_body_size", WORKSPACE, supersedes=[wrong.id]
+    )
+
+    outcome = retriever.retrieve(conn, "413", WORKSPACE, now=NOW)
+
+    superseded = next(hit for hit in outcome.results if hit.id == wrong.id)
+    assert right.id not in {neighbor.id for neighbor in superseded.neighbors}
+
+
+def test_the_replacement_neighbour_crosses_from_the_global_tier(
+    conn: sqlite3.Connection,
+) -> None:
+    """A global lesson may retract a repo memory, so the evidence must cross too."""
+    wrong = store.add_memory(conn, WRONG, WORKSPACE)
+    right = store.add_memory(conn, RIGHT, core_memory.GLOBAL_WORKSPACE, supersedes=[wrong.id])
+
+    outcome = retriever.retrieve(conn, "resizer", WORKSPACE, now=NOW)
+
+    assert outcome.results[0].id == wrong.id
+    assert [neighbor.id for neighbor in outcome.results[0].neighbors] == [right.id]
+
+
+def test_core_memory_skips_a_superseded_row(conn: sqlite3.Connection) -> None:
+    """v0.4.0 C4: a retracted convention stops being pushed into every recall."""
+    retracted = store.add_memory(conn, "always deploy from the release branch", WORKSPACE, "core")
+    store.add_memory(conn, "run migrations before the test suite", WORKSPACE, "core")
+    assert "release branch" in core_memory.build_core_memory(conn, WORKSPACE).text
+
+    store.add_memory(
+        conn,
+        "deploy from main; the release branch is gone",
+        WORKSPACE,
+        "core",
+        supersedes=[retracted.id],
+    )
+
+    built = core_memory.build_core_memory(conn, WORKSPACE)
+    assert "release branch is gone" in built.text
+    assert "always deploy from the release branch" not in built.text
+    # Still stored, still retrievable — excluded from the push tier, not deleted.
+    assert retracted.id in [
+        hit.id for hit in store.search_memories(conn, "release branch", WORKSPACE)
+    ]
+
+
+def test_a_workspace_whose_only_core_row_is_superseded_has_no_core_memory(
+    conn: sqlite3.Connection,
+) -> None:
+    """The workspace listing is filtered too, so `stats` and `audit` agree with recall."""
+    retracted = store.add_memory(conn, "the only core row here", "solo", "core")
+    store.add_memory(conn, "and its correction, which is a note", "solo", supersedes=[retracted.id])
+
+    assert core_memory.core_workspaces(conn) == []
+    assert core_memory.build_core_memory(conn, "solo").text == ""
+
+
+def test_ranking_is_identical_to_milestone_b_when_nothing_is_superseded(
+    conn: sqlite3.Connection,
+) -> None:
+    """The regression that matters: C's penalty must be invisible until it is used."""
+    _build_supersede_corpus(conn)
+
+    for query, expected in MILESTONE_B_RANKING.items():
+        outcome = retriever.retrieve(conn, query, "proj", k=5, now=NOW)
+        actual = [
+            (hit.id, round(hit.score, 9), [neighbor.id for neighbor in hit.neighbors])
+            for hit in outcome.results
+        ]
+        assert actual == expected, query
+
+
 # --- the disjunctive fallback -----------------------------------------------
 
 

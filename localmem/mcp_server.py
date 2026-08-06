@@ -150,6 +150,7 @@ def memory_add(
     kind: str = store.DEFAULT_KIND,
     source: str | None = None,
     keywords: list[str] | None = None,
+    supersedes: list[int] | None = None,
 ) -> dict[str, Any]:
     """Store ``content`` and return §4's add payload.
 
@@ -164,10 +165,16 @@ def memory_add(
             one part of localmem a model contributes to, and it is charged at write
             time only — roughly 20-40 output tokens, once, for a memory that is then
             recalled for free forever. Recall itself stays LLM-free.
+        supersedes: the ids of memories this one corrects. The old memories are kept and
+            stay searchable; they are ranked down, and a recall that returns one gets
+            this memory attached as its first neighbour. An unknown id fails the call
+            rather than storing a memory whose retraction silently did nothing.
 
     Returns:
         ``{"status": "added" | "duplicate_merged", "id": int, "seen_count": int}``. On
-        failure ``{"status": "error", "id": 0, "seen_count": 0, "message": ...}``.
+        failure ``{"status": "error", "id": 0, "seen_count": 0, "message": ...}``. The
+        key set is §4's and does not widen for ``supersedes``: the link either applied or
+        the call is an error, so there is nothing extra to report.
 
     ``session_id`` is accepted by :func:`localmem.store.add_memory` but is not part of
     §4's tool surface, so it is always ``None`` on this path.
@@ -175,7 +182,7 @@ def memory_add(
     See :func:`memory_recall` for why ``except Exception`` is authorized here.
     """
     try:
-        return _add(content, workspace, kind, source, keywords)
+        return _add(content, workspace, kind, source, keywords, supersedes)
     except Exception as exc:
         _LOGGER.exception("memory_add failed for kind %r", kind)
         return {"status": "error", "id": 0, "seen_count": 0, "message": f"{ERROR_PREFIX}{exc}"}
@@ -200,6 +207,7 @@ def _add(
     kind: str,
     source: str | None,
     keywords: list[str] | None,
+    supersedes: list[int] | None,
 ) -> dict[str, Any]:
     """Run one write; raises on bad input or a database failure."""
     if not content.strip():
@@ -212,7 +220,7 @@ def _add(
         raise ValueError(f"kind must be one of {', '.join(ADD_KINDS)}; got {kind!r}")
     target = _add_workspace(workspace)
     with _connection() as conn:
-        result = store.add_memory(conn, content, target, kind, source, None, keywords)
+        result = store.add_memory(conn, content, target, kind, source, None, keywords, supersedes)
     return {"status": result.status, "id": result.id, "seen_count": result.seen_count}
 
 

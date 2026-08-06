@@ -762,6 +762,170 @@ def test_promote_leaves_the_full_text_index_and_entity_links_alone(
     )
 
 
+# --- supersede --------------------------------------------------------------
+
+WRONG = "the leak is in the image resizer — it holds every buffer it allocates"
+RIGHT = "not a leak at all: the connection pool was exhausted, max=5 in config/db.yml"
+
+
+def test_supersede_points_the_old_row_at_the_new_one(conn: sqlite3.Connection) -> None:
+    """v0.4.0 C1: the column M1 reserved finally carries a value."""
+    wrong = store.add_memory(conn, WRONG, "ws")
+
+    right = store.add_memory(conn, RIGHT, "ws", supersedes=[wrong.id])
+
+    assert _row(conn, wrong.id)["superseded_by"] == right.id
+    # The correction itself is current: nothing points at it, and it points at nothing.
+    assert _row(conn, right.id)["superseded_by"] is None
+
+
+def test_supersede_accepts_several_ids_at_once(conn: sqlite3.Connection) -> None:
+    first = store.add_memory(conn, "the first wrong guess", "ws")
+    second = store.add_memory(conn, "the second wrong guess", "ws")
+
+    right = store.add_memory(conn, RIGHT, "ws", supersedes=[first.id, second.id, first.id])
+
+    assert _row(conn, first.id)["superseded_by"] == right.id
+    assert _row(conn, second.id)["superseded_by"] == right.id
+
+
+def test_supersede_rejects_an_unknown_id_and_stores_nothing(conn: sqlite3.Connection) -> None:
+    """An unknown id is an error, never a silent no-op — and it rolls the write back."""
+    with pytest.raises(ValueError, match="no memory with id 404"):
+        store.add_memory(conn, RIGHT, "ws", supersedes=[404])
+
+    assert conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == 0
+
+
+def test_supersede_rolls_back_the_whole_add(conn: sqlite3.Connection) -> None:
+    """The valid half of a half-valid list must not survive either."""
+    wrong = store.add_memory(conn, WRONG, "ws")
+
+    with pytest.raises(ValueError, match="no memory with id 404"):
+        store.add_memory(conn, RIGHT, "ws", supersedes=[wrong.id, 404])
+
+    assert _row(conn, wrong.id)["superseded_by"] is None
+    assert conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == 1
+
+
+def test_a_memory_cannot_supersede_itself(conn: sqlite3.Connection) -> None:
+    """Reachable only through the merge path, where the resolved id is an existing row."""
+    added = store.add_memory(conn, WRONG, "ws")
+
+    with pytest.raises(ValueError, match="cannot supersede itself"):
+        store.add_memory(conn, WRONG, "ws", supersedes=[added.id])
+
+    assert _row(conn, added.id)["superseded_by"] is None
+    # The rollback also undid the duplicate merge's seen_count bump.
+    assert _row(conn, added.id)["seen_count"] == 1
+
+
+def test_an_already_superseded_row_may_be_superseded_again(conn: sqlite3.Connection) -> None:
+    """Corrections get corrected; the link moves to the newest one."""
+    wrong = store.add_memory(conn, WRONG, "ws")
+    better = store.add_memory(conn, RIGHT, "ws", supersedes=[wrong.id])
+
+    best = store.add_memory(
+        conn, "final word: the retry loop never released a connection", "ws", supersedes=[wrong.id]
+    )
+
+    assert _row(conn, wrong.id)["superseded_by"] == best.id
+    assert _row(conn, better.id)["superseded_by"] is None
+
+
+def test_supersede_refuses_a_cycle(conn: sqlite3.Connection) -> None:
+    """A supersede cycle would leave neither row as the current answer.
+
+    An insert cannot make one — a new row has no incoming links — but the duplicate
+    merge can, because there the resolved id is an existing, possibly superseded row.
+    """
+    first = store.add_memory(conn, WRONG, "ws")
+    second = store.add_memory(conn, RIGHT, "ws", supersedes=[first.id])
+
+    with pytest.raises(ValueError, match="already supersedes"):
+        store.add_memory(conn, WRONG, "ws", supersedes=[second.id])
+
+    assert _row(conn, first.id)["superseded_by"] == second.id
+    assert _row(conn, second.id)["superseded_by"] is None
+
+
+def test_supersede_refuses_a_longer_cycle(conn: sqlite3.Connection) -> None:
+    first = store.add_memory(conn, "guess one", "ws")
+    second = store.add_memory(conn, "guess two", "ws", supersedes=[first.id])
+    third = store.add_memory(conn, "guess three", "ws", supersedes=[second.id])
+
+    with pytest.raises(ValueError, match="already supersedes"):
+        store.add_memory(conn, "guess one", "ws", supersedes=[third.id])
+
+
+def test_a_global_memory_may_supersede_a_repo_one(conn: sqlite3.Connection) -> None:
+    """The direction that is allowed: the shared tier is readable from the repo."""
+    wrong = store.add_memory(conn, WRONG, "proj")
+
+    right = store.add_memory(conn, RIGHT, core_memory.GLOBAL_WORKSPACE, supersedes=[wrong.id])
+
+    assert _row(conn, wrong.id)["superseded_by"] == right.id
+
+
+def test_a_repo_memory_may_not_supersede_another_workspace(conn: sqlite3.Connection) -> None:
+    """The questionable direction, refused: `other` cannot even see `proj`."""
+    wrong = store.add_memory(conn, WRONG, "proj")
+
+    with pytest.raises(ValueError, match="cannot supersede memory"):
+        store.add_memory(conn, RIGHT, "other", supersedes=[wrong.id])
+
+    assert _row(conn, wrong.id)["superseded_by"] is None
+
+
+def test_a_repo_memory_may_not_supersede_a_global_one(conn: sqlite3.Connection) -> None:
+    """One repo must not retract knowledge every other repo relies on."""
+    wrong = store.add_memory(conn, WRONG, core_memory.GLOBAL_WORKSPACE)
+
+    with pytest.raises(ValueError, match="cannot supersede memory"):
+        store.add_memory(conn, RIGHT, "proj", supersedes=[wrong.id])
+
+
+def test_supersede_leaves_the_full_text_index_intact(conn: sqlite3.Connection) -> None:
+    """`mem_au` fires on content/keywords only, so this UPDATE costs no index work."""
+    wrong = store.add_memory(conn, WRONG, "ws")
+    store.add_memory(conn, RIGHT, "ws", supersedes=[wrong.id])
+
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+    # Superseded is not deleted: plain search still finds it.
+    assert wrong.id in [hit.id for hit in store.search_memories(conn, "resizer", "ws")]
+
+
+def test_cli_add_supersedes_is_repeatable(db_path: Path) -> None:
+    runner = CliRunner()
+    first = runner.invoke(main, ["add", "guess one", "-w", "proj"])
+    second = runner.invoke(main, ["add", "guess two", "-w", "proj"])
+    correction = runner.invoke(
+        main,
+        ["add", RIGHT, "-w", "proj", "--kind", "lesson", "--supersedes", "1", "--supersedes", "2"],
+    )
+
+    assert json.loads(first.output)["id"] == 1
+    assert json.loads(second.output)["id"] == 2
+    assert json.loads(correction.output) == {"status": "added", "id": 3, "seen_count": 1}
+
+    connection = db.open_database(db_path)
+    try:
+        rows = connection.execute("SELECT id, superseded_by FROM memories ORDER BY id").fetchall()
+    finally:
+        connection.close()
+    assert [(row["id"], row["superseded_by"]) for row in rows] == [(1, 3), (2, 3), (3, None)]
+
+
+def test_cli_add_reports_an_unknown_supersedes_id(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "guess one", "-w", "proj"])
+
+    result = runner.invoke(main, ["add", RIGHT, "-w", "proj", "--supersedes", "404"])
+
+    assert result.exit_code != 0
+    assert "no memory with id 404" in result.output
+
+
 # --- stats ------------------------------------------------------------------
 
 

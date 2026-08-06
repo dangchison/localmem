@@ -6,6 +6,8 @@ core memory rather than propagated.
 
 A named workspace also loads the shared :data:`GLOBAL_WORKSPACE` tier, its own rows
 first; see ``docs/design_decisions.md`` §24.
+
+A superseded core row is excluded outright — see :data:`_SELECT_CORE_SQL`.
 """
 
 from __future__ import annotations
@@ -30,9 +32,15 @@ CORE_MEMORY_TOKEN_CAP = 400
 
 CORE_MEMORY_JOINER = "\n"
 
-_SELECT_CORE_SQL = "SELECT content FROM memories WHERE kind = ?"
+# `superseded_by IS NULL` on both statements: core memory is the one *push* tier, loaded
+# into every recall in the workspace, so a retracted convention must stop being pushed the
+# moment its correction is written. Everywhere else a superseded row stays retrievable and
+# is merely ranked down; here there is no ranking to rank it down in.
+_SELECT_CORE_SQL = "SELECT content FROM memories WHERE kind = ? AND superseded_by IS NULL"
 _CORE_ORDER_BY = " ORDER BY created_at ASC, id ASC"
-_SELECT_CORE_WORKSPACES_SQL = "SELECT DISTINCT workspace FROM memories WHERE kind = ?"
+_SELECT_CORE_WORKSPACES_SQL = (
+    "SELECT DISTINCT workspace FROM memories WHERE kind = ? AND superseded_by IS NULL"
+)
 
 
 @dataclass(frozen=True)

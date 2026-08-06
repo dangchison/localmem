@@ -120,9 +120,15 @@ query
   │      The recency weight is 0.05 normally and 0.25 when the query carried a cue; the
   │      decay curve itself never changes.
   │
+  ├─ 5b. supersede: a row with superseded_by set has its score multiplied by 0.1, and —
+  │      if its replacement is also among the candidates — capped at replacement × 0.1,
+  │      so the correction is always read first when both are found. Never filtered: the
+  │      retracted memory stays findable. See design_decisions.md §43.
+  │
   ├─ 6. evidence closure: up to 2 supporting neighbours per result, never a row already
-  │      in the results. Session-adjacent rows first, then top co-occurring entity
-  │      siblings. See "session_id" below — in practice this is the entity path.
+  │      in the results. A superseded row's replacement takes the first slot, then
+  │      session-adjacent rows, then top co-occurring entity siblings. See "session_id"
+  │      below — in practice the last is the entity path.
   │
   ├─ 7. core memory: kind='core' rows for the workspace, oldest first, joined by newline,
   │      capped at ~400 estimated tokens by dropping whole rows from the front. For a named
@@ -136,7 +142,9 @@ query
 
 Evidence closure keeps each hit inside its **own** workspace: a global hit gathers global
 neighbours, a repo hit gathers repo neighbours. The fallback widens which rows can be *found*,
-not which rows count as evidence for one another.
+not which rows count as evidence for one another. The **replacement** of a superseded hit is the
+one neighbour fetched without a workspace filter, because the write-time rule
+(`design_decisions.md` §41) already guarantees it is a row that workspace can see.
 
 A query consisting of nothing but recency cues (`today`, `hôm qua`) skips both views and
 returns the workspace ordered `created_at DESC`, scored by the recency term alone. That is a
@@ -228,9 +236,23 @@ retriever's session-adjacency neighbour query is guarded by `row.session_id is n
 means it never fires for MCP-written memories; those results get entity-sibling neighbours
 instead. The column is reserved for CLI provenance and for a future `SessionEnd` hook.
 
-**`superseded_by`** is a reserved column with **no logic behind it**. Nothing in v0.2.0 reads
-or writes it, and `transfer.restore` deliberately does not carry it: it holds a row id, and row
-ids are local to a database. Tier-3 temporal supersede is still open.
+**`superseded_by`** carries the temporal supersede tier as of v0.4.0 — the column has been
+reserved since M1 and is written for the first time here. It is set by
+`localmem add --supersedes ID` / `memory_add(..., supersedes=[…])`, in the same transaction as
+the insert, and only where the replacement is visible from the retracted row's workspace
+(§41). Three consequences worth knowing:
+
+- **the retracted row is demoted, never hidden.** Recall multiplies its score by 0.1 and caps it
+  under its replacement's when both are found (§43), and attaches the replacement as its first
+  neighbour. `localmem search`, `stats` and `audit` all still see it.
+- **core memory is the exception**: a superseded `kind='core'` row is excluded outright, because
+  core memory is *pushed* into every recall and a retracted convention must stop being pushed.
+- **`transfer.restore` still does not carry it**, exactly as when the column was reserved: it
+  holds a row id, and ids are reassigned on restore. Supersede links are local to one database
+  and are lost on export/restore; both memories travel, the link does not.
+
+No schema change was needed for any of it — `dedupe --merge` moves links onto the surviving row
+before deleting (§42), so the missing `ON DELETE` clause never bites.
 
 **`recalled_count` / `last_recalled_at`** arrive with schema version 2 and are written by one
 best-effort statement at the end of `retriever.retrieve()`. They exist for `audit` and `stats`;

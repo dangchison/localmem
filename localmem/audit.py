@@ -4,14 +4,15 @@
 writing a byte. Every statement in this module is a ``SELECT``; the report is a report,
 not a gate, so the command always exits 0 and never repairs anything it finds.
 
-Five sections, each reusing infrastructure that already exists:
+Six sections, each reusing infrastructure that already exists:
 
 1. the tier-2 near-duplicate queue, with the exact commands that drain it;
 2. rows that look like core-memory candidates — suggestions only, see
    :data:`PROMOTION_NOTE`;
 3. distribution per workspace, kind and age, plus the entity graph and file size;
 4. core-memory health against the 400-token cap;
-5. dead memories: old and never once recalled.
+5. dead memories: old and never once recalled;
+6. superseded memories, each shown with what replaced it.
 
 Scoping note: ``workspace`` filters *exactly*, with no shared-``global`` fallback. A
 recall reads two tiers on purpose (``docs/design_decisions.md`` §24); an inventory of
@@ -91,6 +92,43 @@ SELECT COUNT(*) AS n
  WHERE recalled_count = 0
    AND created_at < datetime('now', ?)
 """
+
+#: Verbatim in both output modes. A superseded row is demoted, never hidden, and that is
+#: a design decision worth restating where a reader meets the count.
+SUPERSEDED_NOTE = (
+    "Superseded memories are kept and stay searchable — their score is multiplied by "
+    "0.1, and a recall that returns one attaches the replacement as its first "
+    "neighbour, so the correction travels with the memory it corrected. Supersede "
+    "links are local to this database and are not carried by `localmem export`."
+)
+
+# `m` and `r` are the retracted row and its replacement. The join is what turns "17 rows
+# are superseded" into a report a person can act on.
+_SUPERSEDED_SQL = """
+SELECT m.id         AS id,
+       m.workspace  AS workspace,
+       m.kind       AS kind,
+       m.created_at AS created_at,
+       m.content    AS content,
+       r.id         AS replacement_id,
+       r.workspace  AS replacement_workspace,
+       r.content    AS replacement_content
+  FROM memories AS m
+  JOIN memories AS r ON r.id = m.superseded_by
+ WHERE m.superseded_by IS NOT NULL
+"""
+
+_SUPERSEDED_ORDER_BY = " ORDER BY m.id ASC LIMIT ?"
+
+_SUPERSEDED_COUNT_SQL = """
+SELECT COUNT(*) AS n
+  FROM memories AS m
+ WHERE m.superseded_by IS NOT NULL
+"""
+
+#: The retracted row's workspace, qualified: :data:`_SUPERSEDED_SQL` joins ``memories``
+#: to itself, so the bare column name of :data:`_WORKSPACE_FILTER` would be ambiguous.
+_SUPERSEDED_WORKSPACE_FILTER = " AND m.workspace = ?"
 
 _DISTRIBUTION_SQL = """
 SELECT workspace,
@@ -180,6 +218,26 @@ class DeadMemory:
 
 
 @dataclass(frozen=True)
+class SupersededMemory:
+    """Section 6 — a memory a later one corrected, shown with its replacement.
+
+    Attributes:
+        replacement_workspace: where the correction lives. Usually the same workspace;
+            ``global`` when a shared lesson retracted a repo-local one, which is the one
+            cross-workspace direction :func:`localmem.store._supersede` permits.
+    """
+
+    id: int
+    workspace: str
+    kind: str
+    created_at: str
+    content: str
+    replacement_id: int
+    replacement_workspace: str
+    replacement_content: str
+
+
+@dataclass(frozen=True)
 class Audit:
     """The whole report. Assembled by :func:`run`, rendered by the CLI."""
 
@@ -195,6 +253,8 @@ class Audit:
     core_health: tuple[CoreHealth, ...]
     dead: tuple[DeadMemory, ...]
     dead_total: int
+    superseded: tuple[SupersededMemory, ...]
+    superseded_total: int
 
 
 def run(conn: sqlite3.Connection, db_path: Path, workspace: str | None = None) -> Audit:
@@ -221,6 +281,8 @@ def run(conn: sqlite3.Connection, db_path: Path, workspace: str | None = None) -
         core_health=_core_health(conn, scope),
         dead=_dead_memories(conn, scope),
         dead_total=_dead_total(conn, scope),
+        superseded=_superseded_memories(conn, scope),
+        superseded_total=_superseded_total(conn, scope),
     )
 
 
@@ -335,6 +397,45 @@ def _dead_total(conn: sqlite3.Connection, workspace: str | None) -> int:
     params: list[object] = [_DEAD_MEMORY_CUTOFF]
     if workspace is not None:
         sql += _WORKSPACE_FILTER
+        params.append(workspace)
+    return int(conn.execute(sql, params).fetchone()["n"])
+
+
+def _superseded_memories(
+    conn: sqlite3.Connection, workspace: str | None
+) -> tuple[SupersededMemory, ...]:
+    """Return up to :data:`LISTING_LIMIT` retracted rows, oldest id first.
+
+    ``workspace`` filters on the *retracted* row, not on its replacement: the question
+    this section answers is "what in here has been corrected?", and the answer belongs to
+    the workspace that holds the stale memory.
+    """
+    sql = _SUPERSEDED_SQL
+    params: list[object] = []
+    if workspace is not None:
+        sql += _SUPERSEDED_WORKSPACE_FILTER
+        params.append(workspace)
+    params.append(LISTING_LIMIT)
+    return tuple(
+        SupersededMemory(
+            id=int(row["id"]),
+            workspace=row["workspace"],
+            kind=row["kind"],
+            created_at=row["created_at"],
+            content=row["content"],
+            replacement_id=int(row["replacement_id"]),
+            replacement_workspace=row["replacement_workspace"],
+            replacement_content=row["replacement_content"],
+        )
+        for row in conn.execute(sql + _SUPERSEDED_ORDER_BY, params).fetchall()
+    )
+
+
+def _superseded_total(conn: sqlite3.Connection, workspace: str | None) -> int:
+    sql = _SUPERSEDED_COUNT_SQL
+    params: list[object] = []
+    if workspace is not None:
+        sql += _SUPERSEDED_WORKSPACE_FILTER
         params.append(workspace)
     return int(conn.execute(sql, params).fetchone()["n"])
 

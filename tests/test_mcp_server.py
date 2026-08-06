@@ -316,6 +316,46 @@ def test_stdio_writes_a_lesson_and_recalls_it_as_one(db_path: Path, tmp_path: Pa
     assert set(hits[0]) == RESULT_KEYS
 
 
+def test_memory_add_supersedes_leaves_both_payloads_frozen(db_path: Path) -> None:
+    """v0.4.0 C1/C3 over the tool surface: new input, not a byte of new output.
+
+    The correction is attached to the retracted memory through ``neighbors``, which §4
+    already defined as a list of ``{id, content}`` — so the whole learning loop travels
+    on the frozen payload.
+    """
+    wrong = mcp_server.memory_add(
+        "the leak is in the image resizer", workspace="repo-a", kind="lesson"
+    )
+    right = mcp_server.memory_add(
+        "the connection pool was exhausted, max=5 in config/db.yml",
+        workspace="repo-a",
+        kind="lesson",
+        supersedes=[wrong["id"]],
+    )
+
+    assert set(wrong) == set(right) == ADD_KEYS
+    assert right["status"] == "added"
+
+    body = mcp_server.memory_recall("resizer", workspace="repo-a")
+    assert set(body) == RECALL_KEYS
+    hit = body["results"][0]
+    assert set(hit) == RESULT_KEYS
+    assert hit["id"] == wrong["id"]
+    assert hit["neighbors"][0] == {
+        "id": right["id"],
+        "content": "the connection pool was exhausted, max=5 in config/db.yml",
+    }
+
+
+def test_memory_add_reports_an_unknown_supersedes_id_as_a_payload(db_path: Path) -> None:
+    """A tool never raises: the refusal comes back as the error payload."""
+    body = mcp_server.memory_add("a correction of nothing", workspace="repo-a", supersedes=[404])
+
+    assert body["status"] == "error"
+    assert mcp_server.ERROR_PREFIX in body["message"]
+    assert "no memory with id 404" in body["message"]
+
+
 def test_recall_from_a_named_workspace_reaches_the_global_tier(db_path: Path) -> None:
     """v0.2 behaviour, through the tool surface — with §4's payload shape untouched."""
     seed("global", "reset the upload buffer before retrying")

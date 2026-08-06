@@ -6,7 +6,12 @@ the ``memories`` table and nothing else:
 * ``entities`` / ``memory_entities`` are **derived** — :func:`restore` rebuilds them with
   the ordinary backfill, so a stale graph can never travel between machines;
 * ``dedup_queue`` is **transient** — an unreviewed near-duplicate is a local judgement
-  call about a local pair of ids, and ids do not survive the trip.
+  call about a local pair of ids, and ids do not survive the trip;
+* ``superseded_by`` is **local** for that same reason. Every other column travels, but a
+  supersede link is a row id, so restoring a document into a database that already holds
+  rows would point the retraction at whatever happens to carry that id there. The link is
+  therefore dropped: the corrected memory and its correction both arrive, ranking equally,
+  and the link is re-declared by adding the correction again with ``--supersedes``.
 
 Copying ``memory.db`` by hand is the alternative, and it is only safe with every agent
 stopped: WAL keeps recent commits in a ``-wal`` sidecar, so a half-copied pair of files
@@ -51,8 +56,11 @@ _COUNT_SQL = "SELECT COUNT(*) AS n FROM memories"
 
 # `id` is deliberately absent: row ids are local to a database, and forcing them in would
 # collide with whatever the target already stores. `superseded_by` is absent for the same
-# reason — it holds an id, it is reserved schema with no logic behind it in v0.2, and
-# carrying a remapped-away reference would be worse than carrying none.
+# reason — it holds an id, and an id that means one memory here means a different one, or
+# none, in a database that already has rows. v0.4.0 gave the column real logic and did
+# **not** change this: carrying a remapped-away reference would point a retraction at the
+# wrong memory, which is worse than carrying none. The documented consequence is that
+# supersede links are local to one database and are lost on export/restore.
 #
 # Every OTHER column of `memories` must be listed here. Export is `SELECT *` and picks up
 # a new column for free; restore is explicit and does not, so a column added by a

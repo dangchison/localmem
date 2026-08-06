@@ -68,6 +68,19 @@ SELECT id, seen_count, keywords FROM memories WHERE workspace = ? AND content_ha
 
 _SELECT_BY_ID_SQL = "SELECT id, workspace, kind FROM memories WHERE id = ?"
 
+_SELECT_SUPERSEDE_TARGET_SQL = "SELECT id, workspace, superseded_by FROM memories WHERE id = ?"
+
+# `mem_au` fires only `AFTER UPDATE OF content, keywords`, so pointing one row at another
+# costs no FTS5 index maintenance — the same property `_PROMOTE_SQL` relies on.
+_SUPERSEDE_SQL = """
+UPDATE memories
+   SET superseded_by = ?,
+       updated_at = datetime('now')
+ WHERE id = ?
+"""
+
+_SELECT_SUPERSEDED_BY_SQL = "SELECT superseded_by FROM memories WHERE id = ?"
+
 # `kind` is not an indexed FTS5 column and `mem_au` fires only `AFTER UPDATE OF content,
 # keywords`, so this statement costs no index maintenance and cannot desynchronize
 # `memories_fts`. The entity graph is derived from `content`, which is likewise untouched.
@@ -179,6 +192,7 @@ def add_memory(
     source: str | None = None,
     session_id: str | None = None,
     keywords: Sequence[str] | None = None,
+    supersedes: Sequence[int] | None = None,
 ) -> AddResult:
     """Store ``content``, merging it into an existing row on an exact-hash match.
 
@@ -194,6 +208,15 @@ def add_memory(
     route by which an already-stored memory ever gains keywords, since generating them
     needs a model and nothing in localmem calls one.
 
+    ``supersedes`` names the memories this one corrects. Each referenced row gets its
+    ``superseded_by`` set to the id this call resolves to, **inside the same
+    transaction** as the insert, so a database is never left holding the correction
+    without the link. A superseded row is not hidden: it stays retrievable and is ranked
+    down by :data:`localmem.retriever.SUPERSEDED_SCORE_PENALTY`, and a recall that
+    returns it attaches its replacement as evidence. This is the ADD/UPDATE decision
+    Mem0 pays a model call to make, collapsed onto the agent at write time — which is
+    what keeps recall free of any model (``docs/design_decisions.md`` §40).
+
     A new row is indexed by :func:`localmem.indexer.index_memory` in the same
     transaction. A merge does not re-index: the stored content is unchanged, so the
     links already attached to that row stay correct.
@@ -206,40 +229,50 @@ def add_memory(
         existing row in the same workspace was bumped.
 
     Raises:
-        ValueError: if ``content`` is blank or ``workspace`` is empty.
+        ValueError: if ``content`` is blank, ``workspace`` is empty, or any
+            ``supersedes`` id is unknown, is the row being written, or is out of reach
+            of this workspace (see :func:`_supersede`). The whole call rolls back in
+            that case — the memory is not stored either, because a correction whose
+            link failed is not the memory the caller asked for.
     """
     if not content.strip():
         raise ValueError("content is empty; pass the text you want to remember")
     target_workspace = validate_workspace(workspace)
     digest = dedup.content_hash(content)
     keyword_text = normalize_keywords(keywords)
+    targets = _unique_ids(supersedes)
 
     with db.transaction(conn):
         existing = conn.execute(_SELECT_BY_HASH_SQL, (target_workspace, digest)).fetchone()
         if existing is not None:
-            return AddResult(
+            result = AddResult(
                 STATUS_DUPLICATE_MERGED,
                 *_merge_duplicate(conn, target_workspace, digest, keyword_text),
             )
-        try:
-            cursor = conn.execute(
-                _INSERT_MEMORY_SQL,
-                (content, digest, target_workspace, kind, source, session_id, keyword_text),
-            )
-        except sqlite3.IntegrityError:
-            # A concurrent writer won the race on UNIQUE(workspace, content_hash).
-            return AddResult(
-                STATUS_DUPLICATE_MERGED,
-                *_merge_duplicate(conn, target_workspace, digest, keyword_text),
-            )
-        row_id = cursor.lastrowid
-        if row_id is None:
-            raise RuntimeError("SQLite did not report a row id for the inserted memory")
-        indexer.index_memory(conn, row_id, content)
-        dedup.enqueue_near_duplicates(
-            conn, row_id, content, target_workspace, build_match_expression
-        )
-        return AddResult(STATUS_ADDED, row_id, 1)
+        else:
+            try:
+                cursor = conn.execute(
+                    _INSERT_MEMORY_SQL,
+                    (content, digest, target_workspace, kind, source, session_id, keyword_text),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent writer won the race on UNIQUE(workspace, content_hash).
+                result = AddResult(
+                    STATUS_DUPLICATE_MERGED,
+                    *_merge_duplicate(conn, target_workspace, digest, keyword_text),
+                )
+            else:
+                row_id = cursor.lastrowid
+                if row_id is None:
+                    raise RuntimeError("SQLite did not report a row id for the inserted memory")
+                indexer.index_memory(conn, row_id, content)
+                dedup.enqueue_near_duplicates(
+                    conn, row_id, content, target_workspace, build_match_expression
+                )
+                result = AddResult(STATUS_ADDED, row_id, 1)
+        if targets:
+            _supersede(conn, result.id, target_workspace, targets)
+        return result
 
 
 def promote_memory(conn: sqlite3.Connection, memory_id: int, kind: str) -> PromoteResult:
@@ -373,6 +406,101 @@ def normalize_keywords(keywords: Sequence[str] | None) -> str | None:
         if len(unique) == MAX_KEYWORDS:
             break
     return " ".join(unique) or None
+
+
+def _unique_ids(ids: Sequence[int] | None) -> tuple[int, ...]:
+    """Return ``ids`` de-duplicated with first-seen order preserved."""
+    if not ids:
+        return ()
+    unique: dict[int, None] = {}
+    for value in ids:
+        unique.setdefault(int(value), None)
+    return tuple(unique)
+
+
+def _supersede(
+    conn: sqlite3.Connection,
+    replacement_id: int,
+    replacement_workspace: str,
+    targets: tuple[int, ...],
+) -> None:
+    """Point every row in ``targets`` at ``replacement_id``, or raise and roll back.
+
+    Four rules, each enforced here rather than left to the caller:
+
+    * **an unknown id is an error**, never a silent no-op. The agent believes it just
+      retracted something; being told "no such memory" is the only honest answer;
+    * **a row may not supersede itself.** Re-adding a memory's own text with
+      ``--supersedes <its own id>`` reaches this through the duplicate-merge path, where
+      the resolved id *is* the target — a self-loop that would demote the row against
+      its own correction;
+    * **an already-superseded row may be superseded again.** Corrections get corrected,
+      and ``superseded_by`` simply moves to the newest one. This is the case the
+      milestone exists for, so it is allowed by design;
+    * **the replacement must be reachable from the target's workspace.** A row may
+      supersede one in its own workspace, and a ``global`` row may supersede one
+      anywhere — but a repo-local row may not retract knowledge in another workspace.
+      The rule is exactly :func:`localmem.retriever._workspace_scope`'s visibility:
+      a recall scoped to the target's workspace must be able to return the replacement,
+      or the retraction would demote a memory while hiding the reason
+      (``docs/design_decisions.md`` §41).
+
+    Cycles are refused by :func:`_would_cycle`. They cannot arise from an ordinary
+    insert — a freshly inserted row has ``superseded_by`` NULL and nothing pointing at
+    it — but they can through the merge path, where the resolved id is an existing row
+    that may already be superseded.
+    """
+    for target_id in targets:
+        row = conn.execute(_SELECT_SUPERSEDE_TARGET_SQL, (target_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"no memory with id {target_id} to supersede; "
+                "`localmem search` prints the id of every hit"
+            )
+        if target_id == replacement_id:
+            raise ValueError(
+                f"memory {target_id} cannot supersede itself; a correction is a different "
+                "memory, and re-adding the same text merges into the row it already has"
+            )
+        target_workspace = str(row["workspace"])
+        if not _may_supersede(replacement_workspace, target_workspace):
+            raise ValueError(
+                f"a memory in workspace {replacement_workspace!r} cannot supersede memory "
+                f"{target_id} in workspace {target_workspace!r}; store the correction in "
+                f"{target_workspace!r} or in {core_memory.GLOBAL_WORKSPACE!r}, which every "
+                "workspace reads"
+            )
+        if _would_cycle(conn, replacement_id, target_id):
+            raise ValueError(
+                f"memory {target_id} already supersedes {replacement_id}, directly or "
+                "through a chain; pointing them at each other would leave neither as the "
+                "current answer"
+            )
+        conn.execute(_SUPERSEDE_SQL, (replacement_id, target_id))
+
+
+def _may_supersede(replacement_workspace: str, target_workspace: str) -> bool:
+    """Return whether a row in one workspace may supersede a row in another."""
+    return replacement_workspace in (target_workspace, core_memory.GLOBAL_WORKSPACE)
+
+
+def _would_cycle(conn: sqlite3.Connection, replacement_id: int, target_id: int) -> bool:
+    """Return whether ``target_id → replacement_id`` would close a supersede cycle.
+
+    Walks the chain forward from the replacement: if the row being retracted is already
+    somewhere ahead of it, the new edge would join the two ends. The ``seen`` set also
+    makes the walk terminate on a database that somehow already holds a cycle, so this
+    can never hang a write.
+    """
+    seen: set[int] = set()
+    current: int | None = replacement_id
+    while current is not None and current not in seen:
+        if current == target_id:
+            return True
+        seen.add(current)
+        row = conn.execute(_SELECT_SUPERSEDED_BY_SQL, (current,)).fetchone()
+        current = None if row is None or row["superseded_by"] is None else int(row["superseded_by"])
+    return False
 
 
 def _quoted_tokens(query: str) -> list[str]:

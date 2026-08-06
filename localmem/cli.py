@@ -104,6 +104,18 @@ def main() -> None:
         "unions its keywords into the stored row."
     ),
 )
+@click.option(
+    "--supersedes",
+    "supersedes",
+    multiple=True,
+    type=int,
+    metavar="ID",
+    help=(
+        "The id of a memory this one corrects. Repeatable. The old memory is kept and "
+        "stays searchable — it is ranked down, and a recall that returns it attaches "
+        "this one as its first neighbour. An unknown id is an error and stores nothing."
+    ),
+)
 def add(
     content: str,
     workspace: str | None,
@@ -111,12 +123,13 @@ def add(
     source: str | None,
     session_id: str | None,
     keywords: tuple[str, ...],
+    supersedes: tuple[int, ...],
 ) -> None:
     """Store CONTENT, merging it into an existing row if identical."""
     with _session() as (conn, _path):
         target_workspace = _resolve_workspace(workspace)
         result = store.add_memory(
-            conn, content, target_workspace, kind, source, session_id, keywords
+            conn, content, target_workspace, kind, source, session_id, keywords, supersedes
         )
     click.echo(
         json.dumps(
@@ -1026,7 +1039,7 @@ def _benchmark_payload(report: benchmark.Benchmark, workspace: str) -> dict[str,
 
 
 def _echo_audit(report: audit.Audit) -> None:
-    """Render the hygiene report as five numbered sections."""
+    """Render the hygiene report as six numbered sections."""
     scope = report.workspace if report.workspace is not None else "every workspace"
     click.echo(f"localmem audit — {scope}")
     click.echo(f"database: {report.db_path} ({_format_size(report.db_size_bytes)})")
@@ -1035,6 +1048,7 @@ def _echo_audit(report: audit.Audit) -> None:
     _echo_audit_distribution(report)
     _echo_audit_core(report.core_health)
     _echo_audit_dead(report)
+    _echo_audit_superseded(report)
 
 
 def _echo_audit_queue(queue: audit.QueueReport) -> None:
@@ -1121,6 +1135,25 @@ def _echo_audit_dead(report: audit.Audit) -> None:
     click.echo(f"   {audit.DEAD_MEMORY_NOTE}")
 
 
+def _echo_audit_superseded(report: audit.Audit) -> None:
+    click.echo("\n6. superseded memories")
+    if not report.superseded_total:
+        click.echo("   none — nothing in here has been corrected by a later memory")
+        return
+    click.echo(
+        f"   corrected by a later memory: {report.superseded_total} "
+        f"(showing {len(report.superseded)})"
+    )
+    for row in report.superseded:
+        click.echo(
+            f"   id={row.id} workspace={row.workspace} kind={row.kind} created={row.created_at}"
+        )
+        click.echo(f"     {_preview(row.content)}")
+        click.echo(f"     superseded by id={row.replacement_id} ({row.replacement_workspace})")
+        click.echo(f"     {_preview(row.replacement_content)}")
+    click.echo(f"   {audit.SUPERSEDED_NOTE}")
+
+
 def _age(age_days: float | None) -> str:
     """Render an age in days, or say so when the timestamp could not be read."""
     return "age unknown" if age_days is None else f"{age_days:g} days old"
@@ -1195,6 +1228,23 @@ def _audit_payload(report: audit.Audit) -> dict[str, object]:
                     "content": dead.content,
                 }
                 for dead in report.dead
+            ],
+        },
+        "superseded": {
+            "total": report.superseded_total,
+            "note": audit.SUPERSEDED_NOTE,
+            "rows": [
+                {
+                    "id": row.id,
+                    "workspace": row.workspace,
+                    "kind": row.kind,
+                    "created_at": row.created_at,
+                    "content": row.content,
+                    "replacement_id": row.replacement_id,
+                    "replacement_workspace": row.replacement_workspace,
+                    "replacement_content": row.replacement_content,
+                }
+                for row in report.superseded
             ],
         },
     }

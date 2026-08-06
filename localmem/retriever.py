@@ -10,8 +10,9 @@ Implements the original spec §5. The pipeline is pure code — no model, no net
    with both views empty, view A is retried as a disjunction and its rows are marked
    ``from_fallback``;
 4. fuse — each view min-max normalized independently, then weighted;
-5. recency and ``seen_count`` boosts;
-6. evidence closure — up to two neighbors per result;
+5. recency and ``seen_count`` boosts, then the supersede penalty;
+6. evidence closure — up to two neighbors per result, a superseded row's replacement
+   first;
 7. the workspace's capped core memory.
 
 Anything that depends on the clock takes an explicit ``now``, so tests pin time by
@@ -38,6 +39,36 @@ NO_TRACKING_ENV_VAR = "LOCALMEM_NO_TRACKING"
 
 CANDIDATE_LIMIT = 20
 MAX_NEIGHBORS = 2
+
+#: The one number the supersede demotion is built from, used for **two** things in
+#: :func:`_fuse`: a superseded row's score is multiplied by it, and — when the row's
+#: replacement is also among the candidates — capped at ``replacement * penalty``.
+#:
+#: A tenth is a demotion, not a filter: the row stays in the candidate set, stays
+#: rankable and stays findable, because "what did we think was wrong before?" is a
+#: question worth answering. Whatever still ranks after it carries its correction out as
+#: its first neighbour (:func:`_replacement_neighbor`).
+#:
+#: **The multiply alone does not reorder the pair, and that is why the cap exists.**
+#: :func:`_min_max` maps the weakest candidate of a view to exactly 0.0, so when a query
+#: matches only a retracted row and its correction and the retracted row is the better
+#: lexical match, the correction normalizes to 0.0 and keeps nothing but its boosts.
+#: Measured on that exact pair — multiply only, no cap, scores as ``[retraction,
+#: correction]``::
+#:
+#:     penalty | both 60 days old        | retraction 60d, correction 1d
+#:     --------|-------------------------|-------------------------------
+#:     0.1     | wrong first [.0612 .0125] | wrong first [.0612 .0489]
+#:     0.05    | wrong first [.0306 .0125] | fix first   [.0489 .0306]
+#:     0.02    | fix first   [.0125 .0122] | fix first   [.0489 .0122]
+#:
+#: No constant is a fix. At 0.1 the retraction wins both cases; 0.05 only survives when
+#: the correction is fresh enough for the recency term to carry it; 0.02 wins the harder
+#: case by 0.0003, which is luck, not a guarantee — and once both memories are old
+#: enough for recency to vanish from both, the correction sits at 0.0 and *every*
+#: positive constant leaves the retraction above it. The cap removes the constant from
+#: the question entirely (``docs/design_decisions.md`` §43).
+SUPERSEDED_SCORE_PENALTY = 0.1
 
 # The original spec §5 step 4: the relational view leads once the query itself yields an entity
 # that some memory actually carries.
@@ -130,6 +161,7 @@ SELECT m.id         AS id,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
        m.created_at AS created_at,
+       m.superseded_by AS superseded_by,
        -bm25(memories_fts, ?, ?) AS score
   FROM memories_fts
   JOIN memories AS m ON m.id = memories_fts.rowid
@@ -147,7 +179,8 @@ SELECT m.id         AS id,
        m.source     AS source,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
-       m.created_at AS created_at
+       m.created_at AS created_at,
+       m.superseded_by AS superseded_by
   FROM memories AS m
 """
 
@@ -163,6 +196,7 @@ SELECT m.id         AS id,
        m.seen_count AS seen_count,
        m.session_id AS session_id,
        m.created_at AS created_at,
+       m.superseded_by AS superseded_by,
        SUM(me.weight) AS score
   FROM memory_entities AS me
   JOIN memories AS m ON m.id = me.memory_id
@@ -193,6 +227,14 @@ SELECT m.id AS id, m.content AS content, COUNT(*) AS shared
 """
 
 _ENTITY_NEIGHBOR_ORDER_BY = " GROUP BY m.id ORDER BY shared DESC, m.id ASC LIMIT ?"
+
+# The replacement of a superseded hit, fetched by id. Deliberately **not** workspace
+# filtered, unlike the two neighbor queries above: `store._supersede` only ever accepts a
+# replacement the target's own workspace can already see, so the row this returns is
+# always one a recall in that workspace could have returned by itself.
+_REPLACEMENT_NEIGHBOR_SQL = (
+    "SELECT m.id AS id, m.content AS content FROM memories AS m WHERE m.id = ?"
+)
 
 # The two workspace predicates a view can carry. Both bind every value; neither is ever
 # built from a workspace name. Evidence closure keeps using the exact form against the
@@ -279,6 +321,7 @@ class _Row:
     seen_count: int
     session_id: str | None
     created_at: str
+    superseded_by: int | None
 
 
 @dataclass(frozen=True)
@@ -629,6 +672,7 @@ def _to_row(row: sqlite3.Row) -> _Row:
         seen_count=int(row["seen_count"]),
         session_id=row["session_id"],
         created_at=row["created_at"],
+        superseded_by=None if row["superseded_by"] is None else int(row["superseded_by"]),
     )
 
 
@@ -644,6 +688,31 @@ def _fuse(
     ``workspace`` only breaks ties: at an equal fused score the row that belongs to the
     workspace being searched outranks one from the shared ``global`` tier. There is no
     score penalty for being global — a genuinely better global row still wins.
+
+    A row that has been superseded is the one thing here that *is* penalized, in two
+    steps that :data:`SUPERSEDED_SCORE_PENALTY` serves both of:
+
+    1. its score, boosts included, is **multiplied** by the penalty. The multiply comes
+       last on purpose — a demotion applied before the recency term would be undone by
+       it, and a retracted memory is usually the older of the pair;
+    2. if its replacement is **also** among the candidates, its score is then **capped**
+       at ``replacement * penalty`` (:func:`_cap_superseded`). The multiply alone cannot
+       do this: :func:`_min_max`
+       maps the weakest candidate of a view to exactly 0.0, so a correction that is the
+       weaker lexical match keeps only its boosts and no constant factor is small enough
+       to reliably get under them. The cap is what turns "ranked down" into the
+       guarantee the milestone is for — *whenever both are found, the correction is
+       read first* (``docs/design_decisions.md`` §43).
+
+    The cap can land on 0.0, when the replacement is itself the weakest candidate and
+    has no boosts left. The two rows then tie on score and the existing sort key decides:
+    ``created_at`` then ``id``, both of which a correction wins, because it was written
+    after the memory it corrects. The one residual is a correction in ``global`` tying at
+    0.0 against a retracted row in the workspace being searched — the workspace tiebreak
+    sits above ``created_at`` and hands that one to the retracted row.
+
+    A database with no superseded rows anywhere is arithmetically unchanged: no factor
+    and no cap is ever reached.
     """
     normalized_lexical = _min_max(lexical.scores)
     normalized_relational = _min_max(relational.scores)
@@ -653,7 +722,8 @@ def _fuse(
         weights = (LEXICAL_WEIGHT, RELATIONAL_WEIGHT)
 
     candidates = {**relational.memories, **lexical.memories}
-    scored = []
+    penalized: dict[int, float] = {}
+    views: dict[int, tuple[float | None, float | None]] = {}
     for memory_id, row in candidates.items():
         lexical_score = normalized_lexical.get(memory_id)
         relational_score = normalized_relational.get(memory_id)
@@ -661,7 +731,13 @@ def _fuse(
         fused += weights[1] * (relational_score if relational_score is not None else 0.0)
         fused += recency_boost(row.created_at, now, recency_weight)
         fused += seen_count_boost(row.seen_count)
-        scored.append(_Scored(row, fused, lexical_score, relational_score))
+        if row.superseded_by is not None:
+            fused *= SUPERSEDED_SCORE_PENALTY
+        penalized[memory_id] = fused
+        views[memory_id] = (lexical_score, relational_score)
+
+    final = _cap_superseded(penalized, {key: row.superseded_by for key, row in candidates.items()})
+    scored = [_Scored(row, final[key], *views[key]) for key, row in candidates.items()]
     return sorted(
         scored,
         key=lambda item: (
@@ -672,6 +748,46 @@ def _fuse(
         ),
         reverse=True,
     )
+
+
+def _cap_superseded(penalized: dict[int, float], links: dict[int, int | None]) -> dict[int, float]:
+    """Cap each superseded candidate's score under its replacement's *final* score.
+
+    ``penalized`` holds every candidate's score after the multiply and before any cap;
+    ``links`` maps each candidate to the row that superseded it, if any.
+
+    Each chain is resolved **from its newest end backwards**, so a cap is always taken
+    against a value that is itself already capped. That is what keeps a chain ordered:
+    with A corrected by B and B corrected by C, resolving A against B's *pre-cap* score
+    would let A land above B — measured at 0.0061 against 0.0051 on a three-link chain,
+    which is how this function came to exist in this shape. The result does not depend on
+    the order candidates are visited.
+
+    A replacement that is not among the candidates caps nothing: the query did not find
+    the correction, so there is nothing to rank under, and the plain multiply stands. That
+    row still carries its correction out as its first neighbour
+    (:func:`_replacement_neighbor`).
+
+    ``seen`` guards the walk. Cycles cannot be written — :func:`localmem.store._supersede`
+    refuses them — but a hand-edited database must not be able to hang a recall.
+    """
+    final: dict[int, float] = {}
+    for start in penalized:
+        chain: list[int] = []
+        seen: set[int] = set()
+        current: int | None = start
+        while current is not None and current not in final and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            replacement = links.get(current)
+            current = replacement if replacement in penalized else None
+        for memory_id in reversed(chain):
+            score = penalized[memory_id]
+            replacement = links.get(memory_id)
+            if replacement is not None and replacement in final:
+                score = min(score, final[replacement] * SUPERSEDED_SCORE_PENALTY)
+            final[memory_id] = score
+    return final
 
 
 def _min_max(scores: dict[int, float]) -> dict[int, float]:
@@ -694,10 +810,19 @@ def _min_max(scores: dict[int, float]) -> dict[int, float]:
 def _neighbors(conn: sqlite3.Connection, row: _Row, selected: set[int]) -> tuple[Neighbor, ...]:
     """Attach up to :data:`MAX_NEIGHBORS` supporting memories to ``row``.
 
-    Session adjacency comes first; today almost every row has a NULL ``session_id``, so
+    A superseded row's **replacement comes first**, ahead of both ordinary neighbor
+    sources. That is what turns the demotion into learning rather than mere burial: an
+    agent that recalls "we thought it was a memory leak" reads "actually the connection
+    pool was exhausted" in the same response, without a second call and without a change
+    to the frozen payload — ``neighbors`` was already a list of ``{id, content}``.
+
+    Session adjacency comes next; today almost every row has a NULL ``session_id``, so
     the entity-sibling query carries the feature and also tops up a short session hit.
     """
     chosen: dict[int, Neighbor] = {}
+    replacement = _replacement_neighbor(conn, row, selected)
+    if replacement is not None:
+        chosen[replacement.id] = replacement
     if row.session_id is not None:
         for neighbor in _session_neighbors(conn, row, selected):
             chosen.setdefault(neighbor.id, neighbor)
@@ -705,6 +830,23 @@ def _neighbors(conn: sqlite3.Connection, row: _Row, selected: set[int]) -> tuple
         for neighbor in _entity_neighbors(conn, row, selected | set(chosen)):
             chosen.setdefault(neighbor.id, neighbor)
     return tuple(chosen.values())[:MAX_NEIGHBORS]
+
+
+def _replacement_neighbor(
+    conn: sqlite3.Connection, row: _Row, excluded: set[int]
+) -> Neighbor | None:
+    """Return the memory that superseded ``row``, or ``None``.
+
+    ``excluded`` holds the ids already in the result list, so a correction that ranked
+    into the results on its own merits is **not** repeated underneath the row it
+    corrected — the agent reads it once, at the top, which is where it belongs. The
+    interesting case is the other one: a query phrased in the wrong diagnosis's words
+    finds only the wrong diagnosis, and the correction rides in as its evidence.
+    """
+    if row.superseded_by is None or row.superseded_by in excluded:
+        return None
+    found = conn.execute(_REPLACEMENT_NEIGHBOR_SQL, (row.superseded_by,)).fetchone()
+    return None if found is None else Neighbor(id=int(found["id"]), content=found["content"])
 
 
 def _session_neighbors(conn: sqlite3.Connection, row: _Row, excluded: set[int]) -> list[Neighbor]:

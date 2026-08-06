@@ -416,6 +416,37 @@ def test_a_document_without_a_memories_array_is_refused(tmp_path: Path) -> None:
         transfer.read_document(path)
 
 
+def test_supersede_links_are_exported_but_deliberately_not_restored(tmp_path: Path) -> None:
+    """v0.4.0 C4, stated in the docs and pinned here: the link is local to a database.
+
+    ``superseded_by`` holds a row id, and ids are reassigned on restore — carrying one
+    across would point the retraction at whichever memory happens to hold that id in the
+    target. Both memories travel; the link does not, so the corrected memory arrives
+    ranking like any other row and the link is re-declared with ``--supersedes``.
+    """
+    origin = _open(tmp_path / "origin.db")
+    try:
+        wrong = store.add_memory(origin, "the leak is in the resizer", WORKSPACE)
+        store.add_memory(origin, "the pool was exhausted", WORKSPACE, supersedes=[wrong.id])
+        document = transfer.export_document(origin)
+    finally:
+        origin.close()
+
+    # It is in the document — export is `SELECT *`, and provenance is worth carrying.
+    assert [record["superseded_by"] for record in document[transfer.MEMORIES_KEY]] == [2, None]
+
+    target = _open(tmp_path / "target.db")
+    try:
+        # A row already present, so the ids in the document mean something else here.
+        store.add_memory(target, "an unrelated memory that takes id 1", WORKSPACE)
+        transfer.restore(target, document[transfer.MEMORIES_KEY])
+        links = target.execute("SELECT superseded_by FROM memories ORDER BY id").fetchall()
+    finally:
+        target.close()
+
+    assert [row["superseded_by"] for row in links] == [None, None, None]
+
+
 def test_cli_export_reports_a_write_failure_instead_of_a_traceback(
     db_path: Path, tmp_path: Path
 ) -> None:

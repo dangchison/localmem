@@ -48,6 +48,9 @@ def dirty(conn: sqlite3.Connection) -> sqlite3.Connection:
     # 5 — an old memory nothing has ever recalled.
     stale = store.add_memory(conn, "a note nobody ever asks about", WORKSPACE)
     _age(conn, stale.id, 90)
+    # 6 — a diagnosis a later memory corrected.
+    wrong = store.add_memory(conn, "the leak is in the image resizer", WORKSPACE)
+    store.add_memory(conn, "the connection pool was exhausted", WORKSPACE, supersedes=[wrong.id])
     return conn
 
 
@@ -284,6 +287,55 @@ def test_the_audit_command_always_exits_zero_even_when_everything_is_wrong(
         assert heading in result.output
 
 
+# ------------------------------------------------------------ section 6: superseded
+
+
+def test_the_superseded_section_names_what_replaced_each_row(
+    dirty: sqlite3.Connection, db_path: Path
+) -> None:
+    """v0.4.0 C4: a count is the minimum; the replacement is what makes it actionable."""
+    report = audit.run(dirty, db_path)
+
+    assert report.superseded_total == 1
+    (row,) = report.superseded
+    assert row.content == "the leak is in the image resizer"
+    assert row.replacement_content == "the connection pool was exhausted"
+    assert (row.workspace, row.replacement_workspace) == (WORKSPACE, WORKSPACE)
+
+
+def test_the_superseded_section_is_scoped_to_the_retracted_rows_workspace(
+    conn: sqlite3.Connection, db_path: Path
+) -> None:
+    wrong = store.add_memory(conn, "the leak is in the image resizer", WORKSPACE)
+    store.add_memory(
+        conn, "the pool was exhausted", core_memory.GLOBAL_WORKSPACE, supersedes=[wrong.id]
+    )
+
+    assert audit.run(conn, db_path, WORKSPACE).superseded_total == 1
+    assert audit.run(conn, db_path, core_memory.GLOBAL_WORKSPACE).superseded_total == 0
+
+
+def test_the_superseded_section_reports_a_clean_database(
+    conn: sqlite3.Connection, db_path: Path
+) -> None:
+    store.add_memory(conn, LEFT, WORKSPACE)
+    report = audit.run(conn, db_path)
+    assert (report.superseded_total, report.superseded) == (0, ())
+
+
+def test_the_superseded_section_renders_with_its_note(db_path: Path) -> None:
+    runner = CliRunner()
+    runner.invoke(main, ["add", "the leak is in the image resizer", "-w", WORKSPACE])
+    runner.invoke(main, ["add", "the pool was exhausted", "-w", WORKSPACE, "--supersedes", "1"])
+
+    output = runner.invoke(main, ["audit"]).output
+
+    assert "6. superseded memories" in output
+    assert "corrected by a later memory: 1" in output
+    assert "superseded by id=2" in output
+    assert audit.SUPERSEDED_NOTE in output
+
+
 def test_the_json_mode_parses_and_carries_the_same_numbers(db_path: Path) -> None:
     runner = CliRunner()
     runner.invoke(main, ["add", LEFT, "-w", WORKSPACE])
@@ -297,6 +349,7 @@ def test_the_json_mode_parses_and_carries_the_same_numbers(db_path: Path) -> Non
     assert body["database"]["memories"] == 2
     assert body["dead_memories"]["age_days"] == audit.DEAD_MEMORY_AGE_DAYS
     assert body["promotion_candidates"]["note"] == audit.PROMOTION_NOTE
+    assert body["superseded"] == {"total": 0, "note": audit.SUPERSEDED_NOTE, "rows": []}
 
 
 def test_the_json_mode_reports_the_requested_workspace(db_path: Path) -> None:

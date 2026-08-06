@@ -1508,3 +1508,178 @@ duplicated *detail* moved out; the *instruction* did not.
   and the migration guide was re-derived from a real `localmem benchmark --json` run with a
   sandboxed `HOME`: the fixture headline moves −38.0% → **−24.0%** and stays a stated net loss,
   and the 509-token real-`CLAUDE.md` example moves 51.5% → **56.4%**.
+
+## 40. Supersede is declared by the writing agent, not decided by a model
+
+**Milestone:** v0.4.0
+
+`superseded_by` has been a column with no logic behind it since M1, where the comment promised
+"logic lands in v0.2". Until v0.4.0 a wrong diagnosis written in month 1 competed on equal
+footing with the correction written in month 6: the store accumulated, it did not learn.
+
+The obvious way to close that is the way Mem0 closes it — send the new memory and the
+neighbouring old ones to a model and let it emit an ADD / UPDATE / DELETE decision. That is a
+model call on the **write** path, and every write. localmem's entire claim is that neither path
+calls a model, and the one model-authored value in the database (`keywords`, §34) is authored by
+the agent that was already running, not by a call localmem makes.
+
+**Decision:** the agent declares the relationship at write time. `add_memory(..., supersedes=[…])`,
+`memory_add(..., supersedes=[…])`, `localmem add --supersedes ID` (repeatable).
+
+The ADD/UPDATE decision still gets made — it is collapsed onto the party that has just watched
+the old answer be wrong and is composing the new one anyway. It costs a few output tokens on a
+call that was already happening, and zero on recall, forever.
+
+**What it refuses, and why each is an error rather than a shrug**
+
+- **An unknown id fails the whole call**, and the memory is not stored either. The agent
+  believes it has just retracted something; "stored, but the retraction quietly did nothing" is
+  the one outcome that must not be possible. The link and the insert share one
+  `BEGIN IMMEDIATE`, so a database is never left holding one without the other.
+- **A row may not supersede itself.** Not reachable by insert — a new row has a new id — but
+  very reachable through the duplicate merge, where the id the call resolves to is an existing
+  row. A self-loop would demote a memory against itself.
+- **A row may supersede one that is already superseded.** Corrections get corrected; the link
+  moves to the newest one. This is the case the milestone exists for.
+- **Cycles are refused** by `store._would_cycle`, which walks the chain forward from the
+  replacement and stops if the row being retracted is already ahead of it. A cycle cannot be
+  reached by insert, but the merge path can reach one, so the guard is real rather than
+  defensive. Its `seen` set also terminates the walk on a database that somehow already holds a
+  cycle.
+
+**Consequences**
+
+- The MCP `memory_add` payload does **not** widen. `supersedes` is input only: either the link
+  applied or the call is an error, so there is nothing extra to report. §4's key sets — three on
+  add, eight per recall result — are untouched by this milestone.
+- No new CLI command. The list stays at fifteen, pinned by exact equality in three tests.
+
+## 41. A memory may only supersede what its own workspace can see
+
+**Milestone:** v0.4.0
+
+Supersede crosses workspaces or it does not, and both plain answers are wrong. Refusing every
+cross-workspace link would block the most valuable case in the product — a `global` lesson
+retracting a repo-local note is exactly the cross-repo learning the shared tier exists for.
+Allowing all of them would let one repo silently retract knowledge that every other repo relies
+on and cannot even see.
+
+**Decision:** a row in workspace *W* may supersede a row in workspace *T* when `W == T`, or when
+`W` is `global`. Nothing else.
+
+That is not a third rule to remember — it is exactly `retriever._workspace_scope`'s visibility,
+turned around: **a recall scoped to the retracted row's workspace must be able to return the
+replacement.** A named workspace reads itself and `global`, so both permitted directions are
+reachable from *T*; `global` reads only itself, which is why a repo-local row may not retract a
+global one.
+
+**Consequences**
+
+- Evidence closure can attach the replacement without a workspace filter of its own
+  (`retriever._REPLACEMENT_NEIGHBOR_SQL`), because the write-time rule already guarantees the
+  row it fetches is one that a recall in that workspace could have returned by itself. The two
+  workspace-scoped neighbour queries are unchanged.
+- The failure message names the two workspaces that would work, rather than only saying no.
+
+## 42. `dedupe --merge` moves supersede links; the schema is not migrated
+
+**Milestone:** v0.4.0
+
+`resolve_merge` is the only path in localmem that deletes a memory. `superseded_by` is declared
+`REFERENCES memories(id)` with **no `ON DELETE` clause** and `foreign_keys=ON`, so the question
+was whether a merge would dangle or fail.
+
+**Measured, not assumed.** Deleting a row that another row's `superseded_by` names fails
+outright with `sqlite3.IntegrityError: FOREIGN KEY constraint failed`. Deleting the row that
+*does* the pointing succeeds and takes its link with it. So the common case — the retracted row
+is the older twin — was already safe, and the case where the deleted row is somebody's
+*replacement* would have crashed the command.
+
+**Decision:** handle it in the one function that deletes, with one statement before the
+`DELETE`, and leave the schema at version 3.
+
+```sql
+UPDATE memories SET superseded_by = CASE WHEN id = ? THEN NULL ELSE ? END
+ WHERE superseded_by = ?      -- bound (kept, kept, removed)
+```
+
+A migration to `ON DELETE SET NULL` was the alternative and is worse on two counts. SQLite
+cannot alter a constraint, so it means rebuilding `memories` — with the external-content FTS5
+index and three triggers hanging off it — for one column's delete behaviour. And `SET NULL` is
+the wrong answer anyway: the user has just declared the two rows to be the same memory, so the
+twin that survives *is* the same correction. Repointing preserves the retraction; nulling
+discards it.
+
+The `CASE` covers the one row that must not be repointed: if the kept row is itself the one that
+was retracted by the row being deleted, repointing would leave it superseded by itself.
+
+**Consequences**
+
+- `PRAGMA foreign_key_check` is empty after a merge, asserted in two tests, one per branch of
+  the `CASE`.
+- Schema stays at **version 3**. `schema.sql` remains the version-1 baseline, migrations remain
+  forward-only, and this milestone adds none.
+
+## 43. The supersede penalty is a multiply **and** a cap, because the multiply alone does not work
+
+**Milestone:** v0.4.0
+
+The design was one line: multiply a superseded row's fused score by
+`SUPERSEDED_SCORE_PENALTY = 0.1`, demoting it without hiding it. It was implemented, and then
+measured against the thing it was for — does the correction now outrank the retraction? It did
+not.
+
+`_min_max` maps the weakest candidate of a view to **exactly 0.0**. The canonical case is a
+query that matches a retracted memory and its correction and nothing else, where the retraction
+is the better lexical match — it usually is, being the shorter, more direct sentence the user is
+searching with. The correction then normalizes to 0.0 and keeps nothing but its boosts, while
+the retraction keeps a tenth of a much larger number. Scores as `[retraction, correction]`:
+
+| penalty | both 60 days old | retraction 60d, correction 1d |
+|---|---|---|
+| 0.1 | **wrong first** `0.0612 / 0.0125` | **wrong first** `0.0612 / 0.0489` |
+| 0.05 | **wrong first** `0.0306 / 0.0125` | fix first `0.0489 / 0.0306` |
+| 0.02 | fix first `0.0125 / 0.0122` | fix first `0.0489 / 0.0122` |
+
+Tuning the constant was considered and rejected. 0.05 only holds while the correction is fresh
+enough for the recency term to carry it; 0.02 wins the harder row by 0.0003, which is luck; and
+once both memories are old enough for recency to vanish from both, the correction sits at 0.0
+and **every** positive constant leaves the retraction above it. No constant is a fix, because
+the problem is not the size of the demotion — it is that the thing being demoted against can be
+zero.
+
+**Decision:** keep 0.1 and give it a second job. In `_fuse`, a superseded row's score is
+multiplied by the penalty, and then — **only when its replacement is also among the
+candidates** — capped at `replacement * penalty`.
+
+- **Both found → the correction is read first, guaranteed**, not as a function of how the two
+  happened to score.
+- **Only the retraction found → nothing to cap against**, so the plain multiply stands and the
+  row still surfaces, carrying its correction as its first neighbour (§C3). That is the designed
+  behaviour, not a gap: a query phrased in the wrong diagnosis's own words *should* find the
+  wrong diagnosis — with the answer attached.
+
+**Details that are load-bearing**
+
+- **Chains resolve from the newest end backwards.** With A corrected by B and B corrected by C,
+  capping A against B's *pre-cap* score lets A land above B — measured at 0.0061 against 0.0051
+  on a three-link chain, which is why `_cap_superseded` walks the chain rather than reading a
+  single dictionary. Every cap is taken against a value that is itself final, so the further
+  back in the chain a memory sits, the further down it ranks.
+- **The cap can land on 0.0**, when the replacement is itself the weakest candidate and has no
+  boosts left. The two rows then tie on score and `_fuse`'s existing sort key decides:
+  `created_at`, then `id` — both of which a correction wins, because it is written afterwards. A
+  test pins exactly that case with both rows given the *same* `created_at`, so the id is what
+  carries it and a future reordering of the sort key breaks the test rather than the feature.
+  The one residual, stated rather than hidden: a `global` correction tying at 0.0 against a
+  retracted row in the workspace being searched loses, because the workspace tiebreak sits above
+  `created_at`.
+
+**Consequences**
+
+- **A database with no superseded rows anywhere ranks identically to milestone B**, and that is
+  not an argument but a test: the same six-row corpus, five queries, ids and scores to nine
+  decimal places and the neighbour lists, with the expected values produced by running that
+  corpus against the previous commit in a detached worktree rather than by copying what the new
+  code prints.
+- Both weight rows still sum to 1.0; the fusion itself is untouched.

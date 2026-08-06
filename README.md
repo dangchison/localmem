@@ -30,7 +30,7 @@ actually asked for.
 - **One shared tier.** A lesson worth keeping — a bug pattern, a wrong diagnosis, a
   checklist — goes in the `global` workspace once and every repo recalls it.
 
-Status: **v0.3.0**. Python ≥ 3.10. MIT licensed.
+Status: **v0.4.0**. Python ≥ 3.10. MIT licensed.
 
 ---
 
@@ -416,14 +416,14 @@ Fifteen commands, no more:
 | Command | What it does |
 |---|---|
 | `localmem init` | guided setup — the five steps above; `--yes` (step 2 only), `--import-all` (step 3 only), `-w` |
-| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core,lesson}` (default `note`), `--source`, `--session-id`, `-K`/`--keyword` (**repeatable** — another word this memory should be findable by; merging an identical memory unions its keywords in) |
+| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core,lesson}` (default `note`), `--source`, `--session-id`, `-K`/`--keyword` (**repeatable** — another word this memory should be findable by; merging an identical memory unions its keywords in), `--supersedes ID` (**repeatable** — the memory this one corrects; the old one is kept and stays searchable, just ranked below this one) |
 | `localmem promote ID` | reclassify the memory ID **by id**; `--kind {note,trace,core,lesson}` (default `lesson`). Nothing but the kind changes, and running it twice is a no-op. Re-adding the same text with a different `--kind` does *not* work — `add` merges on the content hash and keeps the stored kind |
 | `localmem search QUERY` | ranked recall; `-w`, `-k N` (1–20, **default 5**), `--all`, `--context` (compact output for a prompt hook, silent when nothing matches, and **drops weak OR-fallback hits**), `--context-fallback` (include them anyway; implies `--context`) |
 | `localmem import PATH…` | import markdown instruction files; `-w`, `--dry-run`, `--select`, `--whole-file` |
 | `localmem agents` | list detected agents; `--install NAME` registers one |
 | `localmem serve` | run the MCP server on stdio — this is what agent configs invoke |
 | `localmem stats` | row counts, entity graph size, recalls, queue depth, core-memory cost |
-| `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows; `-w`, `--json` |
+| `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows, superseded rows and what replaced them; `-w`, `--json` |
 | `localmem benchmark [PATHS…]` | estimate instruction-file cost against localmem's fixed cost; `-w`, `--json`. The optional `PATHS` are measured **in addition to** the files it finds by itself |
 | `localmem dedupe` | review the near-duplicate queue; `--review`, `--list`, `--merge ID`, `--keep-both ID`, `-w`, `--json` |
 | `localmem backfill` | extract entities for memories stored before indexing; `-w` |
@@ -591,6 +591,63 @@ stderr if that pushes the core tier past its ~400-token cap. It is safe to run t
 Lessons do not rank higher than anything else. `kind` is a label you and your agent can see and
 filter by, not a thumb on the scale — recall ranks a lesson exactly as it ranks a note.
 
+#### When the lesson itself turns out to be wrong — `--supersedes`
+
+This is the part that makes a memory store *learn* instead of accumulate. Six weeks after
+writing that lesson you find the real cause, and the old one is now actively misleading —
+worse than useless, because it is confidently wrong and it is still winning the search.
+
+```bash
+localmem add "upload 413 is the app body-parser limit — raise it in express.json()" \
+  -w global --kind lesson -K 413
+
+# weeks later, once you actually know
+localmem add "upload 413 was never the body-parser limit: it is nginx client_max_body_size,
+raise it in the server block" -w global --kind lesson -K 413 --supersedes 1
+```
+
+Now recall. The correction comes first — and the wrong diagnosis is **still there**, which is
+the whole point: you asked what was wrong before, and it can tell you.
+
+```
+$ localmem search "upload 413" -w global
+1. [score 0.05] id=2 workspace=global kind=lesson seen=1 created=2026-08-06 07:51:13
+   upload 413 was never the body-parser limit: it is nginx client_max_body_size, raise it in the server block
+2. [score 0.005] id=1 workspace=global kind=lesson seen=1 created=2026-08-06 07:51:13
+   upload 413 is the app body-parser limit — raise it in express.json()
+```
+
+And the case that matters more, because it is the one a searching agent actually hits: a query
+phrased in the *wrong* diagnosis's own words. It finds the wrong diagnosis — and the correction
+rides along with it, in the same response, with no second call:
+
+```
+$ localmem search "body-parser express" -w global
+1. [score 0.065] id=1 workspace=global kind=lesson seen=1 created=2026-08-06 07:51:13
+   upload 413 is the app body-parser limit — raise it in express.json()
+   related id=2: upload 413 was never the body-parser limit: it is nginx client_max_body_size, raise it in the serve…
+```
+
+The rules, in full:
+
+- **Superseded is demoted, never hidden.** The score is multiplied by 0.1, and when the
+  correction is in the same result set the retracted row is capped below it — so *whenever both
+  are found, the correction is read first*. It is never filtered out of search, `stats` or
+  `audit`.
+- **The replacement is attached as the first neighbour** of any superseded hit. Agents get it
+  over MCP too: `neighbors` was always part of the frozen recall payload, so this needed no API
+  change at all.
+- **Core memory is the one exception** — a superseded `--kind core` row stops being loaded into
+  every recall entirely. A retracted convention must not keep being pushed at you.
+- **Corrections can be corrected.** Point `--supersedes` at an already-superseded memory and the
+  chain simply extends; the oldest guess ranks last.
+- **`--supersedes` is repeatable**, and an unknown id is an error that stores nothing rather
+  than a retraction that silently did nothing.
+- **A `global` memory may correct a repo one, but not the reverse.** The rule is exactly what
+  recall can see: a repo reads itself and `global`, so a global lesson can retract a repo note —
+  while one repo cannot retract knowledge that other repos depend on and cannot even see.
+- **Your agent can do all of this itself**: `memory_add(..., supersedes=[id])`.
+
 ### 3. A skill you can apply anywhere
 
 A checklist recalled one bullet at a time is not a checklist, so import it whole:
@@ -610,12 +667,17 @@ localmem audit          # queue, promotion candidates, distribution, core health
 localmem audit --json   # the same numbers, machine-readable
 ```
 
+Six sections: the near-duplicate queue, promotion candidates, distribution, core-memory health,
+dead rows, and — since v0.4.0 — **superseded rows, each shown with the memory that replaced
+it**, so you can see what the store has learned and unlearned.
+
 `audit` writes nothing — a test asserts the database file is byte-identical afterwards. It is
 deterministic and makes no model call, which means it cannot judge whether two memories
-*mean* the same thing. Three gaps it does not close, stated rather than hidden: semantic
-duplicates worded differently (needs embeddings, v0.4), contradictions over time (tier-3
-supersede, still open), and a review queue that grows if you never run `dedupe --review` —
-which `audit` at least makes visible.
+*mean* the same thing. Two gaps it does not close, stated rather than hidden: semantic
+duplicates worded differently (needs embeddings — prototyped and rejected on measurement, see
+[Roadmap](#roadmap)), and a review queue that grows if you never run `dedupe --review` — which
+`audit` at least makes visible. Contradictions over time used to be the third; `--supersedes`
+closes it, but only for contradictions somebody actually declared.
 
 ### Backup and a second machine
 
@@ -631,6 +693,11 @@ Only the `memories` table travels. The entity graph is derived and gets rebuilt 
 the near-duplicate queue is local, transient state. On a conflict the row already in the
 target keeps its `created_at`, `kind` and `source` — only `seen_count` rises to the larger of
 the two.
+
+**Supersede links do not survive the trip.** `superseded_by` holds a row id, and ids are
+reassigned on restore, so carrying one across would point a retraction at whatever memory
+happens to hold that id in the target. Both memories arrive; the link does not, and they rank
+as equals again. Re-declare it with `localmem add … --supersedes ID` on the target machine.
 
 ---
 
@@ -801,7 +868,7 @@ trimming is yours to do. Full guide, including what to keep and what to move:
 ## Limitations
 
 Read this section before deciding localmem is right for you. Everything below is measured
-behaviour of v0.3.0, not speculation.
+behaviour of v0.4.0, not speculation.
 
 1. **Retrieval is still lexical — keywords and an OR fallback work around that, they do not
    remove it.** BM25 matches words, not meaning. Two things mitigate it, and each has a cost
@@ -886,29 +953,40 @@ behaviour of v0.3.0, not speculation.
     with schema version 2, so an upgraded database reports every existing row as never
     recalled until it is returned again. `audit`'s "dead memories" section says so on every
     run rather than letting the number read as history.
-16. **`audit` cannot promote anything, and says so.** Re-adding a note with `--kind core` does
-    not promote it: tier-1 merges on the content hash and keeps the original `kind`. Promotion
-    tooling is still open — v0.3.0 spent its budget on limitation 1 instead; until then the
-    report suggests and you decide.
-17. **`export` does not carry ids.** Row ids are local to a database, so `id` and the reserved
-    `superseded_by` are exported for provenance but not restored — the target assigns its own.
-    Nothing depends on either today; when tier-3 supersede lands, the format version rises.
+16. **`audit` suggests promotions, it cannot make them.** Re-adding a note with `--kind core`
+    does not promote it: tier-1 merges on the content hash and keeps the original `kind`. The
+    report names `localmem promote ID`, which does the job by id — but the judgement of what
+    deserves promoting stays yours.
+17. **`export` does not carry ids, so supersede links are lost on a round trip.** Row ids are
+    local to a database, so `id` and `superseded_by` are exported for provenance but not
+    restored — the target assigns its own. Both the retracted memory and its correction arrive
+    intact and searchable; what is gone is the *link* between them, and with it the demotion
+    and the attached-neighbour behaviour. Re-declare it with `localmem add … --supersedes ID`.
+    This is deliberate: a remapped id would point the retraction at the wrong memory, which is
+    worse than pointing at nothing.
+18. **Supersede is declared, never inferred.** localmem calls no model, so it cannot notice
+    that two memories contradict each other. A wrong memory nobody retracted keeps ranking
+    exactly as it always did. The correction has to come from whoever — or whatever — worked
+    out that the old answer was wrong, at the moment they store the new one.
+19. **A superseded memory can still rank first, on purpose.** The demotion guarantees the
+    correction wins *whenever both are found*. When a query matches only the retracted row —
+    typically because it is phrased in that row's own words — the row still comes back, at a
+    tenth of its score, with the correction attached as its first neighbour. That is the
+    designed answer, not a miss: you asked about the wrong diagnosis and got it, plus the fix.
 
-18. **Recall performs a small write, and turning it off costs you a report.** Every recall
+20. **Recall performs a small write, and turning it off costs you a report.** Every recall
     bumps `recalled_count` on the rows it returned. `LOCALMEM_NO_TRACKING=1` — any non-empty
     value — removes that write and makes recall strictly read-only, which also means `audit`'s
     dead-memory and promotion-candidate sections stop being able to tell a memory that is
     never used from one recalled daily.
-19. **`search --context` truncates at 400 characters and skips core memory.** It is built for
+21. **`search --context` truncates at 400 characters and skips core memory.** It is built for
     a per-prompt hook, not for reading: long memories are cut with the id to recall for the
     rest, and core memory is left out on purpose. Use plain `localmem search` for everything
     else.
 
-Also **not** built, and not described anywhere in this repo as if they were: the
-`superseded_by` column is reserved schema with no logic behind it (tier-3 temporal supersede
-is still open); HTTP/SSE transport exists as a single function parameter for v2's benefit and
-is not reachable from the CLI; there is no two-way sync back into instruction files, and none
-is planned.
+Also **not** built, and not described anywhere in this repo as if they were: HTTP/SSE transport
+exists as a single function parameter for v2's benefit and is not reachable from the CLI; there
+is no two-way sync back into instruction files, and none is planned.
 
 ---
 
@@ -949,18 +1027,21 @@ Recorded, not implemented.
   `LOCALMEM_NO_TRACKING`, `0600`/`0700` file modes and the `mcp<3` pin. **v0.2.2** is
   documentation only — the `uv` install paths, per-agent registration in this file, and
   `README_VI.md`; not one line of `localmem/` changed but the version string. **Still open**:
-  tier-3 temporal supersede using the reserved `superseded_by` column; per-agent `source`
-  analytics in `stats`.
+  per-agent `source` analytics in `stats`. (Tier-3 temporal supersede was the other one, and
+  it landed in v0.4.0.)
 - **v0.3** — **delivered**: agent-supplied `keywords` indexed as a second FTS5 column
   (schema version 3), the disjunctive OR fallback, `-K`/`--keyword` on `add`,
   `--context-fallback` on `search`, and keywords carried through `export`/`restore`. This was
   pulled forward ahead of everything else because limitation 1 was the most-felt one.
-  **Still open** from the original v0.3 list: promotion tooling that acts on what `audit`
-  already suggests (a note cannot be promoted to `kind='core'` today); richer NER as genuine
-  optional extras (spaCy for English, underthesea for Vietnamese) — this is where an
-  installable `[ner]` extra would first exist.
-- **v0.4** — a semantic view was prototyped for this and **rejected on measurement**. Four
-  findings, recorded so the next person does not repeat the work:
+  **Still open** from the original v0.3 list: richer NER as genuine optional extras (spaCy for
+  English, underthesea for Vietnamese) — this is where an installable `[ner]` extra would first
+  exist. Promotion tooling was the other one and shipped in v0.4.0 as `localmem promote ID`.
+- **v0.4** — **delivered**: `kind='lesson'` on both surfaces, `localmem promote ID`, a leaner
+  pointer snippet, and the supersede lifecycle — `--supersedes` / `memory_add(supersedes=[…])`,
+  a demotion that keeps the retracted memory findable, its correction attached as evidence, and
+  a sixth `audit` section for what has been retracted. The **semantic view** originally planned
+  for this release was prototyped and **rejected on measurement**. Four findings, recorded so
+  the next person does not repeat the work:
   - `sqlite-vec` **is** safe to use inside a transaction — the concern that blocked it was
     unfounded;
   - it is also **unnecessary at this scale**: brute-force numpy cosine over 1,000 vectors
@@ -990,8 +1071,10 @@ The MCP surface is two tools and is frozen:
   "message": str|null}`. Each result carries `id`, `content`, `workspace`, `kind`, `source`,
   `created_at`, `score`, `neighbors`. An empty database is **never an error** — it returns
   `results: []` and a friendly message.
-- **`memory_add(content, workspace?, kind?, source?)`** → `{"status": "added" |
-  "duplicate_merged", "id": int, "seen_count": int}`. `kind` accepts `note`, `trace` and
+- **`memory_add(content, workspace?, kind?, source?, keywords?, supersedes?)`** →
+  `{"status": "added" | "duplicate_merged", "id": int, "seen_count": int}`. `supersedes` is a
+  list of ids this memory corrects; it adds **nothing** to the response, because the link
+  either applied or the whole call is an error. `kind` accepts `note`, `trace` and
   `lesson`. **`core` is refused** — core memory is loaded into every recall, so it stays
   human-curated; write one with `localmem add --kind core` from the CLI. `imported` is
   refused for the same category of reason: it belongs to `localmem import`, not to the tool

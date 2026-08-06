@@ -15,9 +15,9 @@ Khác biệt so với `CLAUDE.md` / `AGENTS.md` / steering file: những file đ
 vào context mỗi phiên, dù có liên quan hay không, và phình ra theo thời gian. localmem là
 **pull** — agent chủ động hỏi, và bạn chỉ trả token cho đúng phần nó lấy về.
 
-Trạng thái: **v0.3.0**. Cần Python ≥ 3.10. Giấy phép MIT.
+Trạng thái: **v0.4.0**. Cần Python ≥ 3.10. Giấy phép MIT.
 
-Tài liệu này đủ để dùng thật. Phần lý thuyết (kiến trúc, phương pháp benchmark, danh sách 19
+Tài liệu này đủ để dùng thật. Phần lý thuyết (kiến trúc, phương pháp benchmark, danh sách 21
 giới hạn đầy đủ, roadmap, citation) nằm ở [README.md](README.md) bằng tiếng Anh.
 
 ---
@@ -363,14 +363,14 @@ nên nó phải do con người viết, bằng `localmem add --kind core` từ C
 | Lệnh | Làm gì |
 |---|---|
 | `localmem init` | thiết lập có hướng dẫn, 5 bước; `--yes` (chỉ bước 2), `--import-all` (chỉ bước 3), `-w` |
-| `localmem add TEXT` | lưu một memory; `-w`, `--kind {note,trace,core,lesson}` (mặc định `note`), `--source`, `--session-id`, `-K`/`--keyword` (**lặp lại được** — thêm một từ khác để tìm ra memory này; gộp memory trùng sẽ hợp nhất keywords) |
+| `localmem add TEXT` | lưu một memory; `-w`, `--kind {note,trace,core,lesson}` (mặc định `note`), `--source`, `--session-id`, `-K`/`--keyword` (**lặp lại được** — thêm một từ khác để tìm ra memory này; gộp memory trùng sẽ hợp nhất keywords), `--supersedes ID` (**lặp lại được** — memory mà cái này sửa lại; cái cũ **vẫn được giữ và vẫn tìm ra được**, chỉ bị xếp dưới cái mới) |
 | `localmem promote ID` | đổi `kind` của memory ID, **theo id**; `--kind {note,trace,core,lesson}` (mặc định `lesson`). Chỉ `kind` đổi, chạy lại lần hai không đổi gì thêm. Thêm lại cùng đoạn text với `--kind` khác thì **không** ăn thua — `add` gộp theo hash nội dung và giữ nguyên kind cũ |
 | `localmem search QUERY` | recall có xếp hạng; `-w`, `-k N` (1–20, **mặc định 5**), `--all`, `--context` (in gọn cho hook, im lặng khi không khớp, và **bỏ các kết quả OR-fallback yếu**), `--context-fallback` (giữ lại chúng; ngầm bật `--context`) |
 | `localmem import PATH…` | import file chỉ dẫn markdown; `-w`, `--dry-run`, `--select`, `--whole-file` |
 | `localmem agents` | liệt kê agent nhận diện được; `--install TÊN` đăng ký một cái |
 | `localmem serve` | chạy MCP server trên stdio — đây là thứ config của agent gọi |
 | `localmem stats` | số dòng, kích thước đồ thị thực thể, số lần recall, độ sâu hàng đợi, chi phí core memory |
-| `localmem audit` | báo cáo vệ sinh bộ nhớ — hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết; `-w`, `--json` |
+| `localmem audit` | báo cáo vệ sinh bộ nhớ — hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, và dòng đã bị sửa lại kèm cái đã thay thế nó; `-w`, `--json` |
 | `localmem benchmark [PATHS…]` | ước lượng chi phí file chỉ dẫn so với chi phí cố định của localmem; `-w`, `--json`. `PATHS` tuỳ chọn được đo **thêm vào** những file nó tự tìm thấy |
 | `localmem dedupe` | duyệt hàng đợi gần-trùng; `--review`, `--list`, `--merge ID`, `--keep-both ID`, `-w`, `--json` |
 | `localmem backfill` | trích thực thể cho memory lưu trước khi có indexer; `-w` |
@@ -528,6 +528,64 @@ trần ~400 token. Chạy lại lần hai vẫn an toàn.
 Lesson **không** được cộng điểm khi xếp hạng. `kind` là nhãn để bạn và agent nhìn thấy và lọc,
 không phải ngón tay đè lên cán cân — recall xếp hạng một lesson y hệt một note.
 
+#### Khi chính bài học đó hoá ra cũng sai — `--supersedes`
+
+Đây là chỗ biến một kho memory từ **chất đống** thành **học được**. Sáu tuần sau bạn tìm ra
+nguyên nhân thật, và cái cũ giờ đang chủ động dắt bạn đi sai — tệ hơn cả vô dụng, vì nó sai một
+cách tự tin và vẫn đang thắng ở kết quả tìm kiếm.
+
+```bash
+localmem add "upload 413 là giới hạn body-parser của app — sửa trong express.json()" \
+  -w global --kind lesson -K 413
+
+# vài tuần sau, khi đã biết chắc
+localmem add "upload 413 chưa bao giờ là body-parser: nó là nginx client_max_body_size,
+sửa trong server block" -w global --kind lesson -K 413 --supersedes 1
+```
+
+Giờ recall. Bản sửa lên trước — và chẩn đoán sai **vẫn còn đó**, đúng như mục đích: bạn hỏi
+"trước đây mình đã nghĩ sai cái gì?" thì nó phải trả lời được.
+
+```
+$ localmem search "upload 413" -w global
+1. [score 0.05] id=2 workspace=global kind=lesson seen=1 created=2026-08-06 07:59:10
+   upload 413 chưa bao giờ là body-parser: nó là nginx client_max_body_size, sửa trong server block
+2. [score 0.005] id=1 workspace=global kind=lesson seen=1 created=2026-08-06 07:59:10
+   upload 413 là giới hạn body-parser của app — sửa trong express.json()
+```
+
+Và ca quan trọng hơn, vì đó mới là ca agent gặp thật: câu hỏi được diễn đạt bằng **chính chữ của
+chẩn đoán sai**. Nó tìm ra chẩn đoán sai — và bản sửa đi kèm ngay trong cùng một câu trả lời,
+không cần gọi thêm lần nào:
+
+```
+$ localmem search "body-parser express" -w global
+1. [score 0.065] id=1 workspace=global kind=lesson seen=1 created=2026-08-06 07:59:10
+   upload 413 là giới hạn body-parser của app — sửa trong express.json()
+   related id=2: upload 413 chưa bao giờ là body-parser: nó là nginx client_max_body_size, sửa trong server block
+```
+
+Luật đầy đủ:
+
+- **Bị sửa là bị hạ bậc, không phải bị giấu.** Điểm nhân 0.1, và khi bản sửa cũng nằm trong cùng
+  tập kết quả thì dòng cũ bị kẹp xuống dưới nó — nên **hễ tìm thấy cả hai, bản sửa luôn được đọc
+  trước**. Không bao giờ bị lọc khỏi `search`, `stats` hay `audit`.
+- **Bản sửa được gắn làm neighbour đầu tiên** của mọi kết quả đã bị sửa. Agent qua MCP cũng nhận
+  được: `neighbors` vốn đã nằm trong payload recall đã đóng băng, nên việc này **không đổi một
+  chữ nào** trong API.
+- **Core memory là ngoại lệ duy nhất** — dòng `--kind core` đã bị sửa thì thôi hẳn, không còn
+  được nạp vào mọi recall nữa. Một quy ước đã rút lại thì không được phép tiếp tục bị đẩy vào mặt
+  bạn mỗi phiên.
+- **Bản sửa cũng có thể bị sửa.** Trỏ `--supersedes` vào một memory đã bị sửa rồi thì chuỗi cứ
+  thế dài ra; phỏng đoán cũ nhất xếp cuối cùng.
+- **`--supersedes` lặp lại được**, và id không tồn tại là **lỗi** — không lưu gì cả, thay vì lưu
+  một memory với lời rút lại âm thầm chẳng làm gì.
+- **Memory ở `global` được sửa memory của repo, chiều ngược lại thì không.** Luật đúng bằng cái
+  recall nhìn thấy: một repo đọc chính nó và `global`, nên một bài học global rút lại được một
+  note của repo — còn một repo thì không được rút lại tri thức mà các repo khác đang dựa vào và
+  thậm chí không nhìn thấy.
+- **Agent tự làm được tất cả**: `memory_add(..., supersedes=[id])`.
+
 ### 3. Kỹ năng dùng được ở mọi nơi
 
 Một checklist mà lấy về từng gạch đầu dòng thì không còn là checklist, nên hãy import **nguyên
@@ -544,17 +602,20 @@ Sau đó từ bất kỳ repo nào, "kiểm cái này về mặt bảo mật" �
 ### Giữ cho sạch
 
 ```bash
-localmem audit          # 5 mục: hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết
+localmem audit          # 6 mục: hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, dòng đã bị sửa
 localmem audit --json   # cùng những con số đó, dạng máy đọc
 ```
 
+Mục thứ sáu là của v0.4.0: **những dòng đã bị sửa lại, mỗi dòng in kèm memory đã thay thế nó** —
+để bạn nhìn được kho memory đã học và đã bỏ đi những gì.
+
 `audit` **không ghi một byte nào** — có test chụp lại bytes của file DB và so sánh sau khi chạy.
 Kết quả của nó là tất định và nó không gọi model, nên nó **không thể** phán hai memory có
-*cùng nghĩa* hay không. Ba lỗ nó không bịt được, nói thẳng thay vì giấu: trùng ngữ nghĩa mà
-khác chữ (cần embedding, v0.4), mâu thuẫn theo thời gian (tier-3 supersede, vẫn còn treo),
-và một hàng đợi
-duyệt sẽ phình ra nếu bạn không bao giờ chạy `dedupe --review` — thứ mà ít nhất `audit` làm cho
-bạn thấy.
+*cùng nghĩa* hay không. Hai lỗ nó không bịt được, nói thẳng thay vì giấu: trùng ngữ nghĩa mà
+khác chữ (cần embedding — đã dựng thử và **bị loại vì số đo**), và một hàng đợi duyệt sẽ phình
+ra nếu bạn không bao giờ chạy `dedupe --review` — thứ mà ít nhất `audit` làm cho bạn thấy. Mâu
+thuẫn theo thời gian từng là lỗ thứ ba; `--supersedes` bịt nó, nhưng chỉ bịt được những mâu
+thuẫn mà có người khai báo.
 
 ---
 
@@ -612,6 +673,11 @@ hàng đợi gần-trùng là trạng thái cục bộ, tạm thời. Khi trùng
 `created_at`, `kind` và `source` của nó — chỉ `seen_count` tăng lên bằng giá trị lớn hơn trong
 hai bên.
 
+**Liên kết `--supersedes` KHÔNG đi theo.** `superseded_by` chứa một id, mà id được cấp lại khi
+restore — mang nó sang sẽ trỏ lời rút lại vào bất kỳ memory nào tình cờ mang id đó ở máy đích.
+Cả memory cũ lẫn bản sửa đều sang đủ; chỉ **mối nối** giữa chúng là mất, và cùng với nó là việc
+hạ bậc lẫn việc gắn kèm neighbour. Khai báo lại bằng `localmem add … --supersedes ID` ở máy mới.
+
 ---
 
 ## Bốn lưu ý riêng cho tiếng Việt
@@ -643,7 +709,7 @@ tier-2 chỉ có tiếng Anh, ảnh hưởng độ phủ chứ không ảnh hư�
 
 ## Giới hạn — bản rút gọn
 
-[README.md](README.md) liệt kê đủ **19** giới hạn đã đo được. Những cái nặng nhất:
+[README.md](README.md) liệt kê đủ **21** giới hạn đã đo được. Những cái nặng nhất:
 
 1. **Vẫn khớp theo từ vựng — `keywords` và OR fallback chỉ giảm nhẹ, không xoá bỏ.** BM25 khớp
    chữ, không khớp nghĩa. Con số đã đo: với 14 cặp câu hỏi/memory thực tế không dùng chung chữ
@@ -684,7 +750,18 @@ tier-2 chỉ có tiếng Anh, ảnh hưởng độ phủ chứ không ảnh hư�
 7. **Mọi con số token đều là ước lượng** (±15%), và được gắn nhãn `~estimated` ở mọi nơi chúng
    xuất hiện.
 8. **`dedupe --merge` xoá vĩnh viễn memory cũ hơn.** Đây là đường duy nhất trong localmem xoá
-   một memory, và nó chỉ chạy trên cặp bạn vừa tự duyệt.
+   một memory, và nó chỉ chạy trên cặp bạn vừa tự duyệt. Nếu memory bị xoá đang là bản sửa của
+   một memory khác, mối nối được chuyển sang dòng còn sống chứ không bị mất.
+9. **`export` không mang theo id, nên liên kết supersede mất khi round-trip.** Cả memory cũ lẫn
+   bản sửa đều sang đủ và vẫn tìm được; chỉ mối nối giữa chúng là mất. Khai báo lại bằng
+   `--supersedes`.
+10. **Supersede phải được khai báo, không được suy ra.** localmem không gọi model nên không tự
+    nhận ra hai memory mâu thuẫn nhau. Một memory sai mà không ai rút lại thì vẫn xếp hạng y như
+    cũ.
+11. **Memory đã bị sửa vẫn có thể xếp đầu — và đó là cố ý.** Bản sửa được bảo đảm thắng *khi cả
+    hai cùng được tìm thấy*. Khi câu hỏi chỉ khớp mỗi dòng cũ — thường vì nó được diễn đạt bằng
+    chính chữ của dòng đó — dòng cũ vẫn ra, với một phần mười điểm, và bản sửa gắn kèm làm
+    neighbour đầu tiên. Đó là câu trả lời đúng theo thiết kế, không phải một cú trượt.
 
 Hãy đọc mục **Limitations** đầy đủ trong [README.md](README.md) trước khi dùng thật.
 
@@ -720,8 +797,10 @@ Bề mặt nhỏ, nói thẳng.
 
 - **`memory_recall(query, workspace?, k?)`** — **chỉ đọc**. Trả `results`, `core_memory` và
   `message`. Database rỗng **không phải là lỗi**: nó trả `results: []` kèm một câu thông báo.
-- **`memory_add(content, workspace?, kind?, source?)`** — tool **duy nhất** ghi nội dung.
-  `kind` nhận `note`, `trace` và `lesson`; `core` và `imported` đều bị **từ chối**.
+- **`memory_add(content, workspace?, kind?, source?, keywords?, supersedes?)`** — tool
+  **duy nhất** ghi nội dung. `kind` nhận `note`, `trace` và `lesson`; `core` và `imported`
+  đều bị **từ chối**. `supersedes` là danh sách id mà memory này sửa lại — nó **không** thêm
+  gì vào payload trả về, vì mối nối hoặc đã được tạo, hoặc cả lời gọi là lỗi.
 
 Hợp đồng đầy đủ — kể cả chỗ hai tool **không** đối xứng với `workspace: "all"`, và cách chia
 đọc/ghi để client cấp quyền theo từng tool — ở [README.md#api](README.md#api).

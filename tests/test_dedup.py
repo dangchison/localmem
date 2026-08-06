@@ -235,6 +235,61 @@ def test_merging_the_same_pair_twice_is_a_clean_error(conn: sqlite3.Connection) 
     assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
 
 
+def test_deleting_a_memory_another_row_supersedes_to_is_refused_by_sqlite(
+    conn: sqlite3.Connection,
+) -> None:
+    """The measurement `resolve_merge` is built around, pinned so it cannot drift.
+
+    ``superseded_by`` is ``REFERENCES memories(id)`` with no ``ON DELETE`` clause and
+    ``foreign_keys=ON``, so the *referenced* row cannot be deleted while a link names it.
+    The referencing row deletes fine and takes its own link with it.
+    """
+    wrong = store.add_memory(conn, "the leak is in the resizer", WORKSPACE)
+    right = store.add_memory(conn, "the pool was exhausted", WORKSPACE, supersedes=[wrong.id])
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        conn.execute("DELETE FROM memories WHERE id = ?", (right.id,))
+
+    conn.execute("DELETE FROM memories WHERE id = ?", (wrong.id,))
+    assert conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == 1
+
+
+def test_merge_moves_a_supersede_link_onto_the_surviving_row(conn: sqlite3.Connection) -> None:
+    """v0.4.0 C4: the merge must not dangle, fail, or silently drop the correction."""
+    retracted = store.add_memory(conn, "the leak is in the resizer", WORKSPACE)
+    older = store.add_memory(conn, LEFT, WORKSPACE, supersedes=[retracted.id])
+    newer = store.add_memory(conn, RIGHT, WORKSPACE)
+    pair = dedup.pending_pairs(conn)[0]
+    assert (pair.older.id, pair.newer.id) == (older.id, newer.id)
+
+    dedup.resolve_merge(conn, pair.queue_id)
+
+    # The retraction survives its author: the twin that was kept now carries it.
+    row = conn.execute(
+        "SELECT superseded_by FROM memories WHERE id = ?", (retracted.id,)
+    ).fetchone()
+    assert row["superseded_by"] == newer.id
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_merge_clears_a_link_that_would_point_the_kept_row_at_itself(
+    conn: sqlite3.Connection,
+) -> None:
+    """The one case where repointing is wrong: the kept row *is* the retracted one."""
+    older = store.add_memory(conn, LEFT, WORKSPACE)
+    newer = store.add_memory(conn, RIGHT, WORKSPACE)
+    # Re-adding the older text merges into it, and that merged row supersedes the newer.
+    store.add_memory(conn, LEFT, WORKSPACE, supersedes=[newer.id])
+    pair = dedup.pending_pairs(conn)[0]
+    assert (pair.older.id, pair.newer.id) == (older.id, newer.id)
+
+    dedup.resolve_merge(conn, pair.queue_id)
+
+    row = conn.execute("SELECT superseded_by FROM memories WHERE id = ?", (newer.id,)).fetchone()
+    assert row["superseded_by"] is None
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_keep_both_marks_the_pair_and_removes_nothing(conn: sqlite3.Connection) -> None:
     store.add_memory(conn, LEFT, WORKSPACE)
     store.add_memory(conn, RIGHT, WORKSPACE)
