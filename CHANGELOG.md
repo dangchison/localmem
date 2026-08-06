@@ -12,8 +12,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`localmem eval` — retrieval quality is now a number this repo can produce.** Every threshold in
   the project was fitted against a fixture that lived in a scratchpad and was deleted with it, so
   no change to ranking has been measurable since. The new command builds a throwaway database,
-  writes a versioned bilingual fixture (`localmem/evaldata/bilingual_v1.json`, 30 documents /
-  20 graded queries / 12 off-corpus) through `store.add_memory`, asks every query through
+  writes a versioned bilingual fixture (`localmem/evaldata/bilingual_v1.json`) through
+  `store.add_memory`, asks every query through
   `retriever.retrieve`, and reports recall@1/3/5, MRR and how many off-corpus queries stayed
   silent. Production paths only — nothing is re-implemented. The user's own database is never
   opened. `tests/fixtures/eval/baseline.json` pins the result and
@@ -48,12 +48,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "within noise of zero" that Gate 0 refused the semantic view on. Making the term decisive needs a
   weight above `LEXICAL_WEIGHT`, which is a redesign of the ranking, not a term added to it.
 
-### Known defect, not yet fixed
+### Measured and found not to be a defect
 
-- **`dedup._STOPWORDS` is English only, and `top_terms` uses it to generate tier-2 near-duplicate
-  candidates.** On Vietnamese text about two of the five term slots go to function words —
-  `khi`, `chỉ`, `trên`, `của` — narrowing candidate generation for half this project's users.
-  Found while measuring §54; fixing it needs its own before/after through the capture-gate fixture.
+- **The English-only `dedup._STOPWORDS` was reported as narrowing Vietnamese near-duplicate
+  candidate generation. It does not.** Measured through `nearest_neighbour` on a 57-row corpus with
+  five independently-written Vietnamese restatement pairs: candidate recall is **5/5 with and
+  without** ~70 added Vietnamese function words, identical to four decimals, and unchanged when
+  `TIER2_MAX_CANDIDATES` and `TIER2_TOP_TERMS` are swept. bm25 already discounts a term that appears
+  in most rows, so the "wasted" slots were being ignored anyway. The original claim was made from
+  reading `top_terms` output instead of measuring behaviour (§56).
+- **What the same measurement did find:** `CAPTURE_JACCARD_THRESHOLD = 0.25` fires on only **1 of 5**
+  independently-written Vietnamese restatements, which score 0.158–0.273 — against the 0.314 minimum
+  recorded in `gate-d-capture.md`. The separating band against novel traces narrows from 0.174 to
+  **0.047**. Not enough to justify a new constant; enough to say the current one is looser than its
+  founding measurement claims.
 
 ### Changed
 

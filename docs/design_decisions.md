@@ -2242,7 +2242,7 @@ a query band built specifically to isolate the fallback's ordering. Not a bigger
 > than deleted because the two structural findings — Jaccard's zero spread, and coverage being blind
 > without the keywords column — do not depend on the corpus size.
 
-### One live defect found on the way, unrelated to the rerank
+### One *apparent* defect found on the way — measured in §56, and it is not one
 
 `_STOPWORDS` is **English only**, and `top_terms` — which generates tier-2 near-duplicate candidates
 — uses it. On Vietnamese text roughly two of the five term slots are spent on function words:
@@ -2254,10 +2254,12 @@ staging chạy trên snapshot của prod đã ẩn danh…  ->  ['staging', 'ch�
 ```
 
 `khi`, `chỉ`, `trên`, `của` are the Vietnamese equivalents of the words this frozenset exists to
-remove. The comment above it says "English only, and deliberately small" — deliberate for the
-language it was written against, and a real narrowing of candidate generation for half of this
-project's users. Fixing it needs its own before/after through the capture-gate fixture, so it is not
-folded into this entry.
+remove, so this was written up as a real narrowing of candidate generation for half of this
+project's users. **That claim was wrong**, and §56 records the measurement that overturned it: the
+wasted slots are visible in `top_terms` output and change nothing about which candidates come back,
+because bm25 already discounts a term that appears in most documents. The claim was made from
+reading output rather than from measuring behaviour — which is the exact failure mode this file
+exists to prevent.
 
 ## 55. The eval corpus is widened until every ranking constant is observable
 
@@ -2329,3 +2331,55 @@ distractor documents were rewritten *after* a measurement showed the views agree
 disagreeing, and `seen_count` was added *after* a measurement showed the boost was structurally
 zero. Both changes were made to reach an unobserved code path, and both were made knowing they
 could push the aggregate metrics down — which they did.
+
+## 56. The Vietnamese stopword "defect" is not one, and the capture threshold is looser than recorded
+
+§54 reported, as a live defect, that `_STOPWORDS` is English-only while `top_terms` uses it to pick
+the five terms that generate near-duplicate candidates. Vietnamese memories visibly spend two of
+those five slots on `khi`, `chỉ`, `trên`, `của`. It was measured before being fixed. **It is not a
+defect**, and the way it failed is worth more than the fix would have been.
+
+### The measurement
+
+A fixture of five Vietnamese traces plus five independently-written restatements of them, against a
+57-row background corpus, scored through the production path — `dedup.nearest_neighbour` with
+`store.build_or_match_expression`, the same call the capture gate makes:
+
+| | candidate recall | gate fires | max score on a novel trace |
+|---|---|---|---|
+| English-only stopwords (today) | **5/5** | 1/5 | 0.1111 |
+| plus ~70 Vietnamese function words | **5/5** | 1/5 | 0.1111 |
+
+Identical, to four decimal places. Sweeping `TIER2_MAX_CANDIDATES` over 10/25/50 and
+`TIER2_TOP_TERMS` over 5/8 changes nothing either.
+
+**Why.** The candidate query is `ORDER BY -bm25(...) LIMIT n`, and bm25 already discounts a term by
+its inverse document frequency — a word appearing in most rows contributes almost nothing to the
+ranking. Dropping such words from the term list removes terms that were already being ignored. The
+stopword list earns its keep for the *conjunctive* tier-2 query, where every term must appear; for
+the disjunctive capture query it is close to a no-op. The comment at `dedup.py:67` is right and did
+not need extending.
+
+### The contaminated measurement in between, recorded because it was believable
+
+The first attempt at a larger corpus used the eval fixture (§55) as background and reported
+candidate recall collapsing from 5/5 to 2/5 — apparently confirming that the gate degrades as a
+database grows. It did not. The eval corpus contains rows stating the *same facts* as the fixture's
+"originals" (`doc-multipart` and the upload trace; `doc-cron-overlap` and the cron trace), so
+`nearest_neighbour` was returning a **better** match and being scored as a miss. Two fixtures written
+by the same author about the same domain will overlap; a near-duplicate benchmark has to check for
+that explicitly, and this one now does.
+
+### What the measurement did find
+
+`CAPTURE_JACCARD_THRESHOLD = 0.25` fires on **1 of 5** independently-written Vietnamese
+restatements. Their scores are 0.158, 0.189, 0.194, 0.216, 0.273 — against `gate-d-capture.md`'s
+recorded minimum of **0.314** over its own restatements. The gate is looser than its founding
+measurement suggests, and §44's own words — "provisional, and honestly so… a starting point, not a
+finding" — are holding up.
+
+The tempting move is to lower the threshold. The numbers do not support it yet: the novel-trace
+maximum here is 0.1111, so the separating band is 0.111 → 0.158, a gap of **0.047** against
+gate-D's 0.174. A threshold inside a gap that narrow, on five pairs, is a guess wearing a decimal
+point. What this justifies is a bigger redundancy fixture, not a new constant — and `audit`'s
+similarity histogram remains the instrument for deriving one from real traces.
