@@ -27,7 +27,7 @@ mode built for exactly this:
 
   ```
   Relevant memories (localmem):
-  - (myrepo) file upload 413s behind nginx: client_max_body_size defaults to 1m…
+  - (myrepo) file upload 413 behind nginx: client_max_body_size defaults to 1m…
   - (global) the deploy pipeline uses pnpm, not npm
   ```
 

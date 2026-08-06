@@ -5,6 +5,108 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-08-06
+
+A documentation release. **Not one line of `localmem/` changed except `__version__`** — no
+schema change, no migration, no new command or flag, no dependency change, and the MCP
+contract is untouched. What changed is that the documentation now describes the software that
+actually exists, and that its first command runs.
+
+### Fixed
+
+- **The first install command in the README did not work.** Its `git clone` URL still had the
+  account name as an unreplaced placeholder, which had survived publication. The real URL is
+  `https://github.com/dangchison/localmem.git`; the placeholder appeared twice in `README.md`
+  and in both release links at the bottom of this file, and all four are corrected.
+- **The README's status line said v0.2.0** while the package was 0.2.1.
+- **The README described the `mcp` dependency as `mcp>=2.0`**; `pyproject.toml` has pinned
+  `mcp>=2.0,<3` since v0.2.1. The `[dev]` extra also omitted `pytest-cov`.
+- **This file had no link definition for `[0.2.1]`.** It has one now.
+
+### Added
+
+- **Two `uv` install paths, both executed against the real repository URL before being
+  written down.** `uv tool install git+https://github.com/dangchison/localmem.git` puts a
+  `localmem` executable in `~/.local/bin` with no virtualenv to manage;
+  `uvx --from git+… localmem --version` runs it without installing. **`uvx` must not be used
+  in an agent's MCP config** — it re-resolves the git URL on every launch — and the README
+  says so where a reader would otherwise reach for it. The question this answers is "is there
+  an `npx` one-liner?", and the answer, stated plainly: `npx` is Node's runner, localmem is a
+  Python package, `uv`/`uvx` is the equivalent.
+- **Per-agent registration is now in the README itself**, one collapsible block per agent:
+  install command, config path, the config written verbatim, how to check the agent really
+  took it, and how to remove it. Previously this was a four-row table pointing at
+  `examples/`.
+- **A `PATH` warning at the head of that section.** Every agent config registers
+  `{"command": "localmem", "args": ["serve"]}` — the bare name, resolved against the *agent's*
+  `PATH`, which is frequently not the shell's. This is the most likely reason a registration
+  appears to do nothing, and the README now says so and gives the absolute-path escape.
+- **`README_VI.md`** — a Vietnamese guide complete enough to use the product from, not a
+  translation of the English file: installation, quickstart, per-agent registration, the
+  pointer snippet, the command table, environment variables, the cross-repo `global` tier,
+  both hooks, backup, security, four Vietnamese-specific notes and a condensed limitations
+  list, with pointers back to `README.md` for benchmark methodology, the full 19 limitations,
+  roadmap and citation. The snippet inside it is `POINTER_SNIPPET` byte-for-byte: the
+  drift test that already guarded six documents now guards seven, and the file is the reason
+  it says seven.
+- **An "Environment variables" section.** There are exactly two.
+  `LOCALMEM_DB` set to an empty or whitespace-only value is an **error**, not a fall-back to
+  the default. `LOCALMEM_NO_TRACKING` tests for **emptiness, not truthiness** — so
+  `LOCALMEM_NO_TRACKING=0` disables tracking too, which is the trap worth printing.
+- **An "Upgrading from v0.1" section.** A schema-1 database migrates itself to schema 2 in
+  place on first open by a v0.2+ build, with no downgrade — so `localmem export` first if that
+  matters, and expect `recalled_count` to read as zero for every pre-existing row.
+- **The flags that existed but were documented nowhere.** `init --import-all` appeared in no
+  file in the repository; `init --yes`, `init -w`, `benchmark [PATHS…]` and `localmem
+  --version` were missing from the README. Defaults are now stated where they were assumed:
+  `search -k` is 5, `gc --days` is 30.
+- **`kind='imported'`.** Users saw it in `stats` and `audit` output without the README ever
+  introducing it. It is produced only by `localmem import`, is not writable through MCP, and
+  is retrieved exactly like a `note`.
+- **The `memory_add` / `memory_recall` asymmetry about `workspace: "all"`.** Recall accepts it
+  and the pointer snippet actively teaches it; `memory_add` rejects it, because a memory
+  stored in a workspace named `all` would be unreachable by every ordinary recall. That was
+  undocumented.
+- **A "Permission-granular access" section in the README**, promoted from `antigravity.md`
+  where it had been sitting as if it were Antigravity-specific. All four walkthroughs point at
+  it.
+- **The capture hook's real limits.** The README now states the 100,000-character cap and the
+  `…[truncated by capture hook]` marker, names the two scripts that actually live in the repo
+  — `examples/localmem-capture.sh` and `examples/localmem-auto-recall.sh` — and says both
+  require `jq`, which localmem does not.
+- **`[project.urls]` in `pyproject.toml`** — Homepage, Repository and Changelog. The package
+  metadata previously pointed nowhere.
+
+### Changed
+
+- **The four per-agent walkthroughs are levelled up.** All four now carry an "Automatic
+  capture and recall" section — previously **none of them mentioned either hook** — a line
+  about the shared `global` tier, and a `PATH` diagnosis. `codex.md` gains the
+  workspace-per-call explanation the other files already had.
+- **Verification in the walkthroughs is now about the agent, not the file.** `codex.md` uses
+  `codex mcp get localmem` and `codex mcp list`, Codex's own reader for its own config, which
+  reports the entry as Codex parsed it. For Antigravity and Kiro **no in-agent verification
+  command could be established, so none is claimed**: those two documents keep the
+  `python3 -m json.tool` file check, add "restart and ask the agent to use `memory_recall` —
+  if it calls the tool, registration worked", and label that second step explicitly as an
+  indirect check. Claude Code's `/mcp` is unchanged and remains the only direct readout of the
+  four.
+- **The `## Tiếng Việt` section is gone from `README.md`**, replaced by a link to
+  `README_VI.md` on the second line. It was 83 lines of a 634-line file and was missing agent
+  setup, the pointer snippet, the command table, benchmark, migration, security, limitations
+  and the hooks. All of that is in the new file.
+- **The snippet-drift test covers seven documents**, up from six.
+
+### Notes
+
+- Tests: 554 passing, unchanged in count — the drift test gained a file, not a case. `ruff`,
+  `mypy --strict` and `tests/e2e.sh` are clean.
+- Both `uv` install paths in the README were run against `github.com/dangchison/localmem.git`
+  before release, and the from-source path was exercised in a fresh clone into a temporary
+  directory. The README's note that a stock macOS `python3` (3.9) fails with
+  `editable mode currently requires a setuptools-based build` rather than a version error is
+  an observation from that run, not a guess.
+
 ## [0.2.1] — 2026-08-05
 
 Quick wins against five of the six weaknesses v0.2.0 shipped with. No new command, no schema
@@ -262,5 +364,7 @@ Recorded in full in the README's Limitations section. The load-bearing ones:
 - Inspired by *Zero-Mem: Zero-Token Memory Operations for LLM Agents* (arXiv:2607.29377); see
   the README's Citation section. The package is not affiliated with the paper's authors.
 
-[0.2.0]: https://github.com/<your-account>/localmem/releases/tag/v0.2.0
-[0.1.0]: https://github.com/<your-account>/localmem/releases/tag/v0.1.0
+[0.2.2]: https://github.com/dangchison/localmem/releases/tag/v0.2.2
+[0.2.1]: https://github.com/dangchison/localmem/releases/tag/v0.2.1
+[0.2.0]: https://github.com/dangchison/localmem/releases/tag/v0.2.0
+[0.1.0]: https://github.com/dangchison/localmem/releases/tag/v0.1.0

@@ -1,5 +1,7 @@
 # localmem
 
+*[Tiếng Việt → README_VI.md](README_VI.md)*
+
 **Local-first, zero-token memory for AI coding agents.** One SQLite database, raw traces,
 structured retrieval — no LLM call anywhere in the memory path.
 
@@ -23,29 +25,79 @@ asked for.
 - **One shared tier.** A lesson worth keeping — a bug pattern, a wrong diagnosis, a
   checklist — goes in the `global` workspace once and every repo recalls it.
 
-Status: **v0.2.0**. Python ≥ 3.10. MIT licensed.
+Status: **v0.2.2**. Python ≥ 3.10. MIT licensed.
 
 ---
 
 ## Install
 
-localmem is not on PyPI. Install it from a checkout:
+localmem is not on PyPI; it installs straight from this git repository. Three ways, in the
+order most people want them.
+
+### 1. Fastest — one global command, with `uv`
 
 ```bash
-git clone https://github.com/<your-account>/localmem.git
-cd localmem
-python3 -m venv .venv
-.venv/bin/pip install -e .
+uv tool install git+https://github.com/dangchison/localmem.git
+localmem --version
 ```
 
-`python3` must be **3.10 or newer** — check with `python3 --version` first, and use an
-explicit `python3.11`/`python3.12`/`python3.13` if your default `python3` is older.
+That puts a `localmem` executable in `~/.local/bin` and prints
+`Installed 1 executable: localmem`. No virtualenv to activate, no `PATH` juggling beyond
+having `~/.local/bin` on it. Undo it with `uv tool uninstall localmem`. If you do not have
+`uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
-Runtime dependencies are `click>=8.1`, `mcp>=2.0`, and `tomli>=2.0` on Python 3.10 only
-(`tomllib` is stdlib from 3.11). That is the whole list. Add `".[dev]"` instead of `.` if you
-want pytest, ruff and mypy.
+**`npx` does not apply here.** `npx` is Node's runner and localmem is a Python package —
+`uv`/`uvx` is the Python equivalent, and the two commands above are the answer to "is there
+an npx one-liner?".
 
-Put `.venv/bin` on your `PATH`, or prefix the commands below with `.venv/bin/`.
+### 2. Try it without installing anything
+
+```bash
+uvx --from git+https://github.com/dangchison/localmem.git localmem --version
+```
+
+**Do not put `uvx` in an agent's MCP config.** `uvx` re-resolves the git URL every time it
+runs, so every agent launch would become a network fetch — slow, and broken offline. An
+agent config must point at a `localmem` that is already installed. Use option 1 for that.
+
+### 3. From source, to change it
+
+```bash
+python3 --version                       # must be 3.10 or newer
+git clone https://github.com/dangchison/localmem.git
+cd localmem
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/localmem --version
+```
+
+Run that version check and believe it. On a stock macOS `python3` is **3.9**, and what you
+get is not a readable "wrong Python" message — it is
+`editable mode currently requires a setuptools-based build`, because the pip bundled inside
+a 3.9 virtualenv predates the packaging standard this project builds with. Use an explicit
+`python3.11` / `python3.12` / `python3.13` instead.
+
+Then put `.venv/bin` on your `PATH`, or prefix every command below with `.venv/bin/`.
+
+Runtime dependencies are `click>=8.1`, `mcp>=2.0,<3`, and `tomli>=2.0` on Python 3.10 only
+(`tomllib` is stdlib from 3.11). That is the whole list; the upper bound on `mcp` is
+deliberate, because the 2.x line already broke the API once. Drop `[dev]` from the command
+above if you do not want pytest, pytest-cov, ruff and mypy.
+
+### Upgrading from v0.1
+
+Your database upgrades itself. A v0.1.0 file is schema version 1; the first time v0.2 or
+newer opens it, two forward-only `ALTER TABLE` statements bring it to schema version 2 in
+place, with every row intact. There is no downgrade, so take a backup you can read if that
+matters to you:
+
+```bash
+localmem export -o before-upgrade.json
+```
+
+One consequence worth knowing: `recalled_count` arrives *with* schema 2, so every
+pre-existing row reports as never recalled until it is returned again. `localmem audit`
+says so on every run rather than letting the number read as history.
 
 ---
 
@@ -71,7 +123,20 @@ localmem init
    localmem never edits that file for you.
 5. **Self-check** — runs one real recall and prints where to go next.
 
-Set `LOCALMEM_DB` to put the database somewhere else.
+Three flags shape it, and each one only answers a question `init` would otherwise ask:
+
+| Flag | Effect |
+|---|---|
+| `--yes` | answer yes to **step 2 only** — every detected agent gets registered. It does not import anything |
+| `--import-all` | import every instruction file found in **step 3**. Asked separately from `--yes`, never bundled with it |
+| `-w`, `--workspace NAME` | workspace for the records step 3 imports (default: auto-detected) |
+
+With no terminal and no flags, `init` prints what it *would* register and writes no agent
+config. `localmem --version` prints the installed version if you just want to check the
+install took.
+
+Set `LOCALMEM_DB` to put the database somewhere else — see
+[Environment variables](#environment-variables).
 
 ### 2. Store and recall
 
@@ -112,9 +177,165 @@ backs the original up to `*.bak` before modifying it, and **refuses outright** i
 file cannot be parsed, printing the block for you to add by hand. `~/.claude.json` is never
 opened for writing.
 
-Step-by-step walkthroughs per agent: [`examples/claude_code.md`](examples/claude_code.md),
-[`examples/codex.md`](examples/codex.md), [`examples/antigravity.md`](examples/antigravity.md),
-[`examples/kiro.md`](examples/kiro.md).
+**The one thing that breaks this.** Every config above registers
+`{"command": "localmem", "args": ["serve"]}` — the bare name, resolved against the `PATH` the
+*agent* launches with, which is often not the `PATH` of the shell you typed the install into.
+When a registration appears to do nothing, this is the reason far more often than anything
+else. `uv tool install` puts the binary in `~/.local/bin`, so that directory has to be on the
+agent's `PATH`; if you cannot arrange that, put the absolute path in the config instead —
+`"command": "/Users/you/.local/bin/localmem"` or `"command": "/path/to/repo/.venv/bin/localmem"`.
+localmem never rewrites the entry afterwards, so an absolute path you set stays set.
+
+<details>
+<summary><b>Claude Code</b> — <code>localmem agents --install claude-code</code></summary>
+
+**Detected by:** `~/.claude/` existing.
+
+**Writes:** the project-level `./.mcp.json` in the current directory, **only inside a git
+repository**. Outside one it writes nothing at all and prints
+`claude mcp add localmem -- localmem serve` for you to run. `~/.claude.json` is never opened
+for writing — it is tens of kilobytes of unrelated session state, and you consented to adding
+localmem, not to having that file rewritten.
+
+```json
+{
+  "mcpServers": {
+    "localmem": {
+      "command": "localmem",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}
+```
+
+**Verify it took:** restart Claude Code and run
+
+```
+/mcp
+```
+
+`localmem` should be listed with two tools, `memory_recall` and `memory_add`. This is a real
+check — it reports what the client actually connected to, not what a file says.
+
+**Remove it:** delete the `localmem` entry from `.mcp.json`. Nothing else was written.
+
+Full walkthrough: [`examples/claude_code.md`](examples/claude_code.md).
+</details>
+
+<details>
+<summary><b>Codex CLI</b> — <code>localmem agents --install codex</code></summary>
+
+**Detected by:** `~/.codex/` existing.
+
+**Writes:** appends one block to `~/.codex/config.toml`. It is the only writer that appends
+rather than regenerating, because TOML carries comments and table order that a rewrite would
+destroy.
+
+```toml
+
+# Added by localmem init
+[mcp_servers.localmem]
+command = "localmem"
+args = ["serve"]
+```
+
+**Verify it took:** Codex ships its own reader for this file —
+
+```bash
+codex mcp get localmem
+```
+
+which prints the parsed entry (`enabled`, `transport`, `command`, `args`) as *Codex* sees it,
+and `codex mcp list` shows it in the table of every configured server. That is Codex's own
+parse of the config, not a syntax check of the text. To confirm the server itself starts,
+restart Codex and ask it to use `memory_recall`.
+
+**Remove it:** `codex mcp remove localmem`, or delete the `[mcp_servers.localmem]` table by
+hand — the `# Added by localmem init` comment marks exactly what to remove.
+
+Full walkthrough: [`examples/codex.md`](examples/codex.md).
+</details>
+
+<details>
+<summary><b>Google Antigravity</b> — <code>localmem agents --install antigravity</code></summary>
+
+**Detected by:** `~/.gemini/` existing. The `config/` subdirectory is created if missing.
+
+**Writes:** merges into `~/.gemini/config/mcp_config.json`.
+
+```json
+{
+  "mcpServers": {
+    "localmem": {
+      "command": "localmem",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}
+```
+
+**Verify it took:** localmem has no verified in-agent command to offer here, and will not
+invent one. Check the file parses and contains the entry —
+
+```bash
+python3 -m json.tool ~/.gemini/config/mcp_config.json
+```
+
+— then restart Antigravity and ask it *"use `memory_recall` to find what I know about X"*. If
+it calls the tool, registration worked. **That second step is an indirect check**: it proves
+the client loaded and started the server, but it is a behavioural observation rather than a
+status readout.
+
+**Remove it:** delete the `localmem` entry from `mcpServers`.
+
+Full walkthrough: [`examples/antigravity.md`](examples/antigravity.md).
+</details>
+
+<details>
+<summary><b>AWS Kiro</b> — <code>localmem agents --install kiro</code></summary>
+
+**Detected by:** either `~/.kiro/` or `./.kiro/` existing.
+
+**Writes:** `./.kiro/settings/mcp.json` when `./.kiro/` exists in the current directory —
+workspace level — and `~/.kiro/settings/mcp.json` otherwise. Run `localmem agents` first: it
+prints the exact path it would use, so you can see which one you are about to get.
+
+```json
+{
+  "mcpServers": {
+    "localmem": {
+      "command": "localmem",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}
+```
+
+**Verify it took:** localmem has no verified in-agent command to offer here, and will not
+invent one. Check the file parses and contains the entry —
+
+```bash
+python3 -m json.tool .kiro/settings/mcp.json     # or ~/.kiro/settings/mcp.json
+```
+
+— then restart Kiro and ask it *"use `memory_recall` to find what I know about X"*. If it
+calls the tool, registration worked. **That second step is an indirect check**, the same
+caveat as above.
+
+**Remove it:** delete the `localmem` entry from `mcpServers` in whichever file was written.
+
+Full walkthrough: [`examples/kiro.md`](examples/kiro.md).
+</details>
+
+Both hooks in [`examples/`](examples/) are Claude Code specific, but the two scripts they wrap
+are ordinary shell and work with any client that can run a command around a prompt — see
+[Capturing traces automatically](#capturing-traces-automatically).
 
 ### 4. Tell the agent to use it
 
@@ -136,22 +357,33 @@ Fourteen commands, no more:
 
 | Command | What it does |
 |---|---|
-| `localmem init` | guided setup — the five steps above |
-| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core}`, `--source`, `--session-id` |
-| `localmem search QUERY` | ranked recall; `-w`, `-k N` (1–20), `--all`, `--context` (compact output for a prompt hook, silent when nothing matches) |
+| `localmem init` | guided setup — the five steps above; `--yes` (step 2 only), `--import-all` (step 3 only), `-w` |
+| `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core}` (default `note`), `--source`, `--session-id` |
+| `localmem search QUERY` | ranked recall; `-w`, `-k N` (1–20, **default 5**), `--all`, `--context` (compact output for a prompt hook, silent when nothing matches) |
 | `localmem import PATH…` | import markdown instruction files; `-w`, `--dry-run`, `--select`, `--whole-file` |
 | `localmem agents` | list detected agents; `--install NAME` registers one |
 | `localmem serve` | run the MCP server on stdio — this is what agent configs invoke |
 | `localmem stats` | row counts, entity graph size, recalls, queue depth, core-memory cost |
 | `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows; `-w`, `--json` |
-| `localmem benchmark` | estimate instruction-file cost against localmem's fixed cost; `-w`, `--json` |
+| `localmem benchmark [PATHS…]` | estimate instruction-file cost against localmem's fixed cost; `-w`, `--json`. The optional `PATHS` are measured **in addition to** the files it finds by itself |
 | `localmem dedupe` | review the near-duplicate queue; `--review`, `--list`, `--merge ID`, `--keep-both ID`, `-w`, `--json` |
 | `localmem backfill` | extract entities for memories stored before indexing; `-w` |
 | `localmem export` | write the raw memory rows as JSON; `-w`, `-o FILE` |
 | `localmem restore FILE` | merge an export document back in; idempotent |
-| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` |
+| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` (**default 30**) |
+
+Plus `localmem --version`, which prints the installed version and exits.
 
 Every command works headless. Prompts appear only when stdin is a terminal.
+
+### Environment variables
+
+Two, and no others.
+
+| Variable | Effect |
+|---|---|
+| `LOCALMEM_DB` | path to the database file, instead of `~/.localmem/memory.db`. `~` is expanded. **Setting it to an empty or whitespace-only value is an error**, not a fall-back to the default — every command fails with `LOCALMEM_DB is set but empty`. Unset it rather than blanking it |
+| `LOCALMEM_NO_TRACKING` | any **non-empty** value makes recall strictly read-only: it stops bumping `recalled_count` and `last_recalled_at`. The test is emptiness, not truthiness — **`LOCALMEM_NO_TRACKING=0` disables tracking too**. The cost is that `audit`'s dead-memory and promotion-candidate sections can no longer tell a memory that is never used from one recalled daily |
 
 ---
 
@@ -189,9 +421,32 @@ The MCP surface is two tools and is frozen:
 - **`memory_add(content, workspace?, kind?, source?)`** → `{"status": "added" |
   "duplicate_merged", "id": int, "seen_count": int}`. `kind` accepts `note` and `trace`.
   **`core` is refused** — core memory is loaded into every recall, so it stays
-  human-curated; write one with `localmem add --kind core` from the CLI.
+  human-curated; write one with `localmem add --kind core` from the CLI. `imported` is
+  refused for the same category of reason: it belongs to `localmem import`, not to the tool
+  surface.
+
+The two tools are **not symmetric about `workspace: "all"`**, and the pointer snippet
+deliberately teaches `"all"` for recall. On `memory_recall` it means "every workspace" and is
+the documented retry when nothing comes back. On `memory_add` it is **rejected** — storing a
+memory in a workspace literally named `all` would make it unreachable by every ordinary
+recall, so the tool asks you to name the workspace the memory belongs to instead. An agent
+that copies `"all"` from a recall into a write gets a clear error, not a lost memory.
 
 Transport is stdio. That is the only transport v1 ships.
+
+### Permission-granular access
+
+The split into exactly two tools is along read/write lines, which is what lets any
+permission-granular MCP client allow one and gate the other:
+
+- `memory_recall` — **read only**. Runs a query, never writes. (It does bump
+  `recalled_count` unless `LOCALMEM_NO_TRACKING` is set; that is bookkeeping, not content.)
+- `memory_add` — the **only** tool that writes content.
+
+Allowing recall while gating adds is a reasonable posture: the agent can use everything you
+have taught it, and every new memory passes under your eyes first. The exact syntax is your
+client's — Claude Code spells the pair `mcp__localmem__memory_recall` and
+`mcp__localmem__memory_add` in its permission rules; other clients differ.
 
 ---
 
@@ -265,6 +520,12 @@ occasionally-relevant knowledge that belongs in localmem.
 Re-importing an unchanged file adds no rows: every record hashes to what it hashed to last
 time, merges, and bumps `seen_count`.
 
+**Imported rows carry `kind='imported'`.** That is a fifth kind alongside `note`, `trace` and
+`core` — you will see it in `localmem stats` under `by kind` and in `localmem audit`'s
+distribution section, and it is how you tell what came out of a file from what you or an agent
+wrote by hand. It is not writable through MCP and it is not a flag on `localmem add`; only
+`localmem import` produces it. Retrieval treats it exactly like a `note`.
+
 **localmem never edits your instruction files.** Not on import, not on `init`, not ever. The
 trimming is yours to do. Full guide, including what to keep and what to move:
 [`docs/migrating_from_instruction_files.md`](docs/migrating_from_instruction_files.md).
@@ -291,12 +552,27 @@ shared tier.
 
 ```bash
 # in repo A, right after you work it out
-localmem add "file upload 413s behind nginx: client_max_body_size defaults to 1m — raise it
+localmem add "file upload 413 behind nginx: client_max_body_size defaults to 1m — raise it
 in the server block, not just in the app" -w global --source claude-code
 
 # in repo B, weeks later
 localmem search "upload 413"        # the lesson comes back, even though it was never stored here
 ```
+
+Real output of that second command, run from a `repoB` that has never stored anything (the
+score and timestamp are from that run — the score decays with the memory's age):
+
+```
+1. [score 0.65] id=1 workspace=global kind=note seen=1 created=2026-08-06 02:49:17
+   source: claude-code
+   file upload 413 behind nginx: client_max_body_size defaults to 1m — raise it
+   in the server block, not just in the app
+```
+
+Note the query words are the stored words. **Matching is exact per token** — the index is
+FTS5 `unicode61` with no prefix wildcard, so a memory that said `413s` would *not* be found
+by a search for `413`. That is limitation 1 in miniature; it is worth knowing before you
+blame the shared tier for a miss that is really a spelling difference.
 
 ### 2. The diagnosis that was wrong
 
@@ -352,29 +628,50 @@ the two.
 
 If the problem is that the agent forgets to call `memory_add`, a hook does not forget. There
 is a worked, opt-in Claude Code Stop hook in
-[`examples/claude_code_hook.md`](examples/claude_code_hook.md). It is an example: you install
-it into your own settings, because localmem never edits an agent's configuration without a
-yes and never edits hooks at all.
+[`examples/claude_code_hook.md`](examples/claude_code_hook.md), wrapping the real script
+[`examples/localmem-capture.sh`](examples/localmem-capture.sh) — a test asserts the copy in
+the document is byte-identical to the file. It is an example: you install it into your own
+settings, because localmem never edits an agent's configuration without a yes and never edits
+hooks at all.
+
+It stores the session's final assistant message as `--kind trace`. A summary longer than
+**100,000 characters is truncated**, and the stored trace then ends with
+`…[truncated by capture hook]` so a cut record admits it. That cap is not tidiness: the
+summary is passed to `localmem add` as an exec argument, and past `ARG_MAX` (1 MiB on macOS)
+exec fails with `E2BIG`, which the script's `|| exit 0` would swallow — storing **nothing**,
+silently. Measured before the cap existed: a 900 KB summary stored fine, 1.1 MB and 1.5 MB
+stored nothing at all.
 
 ### Recalling automatically
 
 The mirror image, and the same deal: if the agent forgets to call `memory_recall`, a
 UserPromptSubmit hook does not. [`examples/claude_code_auto_recall.md`](examples/claude_code_auto_recall.md)
-runs `localmem search "<your prompt>" --context -k 3` before the model sees your prompt and
-injects whatever comes back.
+wraps [`examples/localmem-auto-recall.sh`](examples/localmem-auto-recall.sh), which runs
+`localmem search "<your prompt>" --context -k 3` before the model sees your prompt and injects
+whatever comes back.
 
-`--context` exists for that hook and behaves accordingly:
+**Both scripts require [`jq`](https://jqlang.github.io/jq/)**, which parses the hook payload.
+`jq` is a dependency of *the examples*, not of localmem — localmem itself has three runtime
+dependencies and `jq` is not one of them. Neither script fails a session without it: both
+check `command -v jq` and exit 0 silently if it is missing.
+
+`--context` exists for that hook and behaves accordingly. Real output, run from `myrepo`
+against the two `global` memories stored in the walkthrough above:
 
 ```bash
 $ localmem search "upload 413" --context -k 3
 Relevant memories (localmem):
-- (global) file upload 413s behind nginx: client_max_body_size defaults to 1m — raise it in the server block
-- (myrepo) upload 413 is NOT the app body-parser limit — spent two hours there
+- (global) upload 413 is NOT the app body-parser limit — spent two hours there. Check the proxy first.
+- (global) file upload 413 behind nginx: client_max_body_size defaults to 1m — raise it in the server block, not just in the app
 
 $ localmem search "nothing stored about this" --context
 $ echo $?
 0
 ```
+
+Both lines say `(global)` because that is where the walkthrough put them; a memory stored in
+`myrepo` itself would print `(myrepo)`. The shared tier is why a repo that stored neither of
+them gets both.
 
 No match prints **nothing at all** — a hook runs on every prompt, so the ordinary "no memories
 matching…" line would become permanent noise. Each hit is one line, collapsed and truncated at
@@ -387,7 +684,8 @@ an ordinary recall, where it is charged once per session instead of once per pro
 ## Limitations
 
 Read this section before deciding localmem is right for you. Everything below is measured
-behaviour of v0.2.1, not speculation.
+behaviour of v0.2.2, not speculation. v0.2.2 is a documentation release: nothing in this list
+changed, and nothing in `localmem/` changed except the version string.
 
 1. **BM25 has no semantic matching.** Retrieval is lexical plus an entity graph. A query
    that shares no words and no entities with a memory will not find it — "how do we install
@@ -406,7 +704,8 @@ behaviour of v0.2.1, not speculation.
    only. That is a v2 item, and shipping it needs an auth story first.
 5. **`đ`/`Đ` is not folded to `d`.** FTS5's `remove_diacritics 2` strips Vietnamese tone
    marks, but `đ` is a separate letter with no Unicode decomposition. Searching `dung` does
-   **not** match a stored `đúng`; searching `đúng` does. See the Tiếng Việt section.
+   **not** match a stored `đúng`; searching `đúng` does. Three more Vietnamese-specific
+   consequences are in [README_VI.md → *Bốn lưu ý riêng cho tiếng Việt*](README_VI.md#bốn-lưu-ý-riêng-cho-tiếng-việt).
 6. **Near-duplicate detection gates on Jaccard token overlap ≥ 0.7, and on nothing else.**
    FTS5 supplies at most 10 candidates from the new memory's top 5 terms; the decision is
    Jaccard alone. (A bm25 threshold was specified originally and removed — bm25 magnitudes on
@@ -504,9 +803,11 @@ Recorded, not implemented.
   `import --whole-file`, MCP core-write hardening, recall usage tracking (schema version 2),
   `export`/`restore`, and the Claude Code Stop hook example. **v0.2.1** adds
   `search --context` with the auto-recall hook, a ~97-token pointer snippet,
-  `LOCALMEM_NO_TRACKING`, `0600`/`0700` file modes and the `mcp<3` pin. **Still open**: tier-3
-  temporal supersede using the reserved `superseded_by` column; per-agent `source` analytics
-  in `stats`.
+  `LOCALMEM_NO_TRACKING`, `0600`/`0700` file modes and the `mcp<3` pin. **v0.2.2** is
+  documentation only — the `uv` install paths, per-agent registration in this file, and
+  `README_VI.md`; not one line of `localmem/` changed but the version string. **Still open**:
+  tier-3 temporal supersede using the reserved `superseded_by` column; per-agent `source`
+  analytics in `stats`.
 - **v0.3** — promotion tooling that acts on what `audit` already suggests (a note cannot be
   promoted to `kind='core'` today); richer NER as genuine optional extras (spaCy for English,
   underthesea for Vietnamese) — this is where an installable `[ner]` extra would first exist.
@@ -547,88 +848,3 @@ not affiliated with them.
 
 MIT — see [LICENSE](LICENSE).
 
----
-
-## Tiếng Việt
-
-**localmem** là lớp bộ nhớ cục bộ, không tốn token, cho các AI coding agent. Toàn bộ dữ liệu
-nằm trong một file SQLite ở `~/.localmem/memory.db`; mọi thao tác lưu, đánh chỉ mục, khử trùng
-lặp và xếp hạng đều là code thuần — không có lần gọi model nào. Agent truy cập qua hai MCP
-tool: `memory_recall` và `memory_add`.
-
-### Cài đặt
-
-```bash
-git clone https://github.com/<your-account>/localmem.git
-cd localmem
-python3 -m venv .venv        # cần Python >= 3.10
-.venv/bin/pip install -e .
-```
-
-### Dùng nhanh
-
-```bash
-localmem init                         # tạo DB, hỏi từng agent một, đề nghị import
-localmem add "dùng pnpm thay vì npm"
-localmem search "pnpm"
-localmem stats
-```
-
-### Chia sẻ tri thức giữa các repo (v0.2)
-
-Workspace `global` là **tầng dùng chung**: từ v0.2, mọi workspace có tên đều đọc thêm tầng này
-bên cạnh workspace của chính nó. Hai workspace có tên vẫn hoàn toàn tách biệt với nhau.
-
-```bash
-# bài học dùng lại được ở mọi repo — lưu MỘT lần
-localmem add "upload 413 sau nginx: sửa client_max_body_size, không phải giới hạn của app" \
-  -w global
-
-# ở repo khác, tuần sau
-localmem search "upload 413"     # vẫn ra, dù chưa từng lưu ở repo này
-
-# skill/checklist cần lấy lại NGUYÊN BÀI
-localmem import skills/security-review.md --whole-file -w global
-```
-
-Ba tầng nên đặt rule ở đâu: rule **bắt buộc** luôn áp dụng thì giữ trong `CLAUDE.md` (localmem
-là *pull*, agent phải chủ động hỏi); kiến thức tích luỹ **theo repo** để ở workspace tự
-detect; thói quen và bài học **xuyên repo** để ở `global`.
-
-Vệ sinh và sao lưu:
-
-```bash
-localmem audit                    # 5 mục báo cáo, chỉ đọc, không ghi một byte nào
-localmem export -o backup.json    # chỉ bảng memories; index tái tạo khi restore
-localmem restore backup.json      # chạy lại nhiều lần cũng không đổi kết quả
-```
-
-Đừng copy thẳng file `memory.db` khi còn agent đang chạy — WAL giữ commit mới ở file `-wal`,
-copy nửa chừng là hỏng DB. Dùng `export`/`restore`.
-
-Từ v0.2.1: `localmem search "câu hỏi" --context` in gọn cho hook UserPromptSubmit (không có kết
-quả thì **im lặng tuyệt đối**, exit 0) — xem `examples/claude_code_auto_recall.md`. DB và thư
-mục do localmem tạo mới có quyền `0600`/`0700`; cái đã tồn tại thì không đụng tới. Muốn recall
-không ghi gì cả: `LOCALMEM_NO_TRACKING=1`.
-
-### Ba lưu ý riêng cho tiếng Việt
-
-1. **`đ`/`Đ` không được quy về `d`.** FTS5 bỏ dấu thanh nên gõ `dung` vẫn tìm được `dùng`,
-   nhưng `đ` là một chữ cái riêng và Unicode không tách nó ra. Vì vậy tìm `dung` **không** ra
-   `đúng`; phải gõ đúng chữ `đ`.
-2. **Cùng giới hạn đó áp dụng cho từ khoá "gần đây".** localmem nhận các cụm chỉ thời gian
-   (`hôm qua`, `hôm nay`, `tuần trước`, `tháng trước`, `gần đây`, `mới nhất`) và bỏ dấu khi so
-   khớp — nên `tuan truoc` vẫn nhận ra `tuần trước`. Nhưng `gan day` thì **không** được nhận
-   là `gần đây`, còn `gan đay` thì có. Danh sách này là cố định, không suy diễn biến thể:
-   `vài hôm trước` không được coi là chỉ thời gian.
-3. **Trích xuất thực thể gây nhiễu với chữ IN HOA và từ viết tắt.** Lớp `ACRONYM` là
-   `\b[A-Z]{2,10}\b`, không có từ điển. Nó lấy đúng `UBND`, `API`, `SQL` — nhưng câu viết hoa
-   toàn bộ như `THIS IS URGENT` cũng sinh ra ba thực thể. Tiếng Việt viết tắt nhiều nên chịu
-   ảnh hưởng rõ hơn. Các thực thể nhiễu có trọng số thấp nên bị xếp hạng xuống; NER tốt hơn
-   (underthesea) nằm trong kế hoạch v0.3, hiện chưa đóng gói.
-
-Ngoài ra: ước lượng token chuyển sang công thức dày hơn khi văn bản có hơn 15% ký tự
-non-ASCII, tức là hầu hết câu tiếng Việt — mọi con số đều là ước lượng ±15%. Danh sách stopword
-dùng cho tier-2 chỉ có tiếng Anh, ảnh hưởng độ phủ chứ không ảnh hưởng tính đúng đắn.
-
-Phần còn lại của tài liệu bằng tiếng Anh — xem mục **Limitations** ở trên trước khi dùng thật.

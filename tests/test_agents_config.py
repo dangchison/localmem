@@ -1278,15 +1278,18 @@ def test_the_pointer_snippet_tells_the_agent_not_to_copy_memory_into_the_file() 
 
 
 def test_every_documented_copy_of_the_snippet_is_the_real_one() -> None:
-    """Six documents paste the snippet; :data:`agents.POINTER_SNIPPET` is the source.
+    """Seven documents paste the snippet; :data:`agents.POINTER_SNIPPET` is the source.
 
     The copies drifted from the constant once already — this is what makes the next
-    compression a code change rather than a copy-paste hunt.
+    compression a code change rather than a copy-paste hunt. ``README_VI.md`` joined the
+    list in v0.2.2: the prose around it is Vietnamese, the snippet inside it is not, and
+    a translated snippet would be a silently different instruction to the agent.
     """
     root = Path(__file__).resolve().parent.parent
     block = f"```markdown\n{agents.POINTER_SNIPPET}```"
     documents = (
         root / "README.md",
+        root / "README_VI.md",
         root / "docs" / "migrating_from_instruction_files.md",
         root / "examples" / "claude_code.md",
         root / "examples" / "codex.md",
