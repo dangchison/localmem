@@ -1499,3 +1499,79 @@ def test_cli_search_respects_no_tracking(db_path: Path, monkeypatch: pytest.Monk
     runner.invoke(main, ["search", "pnpm", "--context", "-w", WORKSPACE])
     result = runner.invoke(main, ["stats"])
     assert "recalls: 0 recorded across all memories" in result.output
+
+
+# --- entity-graph query expansion (§57) --------------------------------------
+
+
+def test_expansion_reaches_a_memory_sharing_no_word_with_the_query(
+    conn: sqlite3.Connection,
+) -> None:
+    """The case the hop exists for: no shared token, one shared neighbour entity.
+
+    ``bridge_row`` carries both identifiers, so ``config_loader`` co-occurs with
+    ``cache_warmer`` there. A query naming only ``config_loader`` then reaches the
+    ``cache_warmer`` memory, which shares no word with it at all.
+    """
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
+    target = store.add_memory(conn, "cache_warmer đọc danh sách khoá lúc bật máy", WORKSPACE)
+
+    found = retriever.retrieve(conn, "config_loader", WORKSPACE, now=NOW)
+    assert target.id in {hit.id for hit in found.results}
+
+
+def test_expansion_is_off_at_zero_damping(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero is arithmetically the pre-expansion retriever, not merely a small weight."""
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
+    target = store.add_memory(conn, "cache_warmer đọc danh sách khoá lúc bật máy", WORKSPACE)
+
+    monkeypatch.setattr(retriever, "ENTITY_EXPANSION_DAMPING", 0.0)
+    found = retriever.retrieve(conn, "config_loader", WORKSPACE, now=NOW)
+    assert target.id not in {hit.id for hit in found.results}
+
+
+def test_a_directly_matched_memory_outranks_one_reached_by_a_hop(
+    conn: sqlite3.Connection,
+) -> None:
+    """Damping is what makes the hop evidence rather than a second opinion."""
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
+    direct = store.add_memory(conn, "config_loader đọc biến môi trường trước", WORKSPACE)
+    hopped = store.add_memory(conn, "cache_warmer đọc danh sách khoá lúc bật máy", WORKSPACE)
+
+    ranked = [
+        hit.id for hit in retriever.retrieve(conn, "config_loader", WORKSPACE, now=NOW).results
+    ]
+    assert ranked.index(direct.id) < ranked.index(hopped.id)
+
+
+def test_expansion_never_returns_a_query_entity_as_its_own_neighbour(
+    conn: sqlite3.Connection,
+) -> None:
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
+    assert "config_loader" not in retriever._co_occurring_entities(
+        conn, ["config_loader"], WORKSPACE
+    )
+
+
+def test_expansion_is_capped(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dense graph must not let one hop reach the whole corpus."""
+    store.add_memory(
+        conn,
+        "config_loader cache_warmer job_runner log_writer queue_reader mail_sender đi cùng nhau",
+        WORKSPACE,
+    )
+    monkeypatch.setattr(retriever, "ENTITY_EXPANSION_LIMIT", 2)
+    assert len(retriever._co_occurring_entities(conn, ["config_loader"], WORKSPACE)) == 2
+
+
+def test_expansion_stays_inside_the_workspace_scope(conn: sqlite3.Connection) -> None:
+    """The hop reads the same tiers the view it feeds does."""
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", "elsewhere")
+    assert retriever._co_occurring_entities(conn, ["config_loader"], WORKSPACE) == []
+
+
+def test_a_query_with_no_entity_takes_no_hop(conn: sqlite3.Connection) -> None:
+    store.add_memory(conn, "config_loader và cache_warmer luôn khởi động cùng nhau", WORKSPACE)
+    assert retriever._co_occurring_entities(conn, [], WORKSPACE) == []

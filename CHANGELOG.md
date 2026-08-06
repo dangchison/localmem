@@ -20,9 +20,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `test_bundled_fixture_matches_the_recorded_baseline` fails on **any** movement, up or down;
   rewrite it with `LOCALMEM_UPDATE_BASELINE=1 pytest tests/test_evaluate.py`.
 
-  Corpus: 59 documents, 45 graded queries, 20 off-corpus. Baseline: recall@1 **0.6667**,
-  recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**, off-corpus silent **1/20**.
-  `answered_by` is `both 9, lexical 3, relational 8, fallback 44, none 1`.
+  Corpus: 59 documents, 45 graded queries, 20 off-corpus. Baseline as first recorded: recall@1
+  **0.6667**, recall@3 **0.8444**, recall@5 **0.9111**, MRR **0.7552**, off-corpus silent
+  **1/20** — moved once since, by the entity hop below. `answered_by` is
+  `both 9, lexical 3, relational 8, fallback 44, none 1`.
 
   Two findings came straight out of it and are recorded in `docs/design_decisions.md` §53:
 
@@ -35,6 +36,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     30-document corpus had no query engaging both views, so four ranking constants were
     unmeasurable; §55 records widening the corpus until all eight are caught under perturbation.
     The report still prints `answered_by` and warns when `both` is 0.
+
+### Changed — retrieval
+
+- **One damped hop across the entity graph** (`docs/design_decisions.md` §57). View B previously
+  asked one question: which memories carry an entity the query names. It now also asks which
+  entities *co-occur* with those, and folds the memories carrying them in at
+  `ENTITY_EXPANSION_DAMPING = 0.25`. A query for `config_loader` can now reach a memory about
+  `cache_warmer` that shares no word with it, because some third memory mentions both — the shape
+  of retrieval Gate 0 wanted embeddings for, reached with two SQL statements and no model.
+
+  recall@1 **0.6667 → 0.6889**, MRR **0.7552 → 0.7737**, four queries better and one worse, and
+  off-corpus silence **unchanged at 1/20** with not one off-corpus query changing even its first
+  result. Both constants come from a sweep whose results are identical from damping 0.25 upward
+  across limits 3/5/10 — a plateau, not a peak. The one regression is named in §57 rather than
+  tuned away.
+
+  This is the first change to the ranking that `localmem eval` has approved rather than rejected.
 
 ### Measured and not shipped
 

@@ -4,11 +4,11 @@
   "positive_queries": 45,
   "negative_queries": 20,
   "recall": {
-    "@1": 0.6667,
+    "@1": 0.6889,
     "@3": 0.8444,
     "@5": 0.9111
   },
-  "mrr": 0.7552,
+  "mrr": 0.7737,
   "off_corpus_silent": 1,
   "answered_by": {
     "both": 9,
@@ -187,22 +187,22 @@
       ]
     },
     "q-tokenizer": {
-      "first_gold_rank": 2,
+      "first_gold_rank": 1,
       "silent": false,
       "answered_by": "relational",
       "returned": [
-        "doc-fts-about",
         "doc-fts-tokenizer",
+        "doc-fts-about",
         "doc-fts-rebuild"
       ]
     },
     "q-write-tx": {
-      "first_gold_rank": 2,
+      "first_gold_rank": 1,
       "silent": false,
       "answered_by": "relational",
       "returned": [
-        "doc-index-about",
         "doc-write-tx",
+        "doc-index-about",
         "doc-index-cap"
       ]
     },
@@ -591,32 +591,32 @@
       ]
     },
     "q-disagree-perm": {
-      "first_gold_rank": 1,
+      "first_gold_rank": 2,
       "silent": false,
       "answered_by": "both",
       "returned": [
-        "doc-dir-perm",
-        "doc-open-database"
+        "doc-open-database",
+        "doc-dir-perm"
       ]
     },
     "q-disagree-fts": {
-      "first_gold_rank": 3,
+      "first_gold_rank": 2,
       "silent": false,
       "answered_by": "both",
       "returned": [
-        "doc-fts-about",
         "doc-fts-tokenizer",
-        "doc-fts-rebuild"
+        "doc-fts-rebuild",
+        "doc-fts-about"
       ]
     },
     "q-disagree-entity-cap": {
-      "first_gold_rank": 3,
+      "first_gold_rank": 2,
       "silent": false,
       "answered_by": "both",
       "returned": [
-        "doc-index-about",
         "doc-write-tx",
-        "doc-index-cap"
+        "doc-index-cap",
+        "doc-index-about"
       ]
     },
     "q-off-rollback": {

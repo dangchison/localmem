@@ -2383,3 +2383,75 @@ maximum here is 0.1111, so the separating band is 0.111 → 0.158, a gap of **0.
 gate-D's 0.174. A threshold inside a gap that narrow, on five pairs, is a guess wearing a decimal
 point. What this justifies is a bigger redundancy fixture, not a new constant — and `audit`'s
 similarity histogram remains the instrument for deriving one from real traces.
+
+## 57. One hop across the entity graph, damped — the first retrieval change to clear the gate
+
+§54 refused a coverage rerank because it moved one query. This one moves four, worsens one, and
+does not cost a single point of off-corpus silence. It is the first change to the ranking that
+`localmem eval` has approved rather than rejected, and the difference between the two outcomes is
+the whole argument for having built the harness.
+
+### What it does
+
+`retrieve` already extracts the query's entities and asks view B for memories carrying them. That
+is one lookup, not a traversal — `architecture.md` says so in as many words. The hop adds a second
+lookup: entities that **co-occur** with a query entity, and the memories carrying *those*, folded in
+at :data:`ENTITY_EXPANSION_DAMPING`.
+
+The case it exists for has no lexical component at all. A memory saying *"cache_warmer đọc danh
+sách khoá lúc bật máy"* shares no token with the query `config_loader`. But some third memory says
+*"config_loader và cache_warmer luôn khởi động cùng nhau"*, and that is enough: `config_loader`
+co-occurs with `cache_warmer`, so the query reaches a memory it has no word in common with. This is
+the shape of retrieval Gate 0 wanted embeddings for, reached with two SQL statements and no model.
+
+Co-entities are ranked by `SUM(me1.weight * me2.weight)` — the product of both link weights across
+every memory the pair shares — so an entity central to a memory the query's entity also dominates
+outranks one that merely appears in the same paragraph.
+
+**Two passes merged in Python, not one query with per-entity multipliers.** Damping the second pass
+inside SQL would mean a `CASE` built from Python values, which is the habit `store.py`'s docstring
+warns about. Two `_read_view` calls and a dictionary merge cost one extra statement per recall on a
+candidate set already capped at 20.
+
+### Both constants come from the sweep, and the shape of the sweep matters
+
+| damping | limit | recall@1 | MRR | off-corpus silent | queries better / worse |
+|---|---|---|---|---|---|
+| 0.00 | — | 0.6667 | 0.7552 | 1/20 | — |
+| 0.10 | 3 | 0.6889 | 0.7663 | 1/20 | +2 / −1 |
+| 0.10 | 5 | 0.6889 | 0.7700 | 1/20 | +3 / −1 |
+| **0.25** | **5** | **0.6889** | **0.7737** | **1/20** | **+4 / −1** |
+| 0.25 | 10 | 0.6889 | 0.7737 | 1/20 | +4 / −1 |
+| 0.50 | 5 | 0.6889 | 0.7737 | 1/20 | +4 / −1 |
+
+Everything from 0.25 upward is **identical**, across limits 3, 5 and 10. That plateau is the reason
+to trust the number: a constant sitting in the flat interior of a two-dimensional shelf is a
+different object from one perched on a peak, and §54's rejected term needed a weight of 0.8 —
+larger than `LEXICAL_WEIGHT` — to matter at all. 0.25 is the least aggressive point on the shelf and
+5 is its interior on the other axis.
+
+### The leak that did not happen
+
+Every hop widens the candidate set, and widening is how the OR fallback ended up leaking on 19 of 20
+off-corpus queries. So the gate was the noise column, not the recall column. Measured: off-corpus
+silence stays at 1/20, and **not one off-corpus query changes even its first result**. The damping
+and the cap are why — a memory reached only through a hop carries a quarter weight and competes
+against directly-matched rows rather than displacing them, which
+`test_a_directly_matched_memory_outranks_one_reached_by_a_hop` pins.
+
+### The one regression, named
+
+`open_database 0700` falls from rank 1 to rank 2. It is one of the queries §55 added *specifically*
+to make the two views disagree, so it is the adversarial case by construction: the hop pulls in an
+entity that favours the memory about `open_database`'s file mode over the one about its directory
+mode. Reporting it rather than tuning it away is the point — a change that improves four queries and
+costs one is a trade the numbers can be checked against later, and a corpus where nothing ever
+regresses is a corpus that is not being asked anything hard.
+
+### What this does not do
+
+The `answered_by` breakdown is unchanged: `both 9, lexical 3, relational 8, fallback 44, none 1`.
+The hop reorders *within* the relational view; it does not make the relational view answer queries
+that had no entity to begin with. Two thirds of all recall still runs through the disjunctive
+fallback, and off-corpus silence at 1 in 20 remains this system's worst measured property. Neither
+of those is addressed here.
