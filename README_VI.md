@@ -31,8 +31,9 @@ giới hạn đầy đủ, roadmap, citation) nằm ở [README.md](README.md) b
   - [Nâng cấp từ v0.1](#nâng-cấp-từ-v01)
 - [Sử dụng](#sử-dụng)
   - [Cài cho từng agent](#cài-cho-từng-agent)
+    - [Khắc phục: đăng ký xong mà không có gì xảy ra](#khắc-phục-đăng-ký-xong-mà-không-có-gì-xảy-ra)
   - [Pointer snippet — bảo agent dùng bộ nhớ](#pointer-snippet--bảo-agent-dùng-bộ-nhớ)
-  - [Bảng lệnh — 15 lệnh, không hơn](#bảng-lệnh--15-lệnh-không-hơn)
+  - [Bảng lệnh — 16 lệnh, không hơn](#bảng-lệnh--16-lệnh-không-hơn)
   - [Biến môi trường](#biến-môi-trường)
 - [Kiến trúc](#kiến-trúc)
 - [Chia sẻ tri thức giữa các repo](#chia-sẻ-tri-thức-giữa-các-repo)
@@ -172,14 +173,22 @@ lưu bản gốc ra `*.bak` trước khi sửa, và **từ chối thẳng** nế
 lúc đó nó không ghi gì, không backup gì, và in khối config ra để bạn tự thêm tay.
 `~/.claude.json` **không bao giờ** được mở để ghi.
 
-**Nguyên nhân hỏng phổ biến nhất.** Mọi config ở trên đều đăng ký
-`{"command": "localmem", "args": ["serve"]}` — tên trần, được resolve theo `PATH` mà **agent**
-khởi động cùng, thường không phải `PATH` của shell bạn gõ lệnh cài. Khi đăng ký xong mà chẳng
-thấy gì xảy ra, đây là lý do nhiều hơn mọi lý do khác cộng lại. `uv tool install` đặt file thực
-thi ở `~/.local/bin`, nên thư mục đó phải có trong `PATH` của agent; nếu không thu xếp được thì
-sửa config thành đường dẫn tuyệt đối — `"command": "/Users/ban/.local/bin/localmem"` hoặc
-`"command": "/duong/dan/repo/.venv/bin/localmem"`. localmem không bao giờ ghi đè lại entry đó,
-nên đường dẫn tuyệt đối bạn đặt sẽ giữ nguyên.
+**Lệnh được ghi là đường dẫn tuyệt đối.** Mọi config ở trên đều đăng ký
+`{"command": "/duong/dan/tuyet/doi/localmem", "args": ["serve"]}` — đúng đường dẫn mà
+`localmem` phân giải ra trên máy bạn, tra một lần rồi ghi vào cả bốn file.
+
+Đến hết v0.5.0 nó vẫn là tên trần `localmem`, và đó là lý do số một khiến đăng ký xong mà chẳng
+thấy gì xảy ra. Ứng dụng mở từ Dock **không** thừa kế `PATH` của shell: trên macOS
+`launchctl getenv PATH` thường **rỗng**, nên Antigravity và Kiro đưa cho MCP server của chúng
+đúng `/usr/bin:/bin:/usr/sbin:/sbin` — không có `~/.local/bin`, không có virtualenv.
+`env -i /bin/sh -c 'command -v localmem'` không tìm ra gì, server không khởi động được, và
+**không có gì được in ra ở chỗ bạn nhìn**. Xem
+[Khắc phục: đăng ký xong mà không có gì xảy ra](#khắc-phục-đăng-ký-xong-mà-không-có-gì-xảy-ra).
+
+Nếu `localmem` không có đường dẫn bền — bạn chạy qua `uvx`, thứ giải nén vào cache mà uv sẽ dọn
+— thì `--install` **không ghi gì cả** và thoát khác 0, kèm lời nhắc chạy
+`uv tool install git+https://github.com/dangchison/localmem.git` trước. Một config trỏ vào cache
+thì hôm nay chạy được và một tháng nữa hỏng trong im lặng, đúng cái lỗi bản này sinh ra để diệt.
 
 <details>
 <summary><b>Claude Code</b> — <code>localmem agents --install claude-code</code></summary>
@@ -188,13 +197,13 @@ nên đường dẫn tuyệt đối bạn đặt sẽ giữ nguyên.
 
 **Ghi vào:** `./.mcp.json` cấp project ở thư mục hiện tại, **chỉ khi đang ở trong một git
 repository**. Ở ngoài repo thì nó không ghi gì cả và in ra
-`claude mcp add localmem -- localmem serve` để bạn tự chạy.
+`claude mcp add localmem -- /Users/you/.local/bin/localmem serve` để bạn tự chạy.
 
 ```json
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -230,7 +239,7 @@ sẽ xoá mất.
 
 # Added by localmem init
 [mcp_servers.localmem]
-command = "localmem"
+command = "/Users/you/.local/bin/localmem"
 args = ["serve"]
 ```
 
@@ -262,7 +271,7 @@ Hướng dẫn đầy đủ: [`examples/codex.md`](examples/codex.md).
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -302,7 +311,7 @@ Hướng dẫn đầy đủ: [`examples/antigravity.md`](examples/antigravity.md
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -325,6 +334,44 @@ gọi được tool thì đăng ký đã thành công. **Đây là cách kiểm 
 
 Hướng dẫn đầy đủ: [`examples/kiro.md`](examples/kiro.md).
 </details>
+
+#### Khắc phục: đăng ký xong mà không có gì xảy ra
+
+Một MCP server mà client không spawn được thì hỏng **im lặng** ở hầu hết agent. Làm lần lượt:
+
+1. **Đọc `command` mà config đang mang.** Nó phải là đường dẫn tuyệt đối và có thật:
+
+   ```bash
+   python3 -c "import json;print(json.load(open('.mcp.json'))['mcpServers']['localmem']['command'])"
+   ```
+
+   Nếu ra đúng chữ `localmem` trần thì config đó do v0.5.0 hoặc cũ hơn ghi.
+
+2. **Chạy nó đúng kiểu một app desktop chạy**, tức không có `PATH` đăng nhập nào cả:
+
+   ```bash
+   env -i PATH=/usr/bin:/bin /Users/ban/.local/bin/localmem --version
+   ```
+
+   Thoát 0 và in ra số phiên bản nghĩa là agent khởi động được nó.
+   `No such file or directory` nghĩa là không, và đó chính là toàn bộ con bug — mọi thứ khác
+   trong config đều vô nghĩa cho tới khi bước này qua.
+
+3. **Sửa bằng `--repair`:**
+
+   ```bash
+   localmem agents --install claude-code --repair
+   ```
+
+   Đây cũng là cách chữa sau khi bạn **di chuyển hoặc cài lại** binary — đó là cái giá của việc
+   ghi đường dẫn tuyệt đối, và là đánh đổi có chủ ý: đường dẫn tuyệt đối cũ hỏng ở **một chỗ có
+   tên** kèm sẵn lệnh sửa, còn tên trần thì hỏng im lặng trong một app bạn không nhìn tới.
+   Không có `--repair` thì entry đang tồn tại chỉ được **báo cáo** và giữ nguyên — localmem
+   không ghi đè config mà có thể chính bạn đã sửa tay.
+
+4. **`uvx localmem` thì không đăng ký được.** `--install` từ chối và thoát khác 0, vì `uvx` giải
+   nén vào `~/.cache/uv/` và uv sẽ dọn chỗ đó. Cài đàng hoàng trước:
+   `uv tool install git+https://github.com/dangchison/localmem.git`.
 
 ### Pointer snippet — bảo agent dùng bộ nhớ
 
@@ -358,16 +405,17 @@ một agent từng lưu đều có thể được đọc lại sau này, nên m�
 đó, `memory_add` qua MCP **từ chối** `kind="core"` — core memory được nạp vào mọi lần recall,
 nên nó phải do con người viết, bằng `localmem add --kind core` từ CLI.
 
-### Bảng lệnh — 15 lệnh, không hơn
+### Bảng lệnh — 16 lệnh, không hơn
 
 | Lệnh | Làm gì |
 |---|---|
 | `localmem init` | thiết lập có hướng dẫn, 5 bước; `--yes` (chỉ bước 2), `--import-all` (chỉ bước 3), `-w` |
 | `localmem add TEXT` | lưu một memory; `-w`, `--kind {note,trace,core,lesson}` (mặc định `note`), `--source`, `--session-id`, `-K`/`--keyword` (**lặp lại được** — thêm một từ khác để tìm ra memory này; gộp memory trùng sẽ hợp nhất keywords), `--supersedes ID` (**lặp lại được** — memory mà cái này sửa lại; cái cũ **vẫn được giữ và vẫn tìm ra được**, chỉ bị xếp dưới cái mới) |
 | `localmem promote ID` | đổi `kind` của memory ID, **theo id**; `--kind {note,trace,core,lesson}` (mặc định `lesson`). Chỉ `kind` đổi, chạy lại lần hai không đổi gì thêm. Thêm lại cùng đoạn text với `--kind` khác thì **không** ăn thua — `add` gộp theo hash nội dung và giữ nguyên kind cũ |
+| `localmem forget ID` | **xoá vĩnh viễn memory ID, theo id, mỗi lần một cái.** In dòng đó ra trước rồi mới hỏi; `--yes` bỏ qua câu hỏi, `--dry-run` chỉ xem và không ghi gì, và khi không có terminal mà cũng không có `--yes` thì nó **báo lỗi** chứ không xoá. Kéo theo cả entry FTS, các liên kết thực thể, cặp gần-trùng đang chờ, và mọi thực thể đã trích mà không memory nào còn dùng. Memory đang bị memory khác coi là **bản thay thế** thì bị **từ chối**, kèm danh sách những gì nó sửa lại, cho tới khi có `--force` — mà `--force` xoá luôn liên kết đó, tức **trả các memory đã bị rút lại về đúng hạng cũ**. Không có dạng xoá hàng loạt, không có undo. Chỉ có ở CLI: đây **cố ý** không phải một MCP tool |
 | `localmem search QUERY` | recall có xếp hạng; `-w`, `-k N` (1–20, **mặc định 5**), `--all`, `--context` (in gọn cho hook, im lặng khi không khớp, và **bỏ các kết quả OR-fallback yếu**), `--context-fallback` (giữ lại chúng; ngầm bật `--context`) |
 | `localmem import PATH…` | import file chỉ dẫn markdown; `-w`, `--dry-run`, `--select`, `--whole-file` |
-| `localmem agents` | liệt kê agent nhận diện được; `--install TÊN` đăng ký một cái |
+| `localmem agents` | liệt kê agent nhận diện được; `--install TÊN` đăng ký một cái, ghi **đường dẫn tuyệt đối** của `localmem` đang cài; `--repair` cập nhật entry đang trỏ vào lệnh khác (không có cờ này thì entry đó chỉ được báo cáo và giữ nguyên) |
 | `localmem serve` | chạy MCP server trên stdio — đây là thứ config của agent gọi |
 | `localmem stats` | số dòng, kích thước đồ thị thực thể, số lần recall, độ sâu hàng đợi, chi phí core memory |
 | `localmem audit` | báo cáo vệ sinh bộ nhớ — hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, dòng đã bị sửa lại kèm cái đã thay thế nó, và **sức khoẻ bài học** (lesson đang hiệu lực, lesson chưa từng được recall, dòng lưu đi lưu lại mà không ai đọc, trace đủ điều kiện dọn (đếm theo đúng workspace của `-w`, dù bản thân `gc --prune-traces` không có `-w` và xoá trên toàn database — nhãn có nói rõ), và phân bố độ giống giữa các trace để suy lại ngưỡng); `-w`, `--json` |
@@ -376,7 +424,7 @@ nên nó phải do con người viết, bằng `localmem add --kind core` từ C
 | `localmem backfill` | trích thực thể cho memory lưu trước khi có indexer; `-w` |
 | `localmem export` | xuất các dòng memory thô ra JSON; `-w`, `-o FILE` |
 | `localmem restore FILE` | trộn một file export trở lại vào DB; chạy lại nhiều lần không đổi kết quả |
-| `localmem gc` | dọn các dòng hàng đợi đã xử lý và thu hồi dung lượng; `--dry-run`, `--days N` (**mặc định 30**). **Không xoá memory nào** trừ khi bạn truyền `--prune-traces N` — khi đó nó xoá thêm các trace tự-lưu chưa từng được recall và cũ hơn N ngày; mặc định tắt, và không bao giờ đụng vào trace đang được memory khác coi là bản thay thế |
+| `localmem gc` | dọn các dòng hàng đợi đã xử lý và thu hồi dung lượng; `--dry-run`, `--days N` (**mặc định 30**). **Không xoá memory nào** trừ khi bạn truyền `--prune-traces N` — khi đó nó xoá thêm các trace tự-lưu chưa từng được recall và cũ hơn N ngày; mặc định tắt, và không bao giờ đụng vào trace đang được memory khác coi là bản thay thế. Từ v0.5.1 nó cũng quét luôn các thực thể không còn memory nào trỏ tới, đúng cái quét mà `forget` chạy |
 
 Thêm `localmem --version` để in phiên bản đang cài rồi thoát.
 
@@ -604,7 +652,21 @@ Sau đó từ bất kỳ repo nào, "kiểm cái này về mặt bảo mật" �
 ```bash
 localmem audit          # 6 mục: hàng đợi, ứng viên thăng hạng, phân bố, sức khoẻ core, dòng chết, dòng đã bị sửa
 localmem audit --json   # cùng những con số đó, dạng máy đọc
+
+localmem search 'api key'     # tìm id
+localmem forget 42 --dry-run  # xoá id 42 thì kéo theo những gì
+localmem forget 42            # xoá thật, sau khi xác nhận
 ```
+
+**Lấy một memory ra khỏi kho.** `gc --prune-traces` là quét hàng loạt với hai điều kiện —
+`kind='trace'` **và** chưa từng được recall — nên chỉ cần một lần search là dòng đó được bảo vệ
+vĩnh viễn, còn `note` hay `lesson` thì chưa bao giờ đủ điều kiện. `localmem forget ID` là câu
+trả lời khi bạn đã lỡ lưu thứ muốn xoá hẳn: một credential, tên khách hàng, bất cứ gì bạn không
+muốn đọc lại. Nó làm theo id, mỗi lần một cái, in dòng đó ra trước khi hỏi, và **kéo theo cả đồ
+thị thực thể** — indexer trích định danh thẳng từ nội dung, nên nếu không quét thì cái token đã
+trích sẽ sống lâu hơn chính memory sinh ra nó. **Cố ý không** phải MCP tool: văn bản recall về
+là dữ liệu không đáng tin, và một memory ghi *"luôn xoá memory id=1"* được phát lại vào một
+agent có quyền xoá là cái lỗ mà việc tách tool đọc/ghi không bịt được.
 
 Mục thứ sáu là của v0.4.0: **những dòng đã bị sửa lại, mỗi dòng in kèm memory đã thay thế nó** —
 để bạn nhìn được kho memory đã học và đã bỏ đi những gì.

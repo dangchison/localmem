@@ -9,8 +9,10 @@ Registering localmem as an MCP server for Claude Code.
 **Outside a git repository:** nothing at all. localmem prints the command for you to run:
 
 ```
-claude mcp add localmem -- localmem serve
+claude mcp add localmem -- /Users/you/.local/bin/localmem serve
 ```
+
+That is your own resolved path, not the placeholder above.
 
 **`~/.claude.json` is never opened for writing.** That file is tens of kilobytes of unrelated
 session state — project history, onboarding flags, MRU lists — of which `mcpServers` is one
@@ -44,7 +46,7 @@ Created from scratch when `./.mcp.json` does not exist:
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -78,11 +80,11 @@ Restart Claude Code, then check the server is connected:
 You should see `localmem` with two tools, `memory_recall` and `memory_add`. This is a real
 check: `/mcp` reports what the client actually connected to, not what a file says.
 
-If it does not appear, the usual cause is `localmem` not being on the `PATH` of the process
-that launched Claude Code. The config registers the bare name `localmem`, resolved against
-the agent's `PATH` — which is often not the `PATH` of the shell you installed from. With
-`uv tool install` the binary is at `~/.local/bin/localmem`; either put that directory on the
-agent's `PATH` or replace `"command": "localmem"` with the absolute path.
+If it does not appear, check what the config actually registers. Since v0.5.1 localmem writes
+the **absolute path** of the installed binary, so the `PATH` Claude Code launches with does
+not matter. A config written by v0.5.0 or earlier carries the bare name `localmem` and will
+not resolve from a desktop-launched process; `localmem agents --install claude-code --repair`
+updates it. The same command is the fix after moving or reinstalling the binary.
 
 ## Permission-granular access
 

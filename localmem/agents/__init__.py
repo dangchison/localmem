@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from localmem.agents import antigravity, base, claude_code, codex, kiro
+from localmem.agents import antigravity, base, claude_code, codex, command, kiro
 from localmem.agents.base import (
     AgentWriter,
     ApplyResult,
     MalformedConfigError,
 )
+from localmem.agents.command import UnresolvableCommandError
 
 #: Every writer, in the order `init` offers them.
 WRITERS: tuple[AgentWriter, ...] = (
@@ -97,7 +98,9 @@ __all__ = [
     "AgentWriter",
     "ApplyResult",
     "MalformedConfigError",
+    "UnresolvableCommandError",
     "base",
+    "command",
     "detect_agents",
     "find_instruction_files",
     "slugs",

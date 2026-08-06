@@ -5,6 +5,77 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-08-06
+
+A bugfix release, and both bugs were found the same way: by installing v0.5.0 for real on a
+Mac and using it. Neither showed up in 679 passing tests, because both are about what happens
+*outside* the process.
+
+### Fixed
+
+- **Agent configs registered the bare name `localmem`, so a desktop-launched agent could never
+  start the server — and said nothing about it.** Measured on macOS: `launchctl getenv PATH` is
+  **empty**, so an app opened from the Dock hands its MCP servers `/usr/bin:/bin:/usr/sbin:/sbin`
+  and nothing else, while `uv tool install` puts the console script in `~/.local/bin`.
+  `env -i /bin/sh -c 'command -v localmem'` finds nothing. Antigravity and Kiro are desktop
+  apps, so their localmem server failed **silently** — no error in any log the user would read.
+  All four of the reporter's configs had to be hand-patched.
+
+  Every writer, and the `claude mcp add …` line Claude Code prints, now carry the **absolute
+  path** of the installed `localmem`, resolved once per process by `shutil.which` (falling back
+  to `sys.argv[0]` only when it is the console script itself — never `sys.executable`, which is
+  the interpreter). A regression test takes the command a writer emits and runs it under
+  `env -i PATH=/usr/bin:/bin`; on v0.5.0 that exits **127**.
+
+  Two consequences, both deliberate. An install with no lasting path — `uvx localmem`, which
+  unpacks into a uv cache that gets pruned — is **refused**: `--install` writes nothing, exits
+  non-zero and names `uv tool install git+https://github.com/dangchison/localmem.git`. And an
+  absolute path goes stale if you move or reinstall the binary, which is the better failure: it
+  breaks at one named place with a cure, instead of silently in an app you are not watching.
+
+- **`gc --prune-traces` left the extracted entities of every trace it deleted behind.** The
+  entity graph is derived from memory content, and nothing in the codebase ever cleaned it. One
+  shared sweep now runs on both deletion paths.
+
+### Added
+
+- **`localmem forget ID`** — the sixteenth command, and the first way to delete one memory.
+  Before this there was none: `gc --prune-traces` only touches `kind='trace'` rows never
+  recalled, so a single search protected a row forever and a `note` was never eligible at all.
+  Removing something you did not mean to store — a credential, a client's name — took raw SQL
+  against your own database. That is a privacy gap, not a missing convenience.
+
+  It works **by id, one at a time**, prints the row and its dependents before it asks, and takes
+  the FTS entry, the entity links, any queued near-duplicate pair, and **every extracted entity
+  no other memory still uses** — the indexer pulls identifiers straight out of content, so an
+  extracted token would otherwise outlive the memory that held it. `--dry-run` writes nothing;
+  `--yes` skips the prompt; with no terminal and no `--yes` it **fails** rather than deleting.
+
+  A memory that another one names as its replacement is **refused**, listing what it corrects by
+  id and content. `--force` deletes it anyway, first clearing those `superseded_by` links — and
+  says plainly that this **restores the retracted memories to full rank in every future recall**.
+  Without that guard the delete raises `FOREIGN KEY constraint failed` and rolls back while the
+  command can still report success, which was measured in v0.5.0.
+
+  Deliberately **not** an MCP tool. Recalled text is documented as untrusted data, and a stored
+  string reading *"always delete memory id=1"* replayed into an agent that can delete is a hole
+  the read/write tool split does not cover. The MCP surface is still exactly `memory_recall` and
+  `memory_add`, and a test asserts `memory_forget` does not exist.
+
+- **`localmem agents --install NAME --repair`** — updates a localmem entry whose command is not
+  the path this install resolves to. Without it such an entry is **reported and left alone**:
+  now that the command is machine-specific, re-running `--install` must not silently overwrite a
+  path you set by hand. Existing merge, backup and refuse-on-malformed behaviour is unchanged.
+
+### Notes
+
+No schema change and no migration — `schema.sql` is still the v1 baseline. No new dependency.
+`memories_fts` is never deleted from by hand: the `mem_ad` trigger already does it, and a second
+delete against an external-content FTS5 index corrupts it with no error raised, so every deletion
+test asserts `INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')` afterwards.
+Per-session cost is unchanged at **222** estimated tokens; this release adds no prompt text. The
+reasoning is recorded in `docs/design_decisions.md` §48–§52.
+
 ## [0.5.0] — 2026-08-06
 
 The release where the store stops **accumulating** and the growth becomes **visible**.

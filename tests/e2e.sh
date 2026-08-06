@@ -102,13 +102,21 @@ PYTHON_BIN="$(choose_python)" || fail \
     "no Python >= 3.10 found. Set PYTHON=/path/to/python3.11 (or newer) and re-run."
 info "interpreter: ${PYTHON_BIN} ($("${PYTHON_BIN}" -V 2>&1))"
 
-# Snapshot everything the run must not touch, using the *real* home.
+# Snapshot everything the run must not touch, using the *real* home. The `.bak` beside each
+# one is snapshotted too, because step 10 compares it against what it was rather than
+# against absence — see the note there.
 BEFORE_LOCALMEM="$(digest "${REAL_HOME}/.localmem")"
 BEFORE_CLAUDE_JSON="$(digest "${REAL_HOME}/.claude.json")"
 BEFORE_CODEX="$(digest "${REAL_HOME}/.codex/config.toml")"
 BEFORE_GEMINI="$(digest "${REAL_HOME}/.gemini/config/mcp_config.json")"
 BEFORE_KIRO="$(digest "${REAL_HOME}/.kiro/settings/mcp.json")"
 BEFORE_REPO_MCP="$(digest "${REPO_ROOT}/.mcp.json")"
+BEFORE_LOCALMEM_BAK="$(digest "${REAL_HOME}/.localmem.bak")"
+BEFORE_CLAUDE_JSON_BAK="$(digest "${REAL_HOME}/.claude.json.bak")"
+BEFORE_CODEX_BAK="$(digest "${REAL_HOME}/.codex/config.toml.bak")"
+BEFORE_GEMINI_BAK="$(digest "${REAL_HOME}/.gemini/config/mcp_config.json.bak")"
+BEFORE_KIRO_BAK="$(digest "${REAL_HOME}/.kiro/settings/mcp.json.bak")"
+BEFORE_REPO_MCP_BAK="$(digest "${REPO_ROOT}/.mcp.json.bak")"
 info "snapshotted the real ~/.localmem/ and the four real agent configs"
 
 # ------------------------------------------------------------------ 1. sandbox + install
@@ -547,21 +555,41 @@ step "10. The real HOME is untouched"
 [ ! -e "${REAL_HOME}/.localmem" ] || [ "${BEFORE_LOCALMEM}" != "absent" ] ||
     fail "the run created ${REAL_HOME}/.localmem — the sandbox leaked"
 
+# The backup check is against the *snapshot*, not against absence. A developer who has
+# genuinely run `localmem init` on their own machine has a real `.bak` beside every agent
+# config, permanently — asserting no backup exists made this step fail for them on every
+# run, however clean the run was, and said "the sandbox leaked" when nothing had. What the
+# step is actually for is that *this run* wrote nothing outside its sandbox, and a `.bak`
+# whose bytes are exactly what they were before the run is evidence of that, not against it.
 check_unchanged() {
-    local label="$1" target="$2" before="$3"
-    local after
+    local label="$1" target="$2" before="$3" before_backup="$4"
+    local after after_backup
     after="$(digest "${target}")"
-    [ "${after}" = "${before}" ] || fail "${label} changed during the run: ${target}"
-    [ ! -e "${target}.bak" ] || fail "${label} gained a .bak file: ${target}.bak"
+    # A live capture hook is the usual innocent explanation, and it looks exactly like a
+    # sandbox leak from here: this script never touches the real HOME, but a Stop hook
+    # installed from examples/ writes to the real database whenever a session ends, which
+    # can happen *while* this runs. Naming that possibility costs one line and saves the
+    # reader from hunting a leak that is not there.
+    [ "${after}" = "${before}" ] || fail "${label} changed during the run: ${target}
+   If you have the capture hook from examples/ installed, a session ending mid-run wrote
+   this, and the suite did not. Re-run with the hook disabled to tell the two apart."
+    after_backup="$(digest "${target}.bak")"
+    [ "${after_backup}" = "${before_backup}" ] ||
+        fail "${label} gained or changed a .bak file during the run: ${target}.bak"
 }
 
-check_unchanged "the real localmem database" "${REAL_HOME}/.localmem" "${BEFORE_LOCALMEM}"
-check_unchanged "the real Claude Code state" "${REAL_HOME}/.claude.json" "${BEFORE_CLAUDE_JSON}"
-check_unchanged "the real Codex config" "${REAL_HOME}/.codex/config.toml" "${BEFORE_CODEX}"
-check_unchanged "the real Antigravity config" \
-    "${REAL_HOME}/.gemini/config/mcp_config.json" "${BEFORE_GEMINI}"
-check_unchanged "the real Kiro config" "${REAL_HOME}/.kiro/settings/mcp.json" "${BEFORE_KIRO}"
-check_unchanged "the repository .mcp.json" "${REPO_ROOT}/.mcp.json" "${BEFORE_REPO_MCP}"
+check_unchanged "the real localmem database" "${REAL_HOME}/.localmem" \
+    "${BEFORE_LOCALMEM}" "${BEFORE_LOCALMEM_BAK}"
+check_unchanged "the real Claude Code state" "${REAL_HOME}/.claude.json" \
+    "${BEFORE_CLAUDE_JSON}" "${BEFORE_CLAUDE_JSON_BAK}"
+check_unchanged "the real Codex config" "${REAL_HOME}/.codex/config.toml" \
+    "${BEFORE_CODEX}" "${BEFORE_CODEX_BAK}"
+check_unchanged "the real Antigravity config" "${REAL_HOME}/.gemini/config/mcp_config.json" \
+    "${BEFORE_GEMINI}" "${BEFORE_GEMINI_BAK}"
+check_unchanged "the real Kiro config" "${REAL_HOME}/.kiro/settings/mcp.json" \
+    "${BEFORE_KIRO}" "${BEFORE_KIRO_BAK}"
+check_unchanged "the repository .mcp.json" "${REPO_ROOT}/.mcp.json" \
+    "${BEFORE_REPO_MCP}" "${BEFORE_REPO_MCP_BAK}"
 
 if [ "${BEFORE_LOCALMEM}" = "absent" ]; then
     info "${REAL_HOME}/.localmem still does not exist"

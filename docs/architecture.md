@@ -13,7 +13,7 @@ localmem/
 ├── config.py       resolve $LOCALMEM_DB → path; detect workspace from git/dirname
 ├── db.py           connection PRAGMAs, BEGIN IMMEDIATE transactions, forward-only migrations
 ├── schema.sql      the canonical schema, version 1
-├── store.py        add_memory(), the FTS5 MATCH sanitizer, stats aggregation, trace prune
+├── store.py        add_memory(), the FTS5 MATCH sanitizer, stats aggregation, trace prune, forget
 ├── dedup.py        tier-1 hashing, tier-2 candidate + Jaccard gate, nearest_neighbour, queue review, gc
 ├── indexer.py      regex entity extraction, entities/memory_entities maintenance, backfill
 ├── core_memory.py  the always-load tier: kind='core' rows, token-capped, two-tier merge
@@ -24,8 +24,8 @@ localmem/
 ├── audit.py        the read-only hygiene report; every statement is a SELECT
 ├── transfer.py     export/restore of the raw memories table
 ├── mcp_server.py   the two frozen tools, stdio
-├── cli.py          fifteen commands; the only module that calls Path.home()
-└── agents/         one config writer per supported agent
+├── cli.py          sixteen commands; the only module that calls Path.home()
+└── agents/         one config writer per supported agent, over one resolved command path
 ```
 
 Two structural rules are enforced by tests rather than by convention:
@@ -297,7 +297,9 @@ stored state.
   caught as `IntegrityError` and converted into the merge path.
 - `busy_timeout=5000` gives a blocked writer five seconds before it gives up.
 - A memory row and its entity links commit or roll back together; a row can never be visible
-  without its entities.
+  without its entities. Deletion is the same statement in reverse: `forget` and
+  `gc --prune-traces` both run the delete and the orphaned-entity sweep inside one
+  transaction, so an entity is never left unreachable and never removed while still linked.
 - Agent config writes go through a temp file in the same directory followed by `os.replace`, so
   a config is never observed half-written. The original is backed up to `*.bak` first, and a
   backup taken for a write that then fails is removed — a refusal leaves the directory exactly

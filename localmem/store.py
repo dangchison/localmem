@@ -39,6 +39,10 @@ TRACE_KIND = "trace"
 STATUS_PROMOTED = "promoted"
 STATUS_UNCHANGED = "unchanged"
 
+#: How many dependent memories a refusal names before it summarises. Enough to recognise
+#: what would be un-retracted; not so many that the message stops being readable.
+FORGET_DEPENDENT_LIMIT = 10
+
 #: Caps on the agent-supplied keyword list, in the same spirit as the indexer's
 #: :data:`localmem.indexer.MAX_EXTRACT_CHARS` / :data:`~localmem.indexer.MAX_ENTITIES_PER_MEMORY`:
 #: a keyword list is a hint, and a pathological one must not become an index of its own.
@@ -187,6 +191,47 @@ DELETE FROM memories
  )
 """
 
+# The one statement that removes deleted memories' leftovers from `entities`. Spelled as
+# NOT EXISTS rather than `id NOT IN (SELECT entity_id FROM memory_entities)` for the same
+# reason the trace-prune statements are: `NOT IN` over a subquery that yields any NULL is
+# NULL for every row and would delete nothing. `memory_entities.entity_id` is NOT NULL
+# today, so this is defence rather than a live bug — but a statement whose safety depends
+# on a column constraint somewhere else is one schema change away from silently doing
+# nothing, and doing nothing here is a privacy leak (docs/design_decisions.md §52).
+_DELETE_ORPHANED_ENTITIES_SQL = """
+DELETE FROM entities
+ WHERE NOT EXISTS (SELECT 1 FROM memory_entities AS me WHERE me.entity_id = entities.id)
+"""
+
+_SELECT_FORGET_TARGET_SQL = """
+SELECT id, content, workspace, kind, source, created_at, seen_count, recalled_count
+  FROM memories
+ WHERE id = ?
+"""
+
+_COUNT_ENTITY_LINKS_SQL = "SELECT COUNT(*) AS n FROM memory_entities WHERE memory_id = ?"
+
+_COUNT_QUEUED_PAIRS_SQL = """
+SELECT COUNT(*) AS n FROM dedup_queue WHERE memory_id = ? OR candidate_id = ?
+"""
+
+#: The memories this one supersedes — the rows that name it in ``superseded_by``. They
+#: are what makes a plain delete raise ``FOREIGN KEY constraint failed``.
+_SELECT_SUPERSEDED_ROWS_SQL = """
+SELECT id, workspace, content FROM memories WHERE superseded_by = ? ORDER BY id
+"""
+
+# `mem_au` fires only `AFTER UPDATE OF content, keywords`, so clearing the link costs no
+# FTS5 index maintenance — the same property `_SUPERSEDE_SQL` relies on.
+_CLEAR_SUPERSEDED_BY_SQL = """
+UPDATE memories
+   SET superseded_by = NULL,
+       updated_at = datetime('now')
+ WHERE superseded_by = ?
+"""
+
+_DELETE_MEMORY_SQL = "DELETE FROM memories WHERE id = ?"
+
 # The two `?` in bm25() are the column weights; see BM25_COLUMN_WEIGHTS. They bind ahead
 # of the MATCH expression, because that is the order they appear in.
 _SEARCH_SQL = """
@@ -274,6 +319,76 @@ class TracePruneReport:
     eligible: int
     protected: int
     samples: tuple[PrunableTrace, ...]
+
+
+@dataclass(frozen=True)
+class PruneOutcome:
+    """What one ``gc --prune-traces`` actually removed.
+
+    ``entities`` counts rows swept out of the entity graph by
+    :func:`delete_orphaned_entities`, which is not bookkeeping: the extractor pulls
+    identifiers straight out of content, so a pruned trace that held a token leaves that
+    token behind as an ``entities`` row unless it is cleaned up.
+    """
+
+    traces: int
+    entities: int
+
+
+@dataclass(frozen=True)
+class SupersededMemory:
+    """One memory that names another as its replacement, for a refusal to list."""
+
+    id: int
+    workspace: str
+    content: str
+
+
+@dataclass(frozen=True)
+class ForgetTarget:
+    """The row ``forget`` is about to remove, and everything that goes with it.
+
+    Read-only: building one writes nothing, which is what ``--dry-run`` and the
+    confirmation prompt are both built on.
+
+    Attributes:
+        entity_links: how many ``memory_entities`` rows cascade away with the memory.
+            Not the number of ``entities`` rows that will be deleted — an entity shared
+            with another memory survives, and :func:`delete_orphaned_entities` is what
+            decides which.
+        queued_pairs: ``dedup_queue`` rows naming this memory on either side; they
+            cascade too, exactly as they do after ``dedupe --merge``.
+        supersedes: the memories this one corrects, i.e. the rows whose
+            ``superseded_by`` points here. Non-empty means a plain delete is refused.
+    """
+
+    id: int
+    content: str
+    workspace: str
+    kind: str
+    source: str | None
+    created_at: str
+    seen_count: int
+    recalled_count: int
+    entity_links: int
+    queued_pairs: int
+    supersedes: tuple[SupersededMemory, ...]
+
+
+@dataclass(frozen=True)
+class ForgetResult:
+    """What :func:`forget_memory` removed.
+
+    Attributes:
+        id: the memory that is gone.
+        entities_removed: entity rows left with no remaining link, and deleted.
+        restored: the ids whose ``superseded_by`` was cleared under ``force``. They are
+            no longer retracted, and rank at full weight again.
+    """
+
+    id: int
+    entities_removed: int
+    restored: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -496,8 +611,8 @@ def _scoped(sql: str, days: int, workspace: str | None) -> tuple[str, tuple[obje
     return sql + _TRACE_WORKSPACE_FILTER, (*_prune_params(days), workspace)
 
 
-def prune_traces(conn: sqlite3.Connection, days: int) -> int:
-    """Delete never-recalled traces older than ``days`` and return how many went.
+def prune_traces(conn: sqlite3.Connection, days: int) -> PruneOutcome:
+    """Delete never-recalled traces older than ``days`` and report what went.
 
     Opt-in, and off unless ``gc`` is given ``--prune-traces``: localmem's standing rule is
     that it does not delete your memories behind your back, and a garbage collector that
@@ -533,11 +648,158 @@ def prune_traces(conn: sqlite3.Connection, days: int) -> int:
     pruned trace takes its ``dedup_queue`` rows and its ``memory_entities`` links with it.
     A pending near-duplicate pair built on a pruned trace therefore disappears, exactly as
     it does after ``dedupe --merge``.
+
+    What did **not** cascade until v0.5.1 is ``entities`` itself, and that was a leak
+    rather than untidiness: a link is deleted, but the extracted identifier stays behind
+    as a row of its own. :func:`delete_orphaned_entities` runs in the same transaction
+    here and in :func:`forget_memory`, so the two deletion paths close it the same way
+    (``docs/design_decisions.md`` §52).
     """
     with db.transaction(conn):
         cursor = conn.execute(_PRUNE_TRACES_SQL, _prune_params(days))
-        pruned = cursor.rowcount
-    return max(pruned, 0)
+        pruned = max(cursor.rowcount, 0)
+        orphans = delete_orphaned_entities(conn) if pruned else 0
+    return PruneOutcome(traces=pruned, entities=orphans)
+
+
+def delete_orphaned_entities(conn: sqlite3.Connection) -> int:
+    """Delete every ``entities`` row no memory links to, and return how many went.
+
+    Runs inside the **caller's** transaction — it begins none and commits none — so the
+    sweep lands atomically with the deletion that orphaned the rows.
+
+    This is a privacy control, not housekeeping. ``localmem.indexer`` extracts
+    identifiers out of memory content — file paths, quoted strings, snake_case and
+    camelCase tokens — and stores each as a row in ``entities``. Deleting a memory that
+    held an API key therefore leaves the key sitting in that table, readable by anything
+    that opens the database. For a feature whose entire purpose is removing something
+    sensitive, that is a hole in the feature.
+
+    The sweep is **global**, not scoped to the rows just deleted. Anything with no
+    remaining link is unreachable — nothing but ``memory_entities`` references
+    ``entities`` — so there is no such thing as an orphan worth keeping, and a database
+    that accumulated some before this existed is cleaned the first time either caller
+    runs. One shared helper, two callers: :func:`forget_memory` and :func:`prune_traces`
+    leaked identically, and one implementation is what stops them diverging.
+    """
+    return max(conn.execute(_DELETE_ORPHANED_ENTITIES_SQL).rowcount, 0)
+
+
+def describe_forget(conn: sqlite3.Connection, memory_id: int) -> ForgetTarget:
+    """Return everything ``forget ID`` would remove. Writes nothing.
+
+    This is what the confirmation prompt and ``--dry-run`` both print, so the user reads
+    the actual row before agreeing to lose it rather than an id they have to trust.
+
+    Raises:
+        ValueError: if no memory carries ``memory_id``.
+    """
+    row = conn.execute(_SELECT_FORGET_TARGET_SQL, (memory_id,)).fetchone()
+    if row is None:
+        raise ValueError(
+            f"no memory with id {memory_id}; `localmem search` prints the id of every hit"
+        )
+    links = conn.execute(_COUNT_ENTITY_LINKS_SQL, (memory_id,)).fetchone()
+    pairs = conn.execute(_COUNT_QUEUED_PAIRS_SQL, (memory_id, memory_id)).fetchone()
+    return ForgetTarget(
+        id=int(row["id"]),
+        content=str(row["content"]),
+        workspace=str(row["workspace"]),
+        kind=str(row["kind"]),
+        source=row["source"],
+        created_at=str(row["created_at"]),
+        seen_count=int(row["seen_count"]),
+        recalled_count=int(row["recalled_count"]),
+        entity_links=int(links["n"]),
+        queued_pairs=int(pairs["n"]),
+        supersedes=_superseded_rows(conn, memory_id),
+    )
+
+
+def forget_memory(conn: sqlite3.Connection, memory_id: int, *, force: bool = False) -> ForgetResult:
+    """Delete one memory and everything that belongs only to it.
+
+    **Only ``memories`` is deleted from.** ``memory_entities`` and ``dedup_queue`` are
+    declared ``ON DELETE CASCADE`` (``schema.sql:55-56, 63-64``) and go on their own, and
+    the FTS5 row goes through the ``mem_ad`` trigger, which since migration v3 passes the
+    OLD value of *both* indexed columns. Deleting from ``memories_fts`` by hand as well
+    would push a second delete row into an external-content index that cannot verify it —
+    the documented way to corrupt an FTS5 index with no error raised
+    (``docs/design_decisions.md`` §52). The tests assert
+    ``INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')`` afterwards,
+    because that is the only check that sees this class of damage.
+
+    ``entities`` rows left with no remaining link are removed by
+    :func:`delete_orphaned_entities`; entities another memory still uses survive.
+
+    **A memory that other rows name as their replacement is refused by default.**
+    ``superseded_by`` is declared ``REFERENCES memories(id)`` with no ``ON DELETE``
+    clause, so deleting it raises ``FOREIGN KEY constraint failed`` — measured, and
+    measured to be worse than it sounds: the statement rolls back while the caller can
+    still report success. So the dependents are looked up first and named. ``force``
+    clears ``superseded_by`` on them before the delete, which **restores those retracted
+    memories to full rank** in every future recall; the caller is required to say so.
+    Refusing outright was the alternative and is worse — it would leave a memory holding
+    a secret permanently undeletable, which defeats the point of the command.
+
+    The whole thing runs in one :func:`localmem.db.transaction`, so a refusal or a
+    failure leaves the database exactly as it was.
+
+    Raises:
+        ValueError: if ``memory_id`` is unknown, or it is somebody's replacement and
+            ``force`` was not passed. Nothing is written in either case.
+    """
+    with db.transaction(conn):
+        target = describe_forget(conn, memory_id)
+        if target.supersedes and not force:
+            raise ValueError(_forget_refusal(target))
+        restored: tuple[int, ...] = ()
+        if target.supersedes:
+            conn.execute(_CLEAR_SUPERSEDED_BY_SQL, (memory_id,))
+            restored = tuple(row.id for row in target.supersedes)
+        conn.execute(_DELETE_MEMORY_SQL, (memory_id,))
+        entities_removed = delete_orphaned_entities(conn)
+    return ForgetResult(id=memory_id, entities_removed=entities_removed, restored=restored)
+
+
+def _superseded_rows(conn: sqlite3.Connection, memory_id: int) -> tuple[SupersededMemory, ...]:
+    """Return the memories whose ``superseded_by`` points at ``memory_id``."""
+    return tuple(
+        SupersededMemory(id=int(row["id"]), workspace=str(row["workspace"]), content=row["content"])
+        for row in conn.execute(_SELECT_SUPERSEDED_ROWS_SQL, (memory_id,)).fetchall()
+    )
+
+
+def _forget_refusal(target: ForgetTarget) -> str:
+    """Return the message naming what deleting ``target`` would un-retract.
+
+    The dependents are listed by id *and* content: an id alone does not tell the user
+    whether restoring that memory to full rank is acceptable, and that is the decision
+    ``--force`` is asking them to make.
+    """
+    total = len(target.supersedes)
+    shown = target.supersedes[:FORGET_DEPENDENT_LIMIT]
+    lines = [
+        f"memory {target.id} is the correction that {total} "
+        f"{'memory names' if total == 1 else 'memories name'} as their replacement, so "
+        "deleting it would break those links. It supersedes:"
+    ]
+    lines += [f"  id={row.id} ({row.workspace}) {_one_line(row.content)}" for row in shown]
+    if total > len(shown):
+        lines.append(f"  … and {total - len(shown)} more")
+    lines.append(
+        f"Re-run with --force to delete it anyway. That clears superseded_by on "
+        f"{'that memory' if total == 1 else f'those {total} memories'}, which restores "
+        f"{'it' if total == 1 else 'them'} to full rank in every future recall — the "
+        "correction goes away and what it corrected comes back."
+    )
+    return "\n".join(lines)
+
+
+def _one_line(text: str, limit: int = 100) -> str:
+    """Collapse ``text`` onto one line, shortened for a listing inside a message."""
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
 
 
 def _prune_params(days: int) -> tuple[str, str]:

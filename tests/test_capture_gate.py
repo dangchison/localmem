@@ -239,7 +239,7 @@ def test_prune_traces_removes_only_old_unrecalled_traces(conn: sqlite3.Connectio
 
     pruned = store.prune_traces(conn, 30)
 
-    assert pruned == 1
+    assert pruned.traces == 1
     surviving = {row["id"] for row in conn.execute("SELECT id FROM memories")}
     assert surviving == {fresh_trace.id, old_note.id, recalled.id}
 
@@ -258,7 +258,7 @@ def test_a_referenced_trace_does_not_abort_the_prune(conn: sqlite3.Connection) -
 
     pruned = store.prune_traces(conn, 30)
 
-    assert pruned == 1, "the referenced trace aborted the whole statement"
+    assert pruned.traces == 1, "the referenced trace aborted the whole statement"
     surviving = {row["id"] for row in conn.execute("SELECT id FROM memories")}
     assert correcting_trace.id in surviving, "a memory's replacement was deleted"
     assert ordinary_trace.id not in surviving

@@ -353,7 +353,7 @@ def test_stats_on_an_empty_database(conn: sqlite3.Connection, db_path: Path) -> 
 def test_cli_command_set() -> None:
     """AC15, widened in M3 by dedupe and gc, in M4 by serve, in M5 by four more.
 
-    v0.4.0 adds ``promote``, the fifteenth.
+    v0.4.0 adds ``promote``, the fifteenth; v0.5.1 adds ``forget``, the sixteenth.
     """
     result = CliRunner().invoke(cli.main, ["--help"])
     assert result.exit_code == 0
@@ -365,6 +365,7 @@ def test_cli_command_set() -> None:
         "benchmark",
         "dedupe",
         "export",
+        "forget",
         "gc",
         "import",
         "init",

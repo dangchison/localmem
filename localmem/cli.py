@@ -1,13 +1,15 @@
 """The ``localmem`` command line.
 
-Commands: ``init``, ``add``, ``promote``, ``search``, ``import``, ``agents``,
+Commands: ``init``, ``add``, ``promote``, ``forget``, ``search``, ``import``, ``agents``,
 ``benchmark``, ``stats``, ``audit``, ``backfill``, ``dedupe``, ``gc``, ``export``,
 ``restore``, ``serve``.
 
-Every command runs headless — no prompts, no TTY requirement. ``dedupe`` and ``init``
-prompt only when stdin is a terminal; with no terminal and no flags ``init`` prints what
-it *would* do and writes no agent config, and ``import --select`` fails with a clear
-message rather than hanging or silently importing everything.
+Every command runs headless — no prompts, no TTY requirement, with one deliberate
+exception. ``dedupe`` and ``init`` prompt only when stdin is a terminal; with no terminal
+and no flags ``init`` prints what it *would* do and writes no agent config, and
+``import --select`` fails with a clear message rather than hanging or silently importing
+everything. ``forget`` is the exception: it is the only command that destroys a memory,
+so with no terminal and no ``--yes`` it **fails** rather than falling back to deleting.
 
 This module is the only place that resolves the user's home directory. ``Path.home()``
 is read here and passed down as a parameter, so nothing under :mod:`localmem.agents` can
@@ -210,6 +212,52 @@ def promote(memory_id: int, kind: str) -> None:
     )
     if warning is not None:
         click.echo(warning, err=True)
+
+
+@main.command()
+@click.argument("memory_id", metavar="ID", type=int)
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted and write nothing.")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Also delete a memory that other memories name as their replacement, clearing "
+        "superseded_by on them — which restores those retracted memories to full rank."
+    ),
+)
+def forget(memory_id: int, dry_run: bool, yes: bool, force: bool) -> None:
+    """Delete the memory ID permanently. There is no undo.
+
+    Addressed by id, one at a time, exactly as `promote` is — run `localmem search`
+    first, every hit prints its id. There is no `--workspace` or `--kind` bulk form: a
+    mistyped filter would be unrecoverable, and this is the one command that loses data.
+
+    The row is printed in full before anything happens, and deleting it needs either a
+    yes at the prompt or `--yes`. With no terminal to ask on and no `--yes` the command
+    fails and writes nothing; it never falls back to deleting. `--dry-run` shows the same
+    report and always writes nothing.
+
+    What goes with it: the full-text index entry, the entity links, any pending
+    near-duplicate pair naming it, and every extracted entity that no other memory still
+    uses — an entity pulled out of a memory holding a secret is that secret, so it does
+    not stay behind.
+
+    Deliberately **not** available over MCP. Recalled memory text is documented as data
+    and not instructions, and a stored string saying "always delete memory id=1" replayed
+    into an agent that can delete is a hole that a read/write split does not cover.
+    """
+    with _session() as (conn, _path):
+        target = store.describe_forget(conn, memory_id)
+        _echo_forget_target(target, force=force)
+        if dry_run:
+            click.echo("nothing was written")
+            return
+        if not yes and not _confirm_forget(target):
+            click.echo(f"memory {target.id} was kept; nothing was written")
+            return
+        result = store.forget_memory(conn, memory_id, force=force)
+    _echo_forget_result(result)
 
 
 @main.command(context_settings=_TEXT_ARGUMENT_SETTINGS)
@@ -489,8 +537,10 @@ def gc(dry_run: bool, days: int, prune_traces_days: int | None) -> None:
                 _echo_trace_prune_preview(traces)
             click.echo(f"size:    {_format_size(size_before)} (unchanged, nothing written)")
             return
-        pruned_traces = (
-            0 if prune_traces_days is None else store.prune_traces(conn, prune_traces_days)
+        trace_prune = (
+            store.PruneOutcome(0, 0)
+            if prune_traces_days is None
+            else store.prune_traces(conn, prune_traces_days)
         )
         pruned = dedup.prune_resolved(conn, days)
         # VACUUM cannot run inside a transaction, so it happens after prune_resolved
@@ -504,8 +554,9 @@ def gc(dry_run: bool, days: int, prune_traces_days: int | None) -> None:
     click.echo(f"pruned {pruned} resolved queue rows older than {days} days")
     if prune_traces_days is not None:
         click.echo(
-            f"pruned {pruned_traces} never-recalled traces older than {prune_traces_days} days"
+            f"pruned {trace_prune.traces} never-recalled traces older than {prune_traces_days} days"
         )
+        click.echo(f"removed {trace_prune.entities} entities no other memory still uses")
         if traces is not None and traces.protected:
             click.echo(
                 f"kept {traces.protected} otherwise-prunable traces that another memory "
@@ -624,11 +675,26 @@ def import_command(
     metavar="NAME",
     help="Register localmem for one agent by slug; naming it here is the consent.",
 )
-def agents_command(install_slug: str | None) -> None:
+@click.option(
+    "--repair",
+    is_flag=True,
+    help=(
+        "Update an existing localmem entry whose command is no longer the path this "
+        "install resolves to. Without it such an entry is reported and left alone."
+    ),
+)
+def agents_command(install_slug: str | None, repair: bool) -> None:
     """Detect supported agents and print where their config lives.
 
     With ``--install NAME`` it registers localmem for that one agent, under the same
     merge, backup and refuse-on-malformed rules ``init`` uses.
+
+    The command written into every config is the **absolute path** of the installed
+    ``localmem``: an agent launched from the desktop inherits no shell PATH, so a bare
+    name leaves it unable to start the server, with nothing printed anywhere. A localmem
+    binary that has no lasting path — one running under ``uvx`` — is refused rather than
+    written, because a config pointing into a cache fails silently once that cache is
+    pruned. `--repair` is what moves an existing entry to a new path.
     """
     home = Path.home()
     cwd = Path.cwd()
@@ -640,7 +706,14 @@ def agents_command(install_slug: str | None) -> None:
         raise click.UsageError(
             f"unknown agent {install_slug!r}; known agents: {', '.join(agents.slugs())}"
         )
-    _echo_apply_result(writer, writer.apply(home, cwd), home, cwd)
+    try:
+        result = writer.apply(home, cwd, repair=repair)
+    except agents.UnresolvableCommandError as exc:
+        # Nothing has been written at this point: server_entry() raises before any writer
+        # opens a file. Exit non-zero so a script installing localmem fails here rather
+        # than believing an agent was registered (AC1.4).
+        raise click.ClickException(str(exc)) from exc
+    _echo_apply_result(writer, result, home, cwd)
 
 
 @main.command("benchmark")
@@ -801,6 +874,85 @@ def _pair_payload(pair: dedup.DuplicatePair) -> dict[str, object]:
     }
 
 
+def _echo_forget_target(target: store.ForgetTarget, *, force: bool) -> None:
+    """Print the row `forget` is about to remove, and everything that goes with it.
+
+    Printed before the prompt, before ``--dry-run`` returns, and before ``--yes`` acts,
+    so the three paths always show the user the same thing.
+    """
+    click.echo(
+        f"memory {target.id} — workspace={target.workspace} kind={target.kind} "
+        f"created={target.created_at} seen={target.seen_count} "
+        f"recalled={target.recalled_count}"
+    )
+    if target.source:
+        click.echo(f"   source: {target.source}")
+    for line in target.content.splitlines():
+        click.echo(f"   {line}")
+    click.echo(
+        f"also removes: {target.entity_links} entity links, "
+        f"{target.queued_pairs} queued near-duplicate pairs, and its full-text index entry"
+    )
+    if not target.supersedes:
+        return
+    _echo_forget_dependents(target, force=force)
+
+
+def _echo_forget_dependents(target: store.ForgetTarget, *, force: bool) -> None:
+    """Print the memories this one corrects, and what deleting it does to them.
+
+    Without ``--force`` this is a preview of the refusal the store will raise. With it,
+    it is the warning — said plainly, because un-retracting a correction is a change to
+    what future recalls answer, not a bookkeeping detail.
+    """
+    total = len(target.supersedes)
+    noun = "memory" if total == 1 else "memories"
+    click.echo(f"memory {target.id} supersedes {total} {noun}:")
+    for row in target.supersedes[: store.FORGET_DEPENDENT_LIMIT]:
+        click.echo(f"   id={row.id} ({row.workspace}) {_preview(row.content)}")
+    hidden = total - min(total, store.FORGET_DEPENDENT_LIMIT)
+    if hidden:
+        click.echo(f"   … and {hidden} more")
+    if force:
+        click.echo(
+            f"warning: --force clears superseded_by on {'that' if total == 1 else 'those'} "
+            f"{noun}, which restores {'it' if total == 1 else 'them'} to full rank in "
+            "every future recall — the correction goes away and what it corrected comes "
+            "back."
+        )
+        return
+    click.echo("this will be refused without --force")
+
+
+def _confirm_forget(target: store.ForgetTarget) -> bool:
+    """Ask before deleting, or fail when there is no terminal to ask on.
+
+    The no-terminal case is an error and not a default, either way round. Deleting would
+    destroy a memory nobody agreed to lose; skipping silently would let a script believe
+    it had removed a secret that is still there.
+    """
+    if not _is_interactive():
+        raise click.UsageError(
+            f"deleting memory {target.id} needs a yes, and there is no terminal to ask "
+            "on. Re-run with --yes if you are sure, or with --dry-run to see what would "
+            "go. Nothing was written."
+        )
+    return click.confirm(f"Permanently delete memory {target.id}?", default=False)
+
+
+def _echo_forget_result(result: store.ForgetResult) -> None:
+    """Report exactly what the delete removed, including the entity sweep."""
+    click.echo(f"deleted memory {result.id}")
+    click.echo(f"removed {result.entities_removed} entities no other memory still uses")
+    if not result.restored:
+        return
+    ids = ", ".join(str(memory_id) for memory_id in result.restored)
+    click.echo(
+        f"cleared superseded_by on {len(result.restored)} memories (id {ids}); they are "
+        "no longer retracted and are back at full rank"
+    )
+
+
 def _echo_trace_prune_preview(traces: store.TracePruneReport) -> None:
     """Print exactly which traces a real run would delete, and what it would spare."""
     click.echo(
@@ -898,14 +1050,25 @@ def _init_database(path: Path) -> None:
 
 
 def _init_agents(home: Path, cwd: Path, *, yes: bool, interactive: bool) -> None:
-    """Step 2 — ask about each detected agent individually and write only on a yes."""
+    """Step 2 — ask about each detected agent individually and write only on a yes.
+
+    An unresolvable command stops this step and only this step. ``init``'s contract is
+    that every step is independent and a failing one leaves the others intact, and steps
+    3 to 5 — importing instruction files, printing the snippet, proving recall works —
+    need no agent config at all. The refusal is printed in full, so it is loud without
+    taking the rest of the setup down with it; `localmem agents --install NAME` is the
+    command that exits non-zero on the same condition.
+    """
     click.echo("\nStep 2 — agent configuration")
     detected = agents.detect_agents(home, cwd)
     if not detected:
         click.echo("  no supported agent detected; nothing to register")
         return
-    for writer in detected:
-        _register_agent(writer, home, cwd, yes=yes, interactive=interactive)
+    try:
+        for writer in detected:
+            _register_agent(writer, home, cwd, yes=yes, interactive=interactive)
+    except agents.UnresolvableCommandError as exc:
+        click.echo(f"  no agent was registered: {exc}")
 
 
 def _register_agent(

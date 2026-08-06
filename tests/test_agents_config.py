@@ -24,7 +24,7 @@ from click.testing import CliRunner
 
 from localmem import agents, benchmark, cli, db, importer, tokens
 from localmem.agents import antigravity, base, claude_code, codex, kiro
-from tests.conftest import CONFIG_FIXTURES_DIR, FIXTURES_DIR
+from tests.conftest import CONFIG_FIXTURES_DIR, FIXTURES_DIR, STUB_SERVER_COMMAND
 
 JSON_WRITERS = (claude_code.WRITER, antigravity.WRITER, kiro.WRITER)
 
@@ -43,7 +43,8 @@ E2BIG_SUMMARY_CHARS = 1_200_000
 #: the fixture's noise tops out at 61 characters and its real traces start at 120.
 CAPTURE_MIN_SUMMARY_CHARS = 80
 
-LOCALMEM_ENTRY = {"command": "localmem", "args": ["serve"]}
+#: What every writer must register, at the pinned absolute path (AC1.1, AC1.3).
+LOCALMEM_ENTRY = {"command": STUB_SERVER_COMMAND, "args": ["serve"]}
 
 TRIPLE_BASIC = '"' * 3
 TRIPLE_LITERAL = "'" * 3
@@ -225,16 +226,38 @@ def test_json_apply_is_idempotent(home: Path, work: Path) -> None:
 
 
 def test_json_merge_creates_the_servers_object_when_absent() -> None:
-    merged = base.merge_json_document('{"theme": "dark"}')
-    assert merged is not None
-    document = json.loads(merged)
+    merge = base.merge_json_document('{"theme": "dark"}')
+    assert merge.action == "merged"
+    assert merge.document is not None
+    document = json.loads(merge.document)
     assert document == {"theme": "dark", "mcpServers": {"localmem": LOCALMEM_ENTRY}}
 
 
-def test_json_merge_replaces_a_stale_localmem_entry() -> None:
-    merged = base.merge_json_document('{"mcpServers": {"localmem": {"command": "old"}}}')
-    assert merged is not None
-    assert json.loads(merged)["mcpServers"]["localmem"] == LOCALMEM_ENTRY
+def test_json_merge_reports_a_stale_localmem_entry_and_writes_nothing() -> None:
+    """v0.5.1 / AC1.5: an entry naming some other command is not silently rewritten.
+
+    Before this release the entry was replaced without a word. That was tolerable while
+    the command was the constant string `localmem`; with an absolute path it is not, as
+    the stale value may be the user's own deliberate choice.
+    """
+    merge = base.merge_json_document('{"mcpServers": {"localmem": {"command": "old"}}}')
+    assert merge.action == "stale"
+    assert merge.document is None
+    assert merge.previous_command == "old"
+
+
+def test_json_merge_updates_a_stale_localmem_entry_under_repair() -> None:
+    """v0.5.1 / AC1.5: `--repair` is the one thing that moves an existing entry."""
+    merge = base.merge_json_document(
+        '{"mcpServers": {"localmem": {"command": "old"}, "codegraph": {"command": "cg"}}}',
+        repair=True,
+    )
+    assert merge.action == "repaired"
+    assert merge.previous_command == "old"
+    assert merge.document is not None
+    servers = json.loads(merge.document)["mcpServers"]
+    assert servers["localmem"] == LOCALMEM_ENTRY
+    assert servers["codegraph"] == {"command": "cg"}
 
 
 # --------------------------------------------------------------------------- AC13-AC16 Codex
@@ -249,7 +272,7 @@ def test_codex_apply_appends_and_changes_nothing_else(home: Path, work: Path) ->
 
     assert result.action == "merged"
     after = target.read_bytes()
-    assert after == original + codex.CONFIG_BLOCK.encode("utf-8")
+    assert after == original + codex.config_block().encode("utf-8")
     parsed = tomllib.loads(after.decode("utf-8"))
     assert parsed["mcp_servers"]["localmem"] == LOCALMEM_ENTRY
     assert set(parsed["mcp_servers"]) == {"codegraph", "node_repl", "localmem"}
@@ -298,7 +321,7 @@ def test_codex_apply_creates_a_fresh_file_without_a_leading_blank_line(
     result = codex.WRITER.apply(home, work)
     assert result.action == "written"
     text = (home / codex.CONFIG_RELATIVE_PATH).read_text(encoding="utf-8")
-    assert text == codex.CONFIG_BLOCK.lstrip("\n")
+    assert text == codex.config_block().lstrip("\n")
     assert tomllib.loads(text)["mcp_servers"]["localmem"] == LOCALMEM_ENTRY
 
 
@@ -317,7 +340,7 @@ def test_codex_append_preserves_crlf_line_endings(home: Path, work: Path) -> Non
 
     written = target.read_bytes()
     assert written.startswith(original)
-    assert written == original + codex.CONFIG_BLOCK.replace("\n", "\r\n").encode("utf-8")
+    assert written == original + codex.config_block().replace("\n", "\r\n").encode("utf-8")
 
 
 # ------------------------------------- M5 fix round 3: detection is a parse, not a scan
@@ -345,7 +368,7 @@ def test_every_spelling_that_binds_localmem_is_left_alone(
 
     result = codex.WRITER.apply(home, work)
 
-    assert result.action == "already_present"
+    assert result.action == "stale"
     assert target.read_text(encoding="utf-8") == config
     assert not backup_of(target).exists()
     assert tomllib.loads(target.read_text(encoding="utf-8"))
@@ -387,7 +410,7 @@ def test_a_binding_is_found_under_every_valid_line_ending(
 
     result = codex.WRITER.apply(home, work)
 
-    assert result.action == "already_present"
+    assert result.action == "stale"
     assert target.read_bytes() == config.encode("utf-8")
 
 
@@ -423,7 +446,7 @@ def test_a_binding_at_end_of_file_with_no_terminator_is_found(home: Path, work: 
     config = 'model = "x"\r\n[mcp_servers.localmem]\r\ncommand = "localmem"'
     target.write_text(config, encoding="utf-8", newline="")
 
-    assert codex.WRITER.apply(home, work).action == "already_present"
+    assert codex.WRITER.apply(home, work).action == "stale"
 
 
 def test_declares_localmem_reads_the_binding_not_the_spelling() -> None:
@@ -448,7 +471,7 @@ def test_a_sub_table_alone_counts_as_bound(home: Path, work: Path) -> None:
 
     result = codex.WRITER.apply(home, work)
 
-    assert result.action == "already_present"
+    assert result.action == "stale"
     assert target.read_text(encoding="utf-8") == config
 
 
@@ -530,7 +553,7 @@ def test_two_quotes_in_separate_comments_no_longer_hide_a_binding(home: Path, wo
 
     result = codex.WRITER.apply(home, work)
 
-    assert result.action == "already_present"
+    assert result.action == "stale"
     assert target.read_text(encoding="utf-8") == config
 
 
@@ -543,7 +566,7 @@ def test_a_write_that_would_duplicate_the_table_is_rolled_back(
     """AC30: the invariant catches a detection miss before the user ever sees it."""
     target = home / codex.CONFIG_RELATIVE_PATH
     original = install_fixture(CONFIG_FIXTURES_DIR / "codex_config.toml", target)
-    monkeypatch.setattr(codex, "CONFIG_BLOCK", codex.CONFIG_BLOCK * 2)
+    monkeypatch.setattr(codex, "CONFIG_BLOCK_TEMPLATE", codex.CONFIG_BLOCK_TEMPLATE * 2)
 
     result = codex.WRITER.apply(home, work)
 
@@ -565,7 +588,7 @@ def test_a_write_that_would_not_actually_register_is_rolled_back(
     """The invariant checks the outcome, not just that the file still parses."""
     target = home / codex.CONFIG_RELATIVE_PATH
     original = install_fixture(CONFIG_FIXTURES_DIR / "codex_config.toml", target)
-    monkeypatch.setattr(codex, "CONFIG_BLOCK", "\n# a comment and nothing else\n")
+    monkeypatch.setattr(codex, "CONFIG_BLOCK_TEMPLATE", "\n# a comment and nothing else\n")
 
     result = codex.WRITER.apply(home, work)
 
@@ -579,7 +602,7 @@ def test_a_new_file_that_would_duplicate_the_table_is_removed(
     home: Path, work: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC30 on the create path, where there is no backup to restore from."""
-    monkeypatch.setattr(codex, "CONFIG_BLOCK", codex.CONFIG_BLOCK * 2)
+    monkeypatch.setattr(codex, "CONFIG_BLOCK_TEMPLATE", codex.CONFIG_BLOCK_TEMPLATE * 2)
 
     result = codex.WRITER.apply(home, work)
 
@@ -611,7 +634,7 @@ def test_a_failed_rollback_says_where_the_original_is(
     """If the restore itself fails, the message must not claim the file is unchanged."""
     target = home / codex.CONFIG_RELATIVE_PATH
     install_fixture(CONFIG_FIXTURES_DIR / "codex_config.toml", target)
-    monkeypatch.setattr(codex, "CONFIG_BLOCK", codex.CONFIG_BLOCK * 2)
+    monkeypatch.setattr(codex, "CONFIG_BLOCK_TEMPLATE", codex.CONFIG_BLOCK_TEMPLATE * 2)
 
     # The write itself must succeed; only the rollback's os.replace fails, which is the
     # second call — the first is write_atomic swapping its temp file into place.
@@ -709,7 +732,7 @@ def test_codex_apply_detects_an_existing_quoted_table(home: Path, work: Path) ->
     original = '[mcp_servers."localmem"]\ncommand = "localmem"\n'
     target.write_text(original, encoding="utf-8")
 
-    assert codex.WRITER.apply(home, work).action == "already_present"
+    assert codex.WRITER.apply(home, work).action == "stale"
     assert target.read_text(encoding="utf-8") == original
 
 
@@ -883,6 +906,21 @@ def test_init_never_writes_the_global_claude_json(
     assert (work / claude_code.PROJECT_CONFIG_NAME).is_file()
 
 
+#: Spellings that would let a module reach the user's real home directory. Forbidden in
+#: every module of the package, with no exceptions: ``home`` is a parameter, which is what
+#: makes a sandboxed test structurally unable to touch a real config (AC19 / DD-3).
+HOME_NEEDLES = ("Path.home(", ".home()", "expanduser", '"HOME"', "'HOME'")
+
+#: Reading the environment at all, forbidden everywhere *except* the one module that has
+#: to. :mod:`localmem.agents.command` resolves an executable rather than a config file,
+#: and recognising an ephemeral install means knowing where this machine's caches are —
+#: ``UV_CACHE_DIR``, ``XDG_CACHE_HOME``, ``PIPX_HOME``. It is still held to
+#: :data:`HOME_NEEDLES`, so the guarantee that matters is unweakened: it cannot resolve a
+#: home directory, and therefore cannot name a config file.
+ENVIRONMENT_NEEDLES = ("os.environ", "getenv")
+ENVIRONMENT_EXEMPT = frozenset({"command.py"})
+
+
 def test_no_agent_module_resolves_the_home_directory() -> None:
     """AC19 / DD-3: asserted by scanning the source of every module in the package."""
     package_dir = Path(agents.__file__).parent
@@ -893,20 +931,15 @@ def test_no_agent_module_resolves_the_home_directory() -> None:
         "base.py",
         "claude_code.py",
         "codex.py",
+        "command.py",
         "kiro.py",
     }
-    forbidden = (
-        "Path.home(",
-        ".home()",
-        "expanduser",
-        "os.environ",
-        "getenv",
-        '"HOME"',
-        "'HOME'",
-    )
     for path in sources:
         text = path.read_text(encoding="utf-8")
-        for needle in forbidden:
+        needles = HOME_NEEDLES
+        if path.name not in ENVIRONMENT_EXEMPT:
+            needles += ENVIRONMENT_NEEDLES
+        for needle in needles:
             assert needle not in text, f"{path.name} contains {needle!r}"
 
 
@@ -956,7 +989,7 @@ def test_claude_code_prints_a_command_outside_a_repository(home: Path, work: Pat
 
     assert result.action == "printed"
     assert result.path is None
-    assert result.printed_command == "claude mcp add localmem -- localmem serve"
+    assert result.printed_command == f"claude mcp add localmem -- {STUB_SERVER_COMMAND} serve"
     assert list(work.iterdir()) == []
 
 
@@ -1169,7 +1202,7 @@ def test_agents_install_rejects_an_unknown_slug(home: Path, work: Path) -> None:
 def test_agents_install_prints_the_command_outside_a_repository(home: Path, work: Path) -> None:
     result = CliRunner().invoke(cli.main, ["agents", "--install", "claude-code"])
     assert result.exit_code == 0
-    assert "claude mcp add localmem -- localmem serve" in result.output
+    assert f"claude mcp add localmem -- {STUB_SERVER_COMMAND} serve" in result.output
 
 
 # --------------------------------------------------------------------------- benchmark
@@ -1774,3 +1807,274 @@ def test_the_capture_hook_asks_localmem_rather_than_reimplementing_jaccard() -> 
     ).lower()
     for forbidden in ("jaccard", "awk ", "comm -12", "sort -u"):
         assert forbidden not in body, forbidden
+
+
+# ------------------------------------------ v0.5.1: the emitted command is an absolute path
+
+#: The environment a GUI-launched desktop app hands its MCP servers. Measured on the
+#: user's Mac: `launchctl getenv PATH` is empty, so Antigravity and Kiro see only the
+#: system defaults — no `~/.local/bin`, no venv, no shell profile.
+STRIPPED_PATH = "PATH=/usr/bin:/bin"
+
+#: A path shaped exactly like the one `uvx localmem` really resolves to. Measured:
+#: `uvx --from cowsay python -c "shutil.which('cowsay')"` returned
+#: `~/.cache/uv/archive-v0/<hash>/bin/cowsay`, so `shutil.which` finds an ephemeral
+#: install rather than failing on it — which is why detection is a property of the path.
+EPHEMERAL_COMMAND = ".cache/uv/archive-v0/w8fBeEFp/bin/localmem"
+
+
+def run_stripped(*argv: str) -> subprocess.CompletedProcess[str]:
+    """Run ``argv`` with the environment a desktop-launched app would hand a server."""
+    return subprocess.run(  # noqa: S603 - argv is built here from resolved paths
+        ["env", "-i", STRIPPED_PATH, *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_emitted_command_runs_under_a_stripped_environment(
+    real_server_command: str | None,
+) -> None:
+    """AC1.2 — the bug, encoded. A bare `localmem` cannot be found by a GUI-launched app.
+
+    This is the acceptance criterion the whole of defect 1 exists for, and it fails on
+    v0.5.0 with exit 127: `server_entry()` emitted the string `localmem`, which resolves
+    only through a login shell's PATH. `env -i` reproduces exactly what Antigravity and
+    Kiro pass down.
+
+    It asks for ``real_server_command`` rather than the pinned stub, because a stub path
+    proves nothing about whether the emitted command can actually be executed — and skips
+    without an installed localmem, so a CI job that never installed the package does not
+    go red for a reason that is not the code's.
+    """
+    if real_server_command is None:
+        pytest.skip("localmem is not installed on PATH")
+    emitted = str(base.server_entry()["command"])
+    completed = run_stripped(emitted, "--version")
+    assert completed.returncode == 0, (
+        f"the command agent configs carry ({emitted!r}) does not run without a login "
+        f"PATH: {completed.stderr.strip() or completed.stdout.strip()}"
+    )
+
+
+def test_the_resolved_command_is_absolute_existing_and_executable(
+    real_server_command: str | None,
+) -> None:
+    """AC1.1 — the three properties a config's command has to have."""
+    if real_server_command is None:
+        pytest.skip("localmem is not installed on PATH")
+    resolved = Path(str(base.server_entry()["command"]))
+    assert resolved.is_absolute()
+    assert resolved.is_file()
+    assert os.access(resolved, os.X_OK)
+
+
+def test_every_writer_and_the_printed_line_carry_the_same_command(home: Path, work: Path) -> None:
+    """AC1.3 — one resolution, five consumers, and no chance for them to drift.
+
+    The Codex block is TOML and the rest are JSON, so they are compared after parsing
+    rather than as text.
+    """
+    (work / ".git").mkdir()
+    rendered = {
+        writer.slug: json.loads(writer.render_config(home, work))["mcpServers"]["localmem"][
+            "command"
+        ]
+        for writer in JSON_WRITERS
+    }
+    rendered["codex"] = tomllib.loads(codex.WRITER.render_config(home, work))["mcp_servers"][
+        "localmem"
+    ]["command"]
+    assert set(rendered.values()) == {STUB_SERVER_COMMAND}
+    assert claude_code.mcp_add_command() == (
+        f"claude mcp add localmem -- {STUB_SERVER_COMMAND} serve"
+    )
+
+
+@pytest.mark.parametrize("slug", agents.slugs())
+def test_an_unresolvable_command_writes_nothing_and_exits_non_zero(
+    slug: str, home: Path, work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1.4 — no config at all is better than one pointing into a cache.
+
+    A cache path would work today and stop working silently once uv prunes it, weeks
+    later, inside an app the user is not looking at. That is the failure mode this whole
+    release exists to remove, so it is not traded for convenience.
+    """
+    make_home_with_every_agent(home)
+    (work / ".git").mkdir()
+
+    def unresolvable() -> str:
+        raise agents.UnresolvableCommandError("no stable path; run `uv tool install ...`")
+
+    monkeypatch.setattr(agents.command, "resolve_server_command", unresolvable)
+
+    result = CliRunner().invoke(cli.main, ["agents", "--install", slug])
+
+    assert result.exit_code != 0
+    assert "uv tool install" in result.output
+    assert not (home / antigravity.CONFIG_RELATIVE_PATH).exists()
+    assert not (home / codex.CONFIG_RELATIVE_PATH).exists()
+    assert not (home / kiro.KIRO_DIR_NAME / kiro.SETTINGS_RELATIVE_PATH).exists()
+    assert not (work / claude_code.PROJECT_CONFIG_NAME).exists()
+
+
+def test_a_uvx_style_cache_path_is_refused() -> None:
+    """AC1.4 — the detection itself, against the measured uvx layout.
+
+    `shutil.which` *succeeds* under uvx, so "resolution failed" cannot be the signal.
+    """
+    assert agents.command.is_ephemeral(Path.home() / EPHEMERAL_COMMAND)
+
+
+def test_a_uv_tool_install_path_is_not_ephemeral() -> None:
+    """The other direction, and the one that matters more: a real install is accepted.
+
+    Measured on the user's Mac: `uv tool install` leaves `~/.local/bin/localmem` as a
+    symlink into `~/.local/share/uv/tools/`. Neither end is a cache, and a false positive
+    here would refuse to configure a perfectly good install.
+    """
+    home = Path.home()
+    assert not agents.command.is_ephemeral(home / ".local/bin/localmem")
+    assert not agents.command.is_ephemeral(home / ".local/share/uv/tools/localmem/bin/localmem")
+    assert not agents.command.is_ephemeral(Path("/usr/local/bin/localmem"))
+
+
+def test_argv_is_not_used_when_it_names_some_other_program(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`sys.argv[0]` is only a candidate when it *is* the localmem console script.
+
+    Under pytest it is `.venv/bin/pytest`, which exists and is executable — accepting it
+    unchecked would write the test runner into four agent configs as the MCP server.
+    """
+    monkeypatch.setattr(agents.command.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(agents.command.sys, "argv", [sys.executable])
+    assert agents.command._candidate() is None
+
+
+@pytest.mark.parametrize("slug", agents.slugs())
+def test_repair_updates_a_stale_entry_and_nothing_else_does(
+    slug: str, home: Path, work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1.5 — every writer, both directions: reported without `--repair`, fixed with it.
+
+    The stale state is produced the way a real upgrade produces it: a config written by
+    an install that resolved somewhere else.
+    """
+    make_home_with_every_agent(home)
+    (work / ".git").mkdir()
+    writer = agents.writer_for(slug)
+    assert writer is not None
+    monkeypatch.setattr(agents.command, "resolve_server_command", lambda: "/old/bin/localmem")
+    assert writer.apply(home, work).action == "written"
+    target = writer.target_path(home, work)
+    assert target is not None
+    before = target.read_bytes()
+
+    monkeypatch.setattr(agents.command, "resolve_server_command", lambda: STUB_SERVER_COMMAND)
+    reported = writer.apply(home, work)
+
+    assert reported.action == "stale"
+    assert "--repair" in reported.detail
+    assert "/old/bin/localmem" in reported.detail
+    assert target.read_bytes() == before
+
+    fixed = writer.apply(home, work, repair=True)
+
+    assert fixed.action == "repaired"
+    assert "/old/bin/localmem" in fixed.detail and STUB_SERVER_COMMAND in fixed.detail
+    assert STUB_SERVER_COMMAND in target.read_text(encoding="utf-8")
+    assert "/old/bin/localmem" not in target.read_text(encoding="utf-8")
+
+
+def test_repair_keeps_the_codex_comments_and_every_other_server(
+    home: Path, work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Codex repair is a one-line edit, proved by re-parsing — never a rewrite.
+
+    §19's whole point is that this file is never regenerated from parsed data, because
+    that loses the comments and the formatting the user wrote. A repair has to change a
+    value inside it anyway, so it changes exactly one line and proves the rest is intact.
+    """
+    target = home / codex.CONFIG_RELATIVE_PATH
+    target.parent.mkdir(parents=True)
+    original = (
+        "# my codex config\n"
+        'model = "gpt-5-codex"\n'
+        "\n"
+        "[mcp_servers.codegraph]\n"
+        'command = "codegraph-mcp"   # keep me\n'
+        "\n"
+        "# Added by localmem init\n"
+        "[mcp_servers.localmem]\n"
+        'command = "/old/bin/localmem"  # was resolved here\n'
+        'args = ["serve"]\n'
+    )
+    target.write_text(original, encoding="utf-8")
+
+    result = codex.WRITER.apply(home, work, repair=True)
+
+    assert result.action == "repaired"
+    written = target.read_text(encoding="utf-8")
+    assert "# my codex config" in written
+    assert 'command = "codegraph-mcp"   # keep me' in written
+    assert "# was resolved here" in written, "the repaired line keeps its own comment"
+    parsed = tomllib.loads(written)
+    assert parsed["mcp_servers"]["localmem"]["command"] == STUB_SERVER_COMMAND
+    assert parsed["mcp_servers"]["codegraph"]["command"] == "codegraph-mcp"
+    assert parsed["model"] == "gpt-5-codex"
+    assert backup_of(target).read_text(encoding="utf-8") == original
+
+
+def test_a_codex_spelling_that_cannot_be_edited_is_refused_not_rewritten(
+    home: Path, work: Path
+) -> None:
+    """No candidate edit verifies, so nothing is written and the user is told what to set.
+
+    `[[mcp_servers.localmem]]` is an array of tables: there is no single `command` value
+    to move, and re-parsing rejects every candidate rather than guessing.
+    """
+    target = home / codex.CONFIG_RELATIVE_PATH
+    target.parent.mkdir(parents=True)
+    original = '[[mcp_servers.localmem]]\ncommand = "localmem"\n'
+    target.write_text(original, encoding="utf-8")
+
+    result = codex.WRITER.apply(home, work, repair=True)
+
+    assert result.action == "refused"
+    assert STUB_SERVER_COMMAND in result.detail
+    assert target.read_text(encoding="utf-8") == original
+    assert not backup_of(target).exists()
+
+
+def test_repair_on_an_up_to_date_config_changes_nothing(home: Path, work: Path) -> None:
+    """`--repair` is not a rewrite switch: a correct entry is still left alone."""
+    make_home_with_every_agent(home)
+    assert antigravity.WRITER.apply(home, work).action == "written"
+    target = home / antigravity.CONFIG_RELATIVE_PATH
+    before = target.read_bytes()
+
+    result = antigravity.WRITER.apply(home, work, repair=True)
+
+    assert result.action == "already_present"
+    assert target.read_bytes() == before
+    assert not backup_of(target).exists()
+
+
+def test_a_config_written_today_starts_the_server_from_a_stripped_environment(
+    real_server_command: str | None, home: Path, work: Path
+) -> None:
+    """AC1.2 end to end: register an agent into a temp HOME, then run what it wrote.
+
+    The value is read back out of the file on disk, so this covers the whole path from
+    resolution through the JSON writer rather than re-asserting `server_entry()`.
+    """
+    if real_server_command is None:
+        pytest.skip("localmem is not installed on PATH")
+    (home / ".gemini").mkdir()
+    assert antigravity.WRITER.apply(home, work).action == "written"
+
+    document = json.loads((home / antigravity.CONFIG_RELATIVE_PATH).read_text(encoding="utf-8"))
+    written = document["mcpServers"]["localmem"]["command"]
+
+    assert run_stripped(written, "--version").returncode == 0

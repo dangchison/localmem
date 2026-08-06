@@ -42,7 +42,7 @@ Detection is simply "does `~/.codex/` exist".
 
 # Added by localmem init
 [mcp_servers.localmem]
-command = "localmem"
+command = "/Users/you/.local/bin/localmem"
 args = ["serve"]
 ```
 
@@ -55,9 +55,10 @@ writing both disable newline translation, so no unrelated line ending is rewritt
 Everything else in the file survives byte-for-byte: comments, `[desktop]`, `[features]`, other
 `[mcp_servers.*]` tables, alignment, all of it.
 
-`command` is the bare `localmem` name, so it must be on the `PATH` Codex launches with. If you
-installed into a venv that is not on your `PATH`, edit the appended entry to the absolute path
-of `.venv/bin/localmem`.
+`command` is the **absolute path** of the installed `localmem`, resolved once when the block is
+written, so the `PATH` Codex launches with does not matter. Move or reinstall the binary and the
+path goes stale — deliberately, because it then fails at a named place rather than silently:
+`localmem agents --install codex --repair` writes the new one.
 
 ## Safety behaviour worth knowing
 
@@ -95,11 +96,11 @@ restart Codex and ask it to use `memory_recall` — for example *"use `memory_re
 what I know about deployments"*. If it calls the tool, the process launched. That second step
 is an indirect check: it is a behavioural observation, not a status readout.
 
-If `codex mcp get localmem` prints the entry but the tool never appears in a session, the
-cause is almost always `PATH`. The block registers the bare name `localmem`, resolved against
-the `PATH` Codex launches with — often not the `PATH` of the shell you installed from. With
-`uv tool install` the binary is at `~/.local/bin/localmem`; either put that directory on
-Codex's `PATH`, or edit the appended entry to the absolute path.
+If `codex mcp get localmem` prints the entry but the tool never appears in a session, look at
+the `command` it prints. A block written by v0.5.0 or earlier carries the bare name `localmem`,
+which resolves only through a login shell's `PATH`; `localmem agents --install codex --repair`
+replaces it with the absolute path. If the path is already absolute, check that it still exists
+— `--repair` is also the cure after a reinstall moved the binary.
 
 ## Permission-granular access
 

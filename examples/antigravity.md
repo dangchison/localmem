@@ -25,7 +25,7 @@ Created from scratch when the file does not exist:
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -93,11 +93,12 @@ part: it proves the client loaded the config, launched `localmem serve` and conn
 but it is a behavioural observation rather than a status readout, and a refusal tells you
 nothing precise about which of those three steps failed.
 
-If the file is right and the tool never appears, suspect `PATH` first. The config registers
-the bare name `localmem`, resolved against the `PATH` Antigravity launches with — often not
-the `PATH` of the shell you installed from. With `uv tool install` the binary is at
-`~/.local/bin/localmem`; either put that directory on the agent's `PATH`, or replace
-`"command": "localmem"` with the absolute path.
+If the file is right and the tool never appears, check the `command` the entry carries. Since
+v0.5.1 localmem writes the **absolute path** of the installed binary, because Antigravity is
+a desktop app and inherits no login `PATH` — measured, `launchctl getenv PATH` is empty, so a
+bare `localmem` cannot be found and the server fails with nothing printed. A config written
+by v0.5.0 or earlier carries that bare name; `localmem agents --install antigravity --repair`
+updates it, and is also the fix after moving or reinstalling the binary.
 
 ## Tell Antigravity to use it
 

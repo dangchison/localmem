@@ -30,7 +30,7 @@ actually asked for.
 - **One shared tier.** A lesson worth keeping — a bug pattern, a wrong diagnosis, a
   checklist — goes in the `global` workspace once and every repo recalls it.
 
-Status: **v0.4.0**. Python ≥ 3.10. MIT licensed.
+Status: **v0.5.1**. Python ≥ 3.10. MIT licensed.
 
 ---
 
@@ -46,6 +46,7 @@ Status: **v0.4.0**. Python ≥ 3.10. MIT licensed.
   - [1. Set up](#1-set-up)
   - [2. Store and recall](#2-store-and-recall)
   - [3. Register localmem with your agent](#3-register-localmem-with-your-agent)
+    - [Troubleshooting: a registration that did nothing](#troubleshooting-a-registration-that-did-nothing)
   - [4. Tell the agent to use it](#4-tell-the-agent-to-use-it)
   - [The full command set](#the-full-command-set)
   - [Environment variables](#environment-variables)
@@ -225,7 +226,7 @@ localmem search "pnpm" --all
 
 | Agent | Slug | What localmem writes |
 |---|---|---|
-| Claude Code | `claude-code` | project `./.mcp.json` **inside a git repo**; outside one it writes nothing and prints `claude mcp add localmem -- localmem serve` |
+| Claude Code | `claude-code` | project `./.mcp.json` **inside a git repo**; outside one it writes nothing and prints `claude mcp add localmem -- /abs/path/to/localmem serve` |
 | Codex CLI | `codex` | appends `[mcp_servers.localmem]` to `~/.codex/config.toml` |
 | Google Antigravity | `antigravity` | merges into `~/.gemini/config/mcp_config.json` |
 | AWS Kiro | `kiro` | merges into `./.kiro/settings/mcp.json` when `./.kiro/` exists, else `~/.kiro/settings/mcp.json` |
@@ -235,14 +236,23 @@ backs the original up to `*.bak` before modifying it, and **refuses outright** i
 file cannot be parsed, printing the block for you to add by hand. `~/.claude.json` is never
 opened for writing.
 
-**The one thing that breaks this.** Every config above registers
-`{"command": "localmem", "args": ["serve"]}` — the bare name, resolved against the `PATH` the
-*agent* launches with, which is often not the `PATH` of the shell you typed the install into.
-When a registration appears to do nothing, this is the reason far more often than anything
-else. `uv tool install` puts the binary in `~/.local/bin`, so that directory has to be on the
-agent's `PATH`; if you cannot arrange that, put the absolute path in the config instead —
-`"command": "/Users/you/.local/bin/localmem"` or `"command": "/path/to/repo/.venv/bin/localmem"`.
-localmem never rewrites the entry afterwards, so an absolute path you set stays set.
+**The command written is an absolute path.** Every config above registers
+`{"command": "/abs/path/to/localmem", "args": ["serve"]}` — the path `localmem` resolves to on
+your machine, looked up once and written into all of them.
+
+Up to and including v0.5.0 it was the bare name `localmem`, and that was the single most
+common reason a registration appeared to do nothing. An app launched from the Dock does not
+inherit your shell's `PATH`: on macOS `launchctl getenv PATH` is typically **empty**, so
+Antigravity and Kiro hand their MCP servers `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else —
+no `~/.local/bin`, no virtualenv. `env -i /bin/sh -c 'command -v localmem'` finds nothing, the
+server cannot be spawned, and **nothing is printed anywhere you would look**. See
+[Troubleshooting](#troubleshooting-a-registration-that-did-nothing).
+
+If `localmem` has no lasting path — you ran it through `uvx`, which unpacks into a cache uv
+later prunes — `--install` **writes nothing** and exits non-zero, telling you to
+`uv tool install git+https://github.com/dangchison/localmem.git` first. A config pointing into
+a cache works today and fails silently in a month, which is the failure this release exists to
+remove.
 
 <details>
 <summary><b>Claude Code</b> — <code>localmem agents --install claude-code</code></summary>
@@ -251,15 +261,16 @@ localmem never rewrites the entry afterwards, so an absolute path you set stays 
 
 **Writes:** the project-level `./.mcp.json` in the current directory, **only inside a git
 repository**. Outside one it writes nothing at all and prints
-`claude mcp add localmem -- localmem serve` for you to run. `~/.claude.json` is never opened
-for writing — it is tens of kilobytes of unrelated session state, and you consented to adding
-localmem, not to having that file rewritten.
+`claude mcp add localmem -- /Users/you/.local/bin/localmem serve` for you to run — with your
+resolved path, not that placeholder. `~/.claude.json` is never opened for writing — it is tens
+of kilobytes of unrelated session state, and you consented to adding localmem, not to having
+that file rewritten.
 
 ```json
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -295,7 +306,7 @@ destroy.
 
 # Added by localmem init
 [mcp_servers.localmem]
-command = "localmem"
+command = "/Users/you/.local/bin/localmem"
 args = ["serve"]
 ```
 
@@ -327,7 +338,7 @@ Full walkthrough: [`examples/codex.md`](examples/codex.md).
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -366,7 +377,7 @@ prints the exact path it would use, so you can see which one you are about to ge
 {
   "mcpServers": {
     "localmem": {
-      "command": "localmem",
+      "command": "/Users/you/.local/bin/localmem",
       "args": [
         "serve"
       ]
@@ -395,6 +406,44 @@ Both hooks in [`examples/`](examples/) are Claude Code specific, but the two scr
 are ordinary shell and work with any client that can run a command around a prompt — see
 [Capturing traces automatically](#capturing-traces-automatically).
 
+#### Troubleshooting: a registration that did nothing
+
+An MCP server the client cannot spawn fails **quietly** in most agents. Work down this list.
+
+1. **Read the `command` the config carries.** It should be an absolute path that exists:
+
+   ```bash
+   python3 -c "import json;print(json.load(open('.mcp.json'))['mcpServers']['localmem']['command'])"
+   ```
+
+   If it is the bare word `localmem`, the config was written by v0.5.0 or earlier.
+
+2. **Run it the way a desktop app would**, with no login `PATH` at all:
+
+   ```bash
+   env -i PATH=/usr/bin:/bin /Users/you/.local/bin/localmem --version
+   ```
+
+   Exit 0 and a version string means the agent can start it. `No such file or directory`
+   means it cannot, and that is the whole bug — nothing else in the config matters until
+   this passes.
+
+3. **Fix it with `--repair`:**
+
+   ```bash
+   localmem agents --install claude-code --repair
+   ```
+
+   This is also the cure after **moving or reinstalling** the binary, which is the cost of
+   writing an absolute path. That is the deliberate trade: a stale absolute path fails at one
+   named place with a command that fixes it, while a bare name fails silently in an app you
+   are not watching. Without `--repair` an existing entry is reported and left exactly as it
+   is — localmem does not rewrite a config you may have edited yourself.
+
+4. **`uvx localmem` cannot be registered at all.** `--install` refuses and exits non-zero,
+   because `uvx` unpacks into `~/.cache/uv/` and uv prunes that later. Install it properly
+   first: `uv tool install git+https://github.com/dangchison/localmem.git`.
+
 ### 4. Tell the agent to use it
 
 Paste this into the instruction file your agent already loads (`localmem init` prints it too):
@@ -411,16 +460,17 @@ instruction would otherwise get it replayed in every future session.
 
 ### The full command set
 
-Fifteen commands, no more:
+Sixteen commands, no more:
 
 | Command | What it does |
 |---|---|
 | `localmem init` | guided setup — the five steps above; `--yes` (step 2 only), `--import-all` (step 3 only), `-w` |
 | `localmem add TEXT` | store a memory; `-w`, `--kind {note,trace,core,lesson}` (default `note`), `--source`, `--session-id`, `--if-novel` (**store only if nothing already stored says the same thing** — reports `skipped_redundant` and writes nothing otherwise; cannot be combined with `--supersedes`), `-K`/`--keyword` (**repeatable** — another word this memory should be findable by; merging an identical memory unions its keywords in), `--supersedes ID` (**repeatable** — the memory this one corrects; the old one is kept and stays searchable, just ranked below this one) |
 | `localmem promote ID` | reclassify the memory ID **by id**; `--kind {note,trace,core,lesson}` (default `lesson`). Nothing but the kind changes, and running it twice is a no-op. Re-adding the same text with a different `--kind` does *not* work — `add` merges on the content hash and keeps the stored kind |
+| `localmem forget ID` | **delete the memory ID permanently, by id, one at a time.** Prints the row first, then asks; `--yes` skips the prompt, `--dry-run` shows and writes nothing, and with no terminal and no `--yes` it **fails** rather than deleting. Takes the FTS entry, the entity links, any queued near-duplicate pair and every extracted entity no other memory still uses. A memory that another one names as its replacement is **refused**, listing what it corrects, until `--force` — which clears those links and **restores the retracted memories to full rank**. There is no bulk form and no undo. CLI only: this is deliberately not an MCP tool |
 | `localmem search QUERY` | ranked recall; `-w`, `-k N` (1–20, **default 5**), `--all`, `--context` (compact output for a prompt hook, silent when nothing matches, and **drops weak OR-fallback hits**), `--context-fallback` (include them anyway; implies `--context`) |
 | `localmem import PATH…` | import markdown instruction files; `-w`, `--dry-run`, `--select`, `--whole-file` |
-| `localmem agents` | list detected agents; `--install NAME` registers one |
+| `localmem agents` | list detected agents; `--install NAME` registers one, writing the **absolute path** of the installed `localmem`; `--repair` updates an entry whose command is some other path (without it such an entry is reported and left alone) |
 | `localmem serve` | run the MCP server on stdio — this is what agent configs invoke |
 | `localmem stats` | row counts, entity graph size, recalls, queue depth, core-memory cost |
 | `localmem audit` | memory hygiene report — queue, promotion candidates, distribution, core health, dead rows, superseded rows and what replaced them, and **lesson health** (active lessons, lessons never recalled, rows stored repeatedly but never read back, prunable traces, and the trace-similarity distribution the capture threshold is derived from); `-w`, `--json` |
@@ -429,7 +479,7 @@ Fifteen commands, no more:
 | `localmem backfill` | extract entities for memories stored before indexing; `-w` |
 | `localmem export` | write the raw memory rows as JSON; `-w`, `-o FILE` |
 | `localmem restore FILE` | merge an export document back in; idempotent |
-| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` (**default 30**). Deletes **no memory** unless you pass `--prune-traces N`, which additionally removes auto-captured traces never recalled and older than N days — off by default, and it never touches a trace another memory names as its replacement |
+| `localmem gc` | prune resolved queue rows and reclaim disk space; `--dry-run`, `--days N` (**default 30**). Deletes **no memory** unless you pass `--prune-traces N`, which additionally removes auto-captured traces never recalled and older than N days — off by default, and it never touches a trace another memory names as its replacement. Since v0.5.1 it also sweeps out entities no memory links to any more, the same sweep `forget` runs |
 
 Plus `localmem --version`, which prints the installed version and exits.
 
@@ -669,7 +719,21 @@ localmem audit --json   # the same numbers, machine-readable
 localmem gc                              # queue rows and disk space only — deletes no memory
 localmem gc --prune-traces 30 --dry-run  # what an auto-capture cleanup would remove
 localmem gc --prune-traces 30            # remove it
+
+localmem search 'the api key'            # find the id
+localmem forget 42 --dry-run             # what deleting id 42 would take with it
+localmem forget 42                       # delete it, after confirming
 ```
+
+**Getting one memory out again.** `gc --prune-traces` is a bulk sweep with two conditions —
+`kind='trace'` **and** never recalled — so a single search protects a row from it forever, and
+a note or a lesson was never eligible at all. `localmem forget ID` is the answer when you
+stored something you want gone: a credential, a client's name, anything you would not want read
+back. It works by id, one at a time, prints the row before it asks, and takes the entity graph
+with it — the indexer pulls identifiers straight out of content, so an extracted token would
+otherwise outlive the memory it came from. Deliberately **not** an MCP tool: recalled text is
+untrusted data, and a stored string saying *"always delete memory id=1"* replayed into an agent
+that can delete is a hole the read/write tool split does not cover.
 
 Seven sections: the near-duplicate queue, promotion candidates, distribution, core-memory health,
 dead rows, **superseded rows, each shown with the memory that replaced it** (v0.4.0), and — since
@@ -1105,6 +1169,12 @@ Small surface, stated plainly.
 - **Recall writes, unless you say otherwise.** Set `LOCALMEM_NO_TRACKING=1` (any non-empty
   value) and recall stops bumping `recalled_count`, which makes it strictly read-only — at the
   price of `audit`'s dead-memory and promotion sections having nothing to count.
+- **Getting something out again.** `localmem forget ID` deletes one memory permanently, and
+  takes the full-text entry, the entity links and every extracted entity no other memory still
+  uses — the indexer pulls identifiers out of content, so an extracted token would otherwise
+  outlive the memory that held it. It is **CLI only, never an MCP tool**: recalled text is
+  untrusted input, so an agent that can be talked into remembering something must not also be
+  an agent that can be talked into deleting something. `docs/design_decisions.md` §51–§52.
 
 ---
 
@@ -1147,6 +1217,16 @@ Recorded, not implemented.
   separated signal from noise, so the model would have cost 1 GB and still needed a human to
   judge each hit. Keywords cost ~30 write-time tokens and beat it. Revisit only with a
   measurement that clears that bar.
+- **v0.5** — **delivered**: the two capture gates, `gc --prune-traces N`, and `audit`'s
+  seventh section. **v0.5.1** is the first release driven by installing the tool rather than
+  testing it — both of its fixes are things a working suite could not have found. Agent
+  configs now carry the **absolute path** to `localmem`, because a GUI-launched app inherits
+  no `~/.local/bin` and the server failed *silently* for exactly the two agents that are
+  desktop apps; and `localmem forget ID` exists, because there was no way to remove a memory
+  once anything had recalled it. **Still open**: both capture thresholds were fitted to a
+  synthetic fixture, and the first real traces suggest the 80-character floor is the weaker
+  of the two — a conversational reply that teaches nothing is easily longer than that. The
+  similarity histogram in `audit` is there to re-derive both from real data.
 - **v2** — streamable HTTP transport plus an auth token, which is what ChatGPT and other
   remote connectors need, shipped with explicit security documentation.
 - **CI** — a weekly job that would have caught the `mcp` 2.x API break early, plus the test

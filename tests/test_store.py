@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from localmem import config, core_memory, db, store
+from localmem import cli, config, core_memory, db, store
 from localmem.cli import main
 from localmem.dedup import content_hash, normalize
 
@@ -977,7 +977,8 @@ def test_cli_exposes_exactly_the_expected_commands() -> None:
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
     # M3 added dedupe and gc, M4 added serve, M5 added init/import/agents/benchmark,
-    # v0.4.0 added promote; the assertion stays exact so a stray command is noticed.
+    # v0.4.0 added promote, v0.5.1 added forget; the assertion stays exact so a stray
+    # command is noticed. It is a NAME SET, not a count: adding a name is the change.
     assert set(main.commands) == {
         "add",
         "agents",
@@ -986,6 +987,7 @@ def test_cli_exposes_exactly_the_expected_commands() -> None:
         "benchmark",
         "dedupe",
         "export",
+        "forget",
         "gc",
         "import",
         "init",
@@ -1174,3 +1176,346 @@ def test_cli_reports_unusable_database(monkeypatch: pytest.MonkeyPatch, tmp_path
     result = CliRunner().invoke(main, ["stats"])
     assert result.exit_code != 0
     assert "cannot open the localmem database" in result.output
+
+
+# --- v0.5.1: forget ---------------------------------------------------------
+
+#: Content that yields entity links under every extractor class that matters here — a
+#: file path, a snake_case identifier and an acronym. `forget` has to take all of them
+#: with it, because an identifier the extractor pulled out of a secret *is* the secret.
+SENSITIVE_CONTENT = "the deploy key lives in config/secrets.env as deploy_token for the API"
+
+#: One entity the two memories below deliberately share, so a delete can be shown to
+#: remove what is now unused without touching what is still in use.
+SHARED_CONTENT = "config/secrets.env is read by the boot script"
+
+
+def fts_integrity(conn: sqlite3.Connection) -> None:
+    """Assert the FTS5 index is internally consistent.
+
+    This is the only check that sees the damage a hand-written
+    ``DELETE FROM memories_fts`` does. An external-content index cannot verify a delete
+    row, so a second one — on top of the `mem_ad` trigger's — corrupts it silently: every
+    later query still runs, and simply returns the wrong rows. Asserted after every test
+    here that deletes anything (``docs/design_decisions.md`` §52).
+    """
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')")
+
+
+def foreign_keys_clean(conn: sqlite3.Connection) -> None:
+    """Assert no row references a memory that is no longer there."""
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def entity_names(conn: sqlite3.Connection) -> set[str]:
+    return {row["norm_name"] for row in conn.execute("SELECT norm_name FROM entities")}
+
+
+def test_forget_removes_the_row_from_every_table(conn: sqlite3.Connection) -> None:
+    """AC2.1 — memories, the FTS index, the entity links and the queue all lose it."""
+    doomed = store.add_memory(conn, SENSITIVE_CONTENT, "ws").id
+    keeper = store.add_memory(conn, "an unrelated memory about pnpm", "ws").id
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_entities WHERE memory_id = ?", (doomed,)
+    ).fetchone()["n"]
+
+    result = store.forget_memory(conn, doomed)
+
+    assert result.id == doomed
+    assert {row["id"] for row in conn.execute("SELECT id FROM memories")} == {keeper}
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM memory_entities WHERE memory_id = ?", (doomed,)
+        ).fetchone()["n"]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM dedup_queue WHERE memory_id = ? OR candidate_id = ?",
+            (doomed, doomed),
+        ).fetchone()["n"]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM memories_fts WHERE memories_fts MATCH ?", ('"deploy"',)
+        ).fetchone()["n"]
+        == 0
+    )
+    foreign_keys_clean(conn)
+    fts_integrity(conn)
+
+
+def test_forget_leaves_the_fts_index_intact_for_every_other_row(
+    conn: sqlite3.Connection,
+) -> None:
+    """AC2.1 — the trigger does the FTS delete, and nothing else may.
+
+    A second delete against an external-content index does not raise; it silently
+    desynchronizes it. The surviving row still being findable is what proves the index
+    was not damaged in passing, and `integrity-check` is what proves it structurally.
+    """
+    doomed = store.add_memory(conn, "use pnpm not npm for this project", "ws").id
+    store.add_memory(conn, "use pnpm workspaces for the monorepo", "ws")
+
+    store.forget_memory(conn, doomed)
+
+    fts_integrity(conn)
+    hits = store.search_memories(conn, "pnpm", "ws")
+    assert [hit.id for hit in hits] and doomed not in {hit.id for hit in hits}
+
+
+def test_forget_removes_the_memory_from_search(conn: sqlite3.Connection) -> None:
+    """AC2.2 — the point of the feature, stated as the user would check it."""
+    doomed = store.add_memory(conn, SENSITIVE_CONTENT, "ws").id
+    assert [hit.id for hit in store.search_memories(conn, "deploy token", "ws")] == [doomed]
+
+    store.forget_memory(conn, doomed)
+
+    assert store.search_memories(conn, "deploy token", "ws") == []
+    fts_integrity(conn)
+
+
+def test_forget_sweeps_orphaned_entities_and_keeps_shared_ones(
+    conn: sqlite3.Connection,
+) -> None:
+    """AC2.3 — a privacy control, not tidiness.
+
+    ``deploy_token`` was extracted out of the deleted memory and nothing else links it,
+    so it goes. ``config/secrets.env`` is still named by another memory, so it stays —
+    deleting it would break that memory's relational view.
+    """
+    doomed = store.add_memory(conn, SENSITIVE_CONTENT, "ws").id
+    store.add_memory(conn, SHARED_CONTENT, "ws")
+    before = entity_names(conn)
+    assert "deploy_token" in before
+    assert "config/secrets.env" in before
+
+    result = store.forget_memory(conn, doomed)
+
+    after = entity_names(conn)
+    assert "deploy_token" not in after, "an identifier extracted from the deleted memory survived"
+    assert "config/secrets.env" in after, "an entity another memory still uses was deleted"
+    assert result.entities_removed == len(before - after)
+    foreign_keys_clean(conn)
+    fts_integrity(conn)
+
+
+def test_forget_rejects_an_unknown_id_and_changes_nothing(conn: sqlite3.Connection) -> None:
+    """AC2.4."""
+    kept = store.add_memory(conn, SENSITIVE_CONTENT, "ws").id
+    entities_before = entity_names(conn)
+
+    with pytest.raises(ValueError, match="no memory with id 999"):
+        store.forget_memory(conn, 999)
+
+    assert {row["id"] for row in conn.execute("SELECT id FROM memories")} == {kept}
+    assert entity_names(conn) == entities_before
+    fts_integrity(conn)
+
+
+def test_forget_refuses_a_memory_that_other_memories_name_as_their_replacement(
+    conn: sqlite3.Connection,
+) -> None:
+    """AC2.5 — refused by default, with the dependents listed by id and content.
+
+    ``superseded_by`` has no ``ON DELETE`` clause, so an unguarded delete raises
+    ``FOREIGN KEY constraint failed`` and rolls the statement back while the command can
+    still report success — measured in milestone C. The guard is a lookup, not a caught
+    exception, so the user gets the list rather than an FK error string.
+    """
+    stale = store.add_memory(conn, "the old advice: use npm", "ws").id
+    correction = store.add_memory(conn, "actually use pnpm", "ws", supersedes=[stale]).id
+
+    with pytest.raises(ValueError) as caught:
+        store.forget_memory(conn, correction)
+
+    message = str(caught.value)
+    assert f"id={stale}" in message
+    assert "use npm" in message
+    assert "--force" in message
+    assert "full rank" in message
+    assert {row["id"] for row in conn.execute("SELECT id FROM memories")} == {stale, correction}
+    assert (
+        conn.execute("SELECT superseded_by FROM memories WHERE id = ?", (stale,)).fetchone()[
+            "superseded_by"
+        ]
+        == correction
+    )
+    foreign_keys_clean(conn)
+    fts_integrity(conn)
+
+
+def test_forget_force_clears_the_dangling_references(conn: sqlite3.Connection) -> None:
+    """AC2.5 — `--force` deletes it and un-retracts what it corrected.
+
+    Refusing outright would leave a memory holding a secret permanently undeletable,
+    which defeats the point of the command; the price is that the correction goes away
+    and the thing it corrected comes back at full rank.
+    """
+    stale = store.add_memory(conn, "the old advice: use npm", "ws").id
+    also_stale = store.add_memory(conn, "another old note about npm caching", "ws").id
+    correction = store.add_memory(
+        conn, "actually use pnpm", "ws", supersedes=[stale, also_stale]
+    ).id
+
+    result = store.forget_memory(conn, correction, force=True)
+
+    assert set(result.restored) == {stale, also_stale}
+    assert {row["id"] for row in conn.execute("SELECT id FROM memories")} == {stale, also_stale}
+    assert [row["superseded_by"] for row in conn.execute("SELECT superseded_by FROM memories")] == [
+        None,
+        None,
+    ]
+    foreign_keys_clean(conn)
+    fts_integrity(conn)
+
+
+def test_describe_forget_reports_the_row_and_what_goes_with_it(
+    conn: sqlite3.Connection,
+) -> None:
+    """The read-only half: it is what the prompt and `--dry-run` both print."""
+    stale = store.add_memory(conn, "the old advice: use npm", "ws").id
+    correction = store.add_memory(
+        conn, SENSITIVE_CONTENT, "ws", source="claude-code", supersedes=[stale]
+    ).id
+
+    target = store.describe_forget(conn, correction)
+
+    assert target.id == correction
+    assert target.workspace == "ws"
+    assert target.kind == "note"
+    assert target.source == "claude-code"
+    assert target.seen_count == 1
+    assert target.recalled_count == 0
+    assert target.entity_links > 0
+    assert [row.id for row in target.supersedes] == [stale]
+    assert {row["id"] for row in conn.execute("SELECT id FROM memories")} == {stale, correction}
+
+
+def test_prune_traces_no_longer_leaves_orphaned_entities(conn: sqlite3.Connection) -> None:
+    """AC2.8 — the same leak, closed on the other deletion path by the same helper."""
+    trace = store.add_memory(conn, SENSITIVE_CONTENT, "ws", kind="trace").id
+    store.add_memory(conn, SHARED_CONTENT, "ws")
+    conn.execute(
+        "UPDATE memories SET created_at = datetime('now', '-90 days') WHERE id = ?", (trace,)
+    )
+    conn.commit()
+
+    outcome = store.prune_traces(conn, 30)
+
+    assert outcome.traces == 1
+    assert outcome.entities > 0
+    assert "deploy_token" not in entity_names(conn)
+    assert "config/secrets.env" in entity_names(conn)
+    foreign_keys_clean(conn)
+    fts_integrity(conn)
+
+
+def test_delete_orphaned_entities_sweeps_what_earlier_versions_left_behind(
+    conn: sqlite3.Connection,
+) -> None:
+    """The sweep is global, so a database that leaked before v0.5.1 is cleaned too."""
+    conn.execute("INSERT INTO entities (name, norm_name) VALUES (?, ?)", ("LEFTOVER", "leftover"))
+    conn.commit()
+    assert "leftover" in entity_names(conn)
+
+    with db.transaction(conn):
+        removed = store.delete_orphaned_entities(conn)
+
+    assert removed == 1
+    assert "leftover" not in entity_names(conn)
+
+
+# --- v0.5.1: the forget command ---------------------------------------------
+
+
+def test_cli_forget_dry_run_prints_the_row_and_writes_nothing() -> None:
+    """AC2.6 — `--dry-run` shows exactly what a real run would take, and writes nothing."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", SENSITIVE_CONTENT, "-w", "ws"])
+
+    result = runner.invoke(main, ["forget", "1", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "deploy_token" in result.output
+    assert "nothing was written" in result.output
+    assert "memories: 1" in runner.invoke(main, ["stats"]).output
+
+
+def test_cli_forget_without_a_terminal_and_without_yes_fails() -> None:
+    """AC2.6 — never a silent delete, and never a silent skip either.
+
+    CliRunner's stdin is not a tty, which is exactly the condition being tested.
+    """
+    runner = CliRunner()
+    runner.invoke(main, ["add", SENSITIVE_CONTENT, "-w", "ws"])
+
+    result = runner.invoke(main, ["forget", "1"])
+
+    assert result.exit_code != 0
+    assert "--yes" in result.output
+    assert "memories: 1" in runner.invoke(main, ["stats"]).output
+
+
+def test_cli_forget_declined_at_the_prompt_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2.6 — answering no keeps the memory.
+
+    CliRunner's stdin is never a tty, so the terminal is faked the way every other
+    prompting test in this suite fakes it; the answer itself is real input.
+    """
+    monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+    runner = CliRunner()
+    runner.invoke(main, ["add", SENSITIVE_CONTENT, "-w", "ws"])
+
+    result = runner.invoke(main, ["forget", "1"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "was kept" in result.output
+    assert "memories: 1" in runner.invoke(main, ["stats"]).output
+
+
+def test_cli_forget_with_yes_deletes_and_reports_the_entity_sweep() -> None:
+    """AC2.1 through AC2.3 through the command the user actually types."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", SENSITIVE_CONTENT, "-w", "ws"])
+    runner.invoke(main, ["add", SHARED_CONTENT, "-w", "ws"])
+
+    result = runner.invoke(main, ["forget", "1", "--yes"])
+
+    assert result.exit_code == 0
+    assert "deleted memory 1" in result.output
+    assert "entities no other memory still uses" in result.output
+    assert "memories: 1" in runner.invoke(main, ["stats"]).output
+    assert (
+        "no memories matching" in runner.invoke(main, ["search", "deploy token", "-w", "ws"]).output
+    )
+
+
+def test_cli_forget_refuses_a_replacement_then_accepts_force() -> None:
+    """AC2.5 end to end, including the warning that must be said in terms."""
+    runner = CliRunner()
+    runner.invoke(main, ["add", "the old advice: use npm", "-w", "ws"])
+    runner.invoke(main, ["add", "actually use pnpm", "-w", "ws", "--supersedes", "1"])
+
+    refused = runner.invoke(main, ["forget", "2", "--yes"])
+
+    assert refused.exit_code != 0
+    assert "--force" in refused.output
+    assert "memories: 2" in runner.invoke(main, ["stats"]).output
+
+    forced = runner.invoke(main, ["forget", "2", "--yes", "--force"])
+
+    assert forced.exit_code == 0
+    assert "full rank" in forced.output
+    assert "cleared superseded_by" in forced.output
+    assert "memories: 1" in runner.invoke(main, ["stats"]).output
+
+
+def test_cli_forget_unknown_id_fails_cleanly() -> None:
+    """AC2.4 through the command."""
+    result = CliRunner().invoke(main, ["forget", "999", "--yes"])
+    assert result.exit_code != 0
+    assert "no memory with id 999" in result.output

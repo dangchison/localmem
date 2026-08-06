@@ -4,6 +4,7 @@ so no test can reach the real ~/.claude/, ~/.codex/, ~/.gemini/ or ~/.kiro/."""
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -11,9 +12,20 @@ from pathlib import Path
 import pytest
 
 from localmem import config, db
+from localmem.agents import command
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 CONFIG_FIXTURES_DIR = FIXTURES_DIR / "configs"
+
+#: The absolute path every agent config in the test suite is expected to carry.
+#:
+#: The real answer depends on how the machine running the tests installed localmem —
+#: ``~/.local/bin`` under ``uv tool install``, a venv under ``pip install -e .``, nothing
+#: at all in a bare source checkout. Pinning it makes every writer assertion an exact
+#: equality instead of a re-derivation of the code under test, and it means the suite
+#: does not need localmem installed to run. The handful of tests that must see the real
+#: resolution ask for the ``real_server_command`` fixture and skip without an install.
+STUB_SERVER_COMMAND = "/opt/localmem/bin/localmem"
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +48,32 @@ def sandbox_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     return home
+
+
+@pytest.fixture
+def real_server_command() -> str | None:
+    """Opt out of :func:`stub_server_command`: this test needs the real installed path.
+
+    Returns what :func:`shutil.which` finds, or ``None`` when localmem is not installed
+    on this machine — the tests that need it skip on ``None`` rather than going red for
+    a reason that has nothing to do with the code.
+    """
+    return shutil.which(command.SERVER_NAME)
+
+
+@pytest.fixture(autouse=True)
+def stub_server_command(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> str | None:
+    """Pin the command every writer embeds, so assertions can be exact equalities.
+
+    Skipped for any test that asks for ``real_server_command``; a test that wants to
+    exercise a *failing* resolution simply patches the same attribute again itself.
+    """
+    if "real_server_command" in request.fixturenames:
+        return None
+    monkeypatch.setattr(command, "resolve_server_command", lambda: STUB_SERVER_COMMAND)
+    return STUB_SERVER_COMMAND
 
 
 @pytest.fixture
